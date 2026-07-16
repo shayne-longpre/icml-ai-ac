@@ -1,0 +1,1927 @@
+from __future__ import annotations
+
+import base64
+import itertools
+import json
+import math
+import statistics
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from icml_ai_ac.models import PaperRecord
+from icml_ai_ac.pdf_utils import write_pdf_page_excerpt
+from icml_ai_ac.scoring.providers import ChatCompletionClient
+from icml_ai_ac.scoring.runner import estimate_tokens, read_text_path, resolve_record_text_path
+from icml_ai_ac.scoring.schema import CONTRIBUTION_CLASSES, parse_json_response
+from icml_ai_ac.storage import read_paper_records, write_json, write_jsonl
+
+
+FRONTIER_CARD_PROMPT_VERSION = "frontier_pdf_paper_card_v1"
+FRONTIER_CARD_ENSEMBLE_VERSION = "frontier_pdf_card_ensemble_v1"
+FRONTIER_SYNTHESIS_PROMPT_VERSION = "frontier_pdf_card_synthesis_rank_v1"
+FRONTIER_TOURNAMENT_PROMPT_VERSION = "frontier_pdf_card_pairwise_tournament_v1"
+
+
+@dataclass(slots=True)
+class FrontierCardConfig:
+    provider: str
+    model: str
+    reasoning_effort: str | None
+    prompt_version: str
+    paper_set_name: str
+    text_source: str
+    limit: int | None
+    paper_ids: set[str]
+    per_paper_char_budget: int
+    pdf_excerpt_pages: int
+    pdf_excerpt_dir: Path
+    pdf_optimize_threshold_bytes: int | None
+    pdf_settings: str
+    temperature: float
+    max_output_tokens: int
+    seed: int | None
+    dry_run: bool
+    overwrite: bool
+    openrouter_pdf_engine: str | None
+
+
+@dataclass(slots=True)
+class FrontierCardCandidate:
+    record: PaperRecord
+    text_path: str
+    resolved_text_source: str
+    paper_text: str
+    pdf_path: Path
+    pdf_excerpt_path: Path
+
+
+@dataclass(slots=True)
+class FrontierSynthesisConfig:
+    provider: str
+    model: str
+    reasoning_effort: str | None
+    prompt_version: str
+    paper_set_name: str
+    temperature: float
+    max_output_tokens: int
+    seed: int | None
+    dry_run: bool
+
+
+@dataclass(slots=True)
+class FrontierTournamentConfig:
+    provider: str
+    model: str
+    reasoning_effort: str | None
+    prompt_version: str
+    paper_set_name: str
+    strategy: str
+    top_n: int
+    pairs_per_batch: int
+    swiss_rounds: int
+    playoff_top_n: int | None
+    temperature: float
+    max_output_tokens: int
+    seed: int | None
+    dry_run: bool
+    overwrite: bool
+
+
+def run_frontier_pdf_cards(
+    *,
+    manifest: Path,
+    out: Path,
+    run_dir: Path,
+    config: FrontierCardConfig,
+    client: ChatCompletionClient | None,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    candidates = select_frontier_card_candidates(manifest=manifest, config=config)
+    for child in ["prompts", "responses", "parsed", "cards", "errors"]:
+        (run_dir / child).mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    for index, candidate in enumerate(candidates, start=1):
+        row = run_frontier_pdf_card(
+            candidate,
+            index=index,
+            total=len(candidates),
+            run_dir=run_dir,
+            config=config,
+            client=client,
+        )
+        rows.append(row)
+        write_jsonl(out, rows)
+    summary = {
+        "status": "dry_run" if config.dry_run else "ok",
+        "provider": config.provider,
+        "model": config.model,
+        "reasoning_effort": config.reasoning_effort,
+        "prompt_version": config.prompt_version,
+        "paper_set_name": config.paper_set_name,
+        "manifest": str(manifest),
+        "out": str(out),
+        "run_dir": str(run_dir),
+        "candidate_count": len(candidates),
+        "ok_count": sum(1 for row in rows if row.get("status") == "ok"),
+        "failed_count": sum(1 for row in rows if row.get("status") == "failed"),
+        "validation_error_count": sum(1 for row in rows if row.get("status") == "validation_error"),
+        "dry_run_count": sum(1 for row in rows if row.get("status") == "dry_run"),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "usage": sum_usage(row.get("usage") for row in rows),
+    }
+    if summary["failed_count"] or summary["validation_error_count"]:
+        summary["status"] = "partial" if not config.dry_run else "dry_run"
+    write_json(run_dir / "run.json", summary)
+    return summary
+
+
+def run_frontier_pdf_card(
+    candidate: FrontierCardCandidate,
+    *,
+    index: int,
+    total: int,
+    run_dir: Path,
+    config: FrontierCardConfig,
+    client: ChatCompletionClient | None,
+) -> dict[str, Any]:
+    paper_id = candidate.record.paper_id
+    card_path = run_dir / "cards" / f"{paper_id}.json"
+    if card_path.exists() and not config.overwrite:
+        existing = json.loads(card_path.read_text(encoding="utf-8"))
+        if existing.get("status") == "ok":
+            return {**existing, "resumed_from": str(card_path)}
+
+    base_result: dict[str, Any] = {
+        "status": "dry_run" if config.dry_run else "pending",
+        "paper_id": paper_id,
+        "title": candidate.record.title,
+        "provider": config.provider,
+        "model": config.model,
+        "reasoning_effort": config.reasoning_effort,
+        "prompt_version": config.prompt_version,
+        "paper_set_name": config.paper_set_name,
+        "text_source": config.text_source,
+        "resolved_text_source": candidate.resolved_text_source,
+        "text_path": candidate.text_path,
+        "pdf_path": str(candidate.pdf_path),
+        "pdf_excerpt_path": str(candidate.pdf_excerpt_path),
+        "candidate_index": index,
+        "candidate_total": total,
+        "raw_response_path": None,
+        "parsed_response_path": None,
+        "prompt_path": None,
+        "validation_errors": [],
+    }
+    try:
+        excerpt_info = write_pdf_page_excerpt(
+            source_pdf=candidate.pdf_path,
+            out_pdf=candidate.pdf_excerpt_path,
+            max_pages=config.pdf_excerpt_pages,
+            overwrite=False,
+            optimize_if_larger_than_bytes=config.pdf_optimize_threshold_bytes,
+            pdf_settings=config.pdf_settings,
+        )
+        messages = build_frontier_card_messages(candidate, config=config)
+        prompt_payload = {
+            **base_result,
+            "status": "prompt_ready",
+            "pdf_excerpt": excerpt_info,
+            "messages": redact_file_data(messages),
+            "prompt_tokens_estimate_without_pdf": sum(
+                estimate_tokens(_message_text_for_estimate(message)) for message in messages
+            ),
+        }
+        prompt_path = run_dir / "prompts" / f"{paper_id}.json"
+        write_json(prompt_path, prompt_payload)
+        base_result["prompt_path"] = str(prompt_path)
+        if config.dry_run:
+            row = {**base_result, "status": "dry_run", "pdf_excerpt": excerpt_info}
+            write_json(card_path, row)
+            return row
+        if client is None:
+            raise ValueError("client is required unless dry_run=True")
+        chat = client.complete(
+            messages=messages,
+            temperature=config.temperature,
+            max_output_tokens=config.max_output_tokens,
+            seed=config.seed,
+            response_format={"type": "json_object"},
+        )
+        raw_response_path = run_dir / "responses" / f"{paper_id}.json"
+        write_json(raw_response_path, chat.response)
+        parsed = parse_json_response(chat.content)
+        parsed.setdefault("paper_id", paper_id)
+        parsed.setdefault("title", candidate.record.title or "")
+        validation_errors = validate_frontier_card(parsed, expected_paper_id=paper_id)
+        parsed_response_path = run_dir / "parsed" / f"{paper_id}.json"
+        write_json(parsed_response_path, parsed)
+        row = {
+            **base_result,
+            "status": "ok" if not validation_errors else "validation_error",
+            "pdf_excerpt": excerpt_info,
+            "raw_response_path": str(raw_response_path),
+            "parsed_response_path": str(parsed_response_path),
+            "validation_errors": validation_errors,
+            "served_model": chat.served_model,
+            "usage": chat.usage,
+            "provider_elapsed_seconds": round(chat.elapsed_seconds, 3),
+            "card": parsed,
+        }
+    except Exception as exc:  # noqa: BLE001 - persist row-local failures for retry.
+        error_path = run_dir / "errors" / f"{paper_id}.json"
+        write_json(error_path, {"paper_id": paper_id, "error": repr(exc)})
+        row = {
+            **base_result,
+            "status": "failed",
+            "error_path": str(error_path),
+            "error": repr(exc),
+        }
+    write_json(card_path, row)
+    return row
+
+
+def select_frontier_card_candidates(*, manifest: Path, config: FrontierCardConfig) -> list[FrontierCardCandidate]:
+    candidates: list[FrontierCardCandidate] = []
+    for record in read_paper_records(manifest):
+        if config.paper_ids and record.paper_id not in config.paper_ids:
+            continue
+        if record.parse_status != "ok" or not record.pdf_path:
+            continue
+        text_path, resolved_text_source = resolve_record_text_path(record, config.text_source)
+        pdf_path = Path(record.pdf_path)
+        if not pdf_path.exists():
+            continue
+        paper_text = truncate_text(read_text_path(text_path), config.per_paper_char_budget)
+        candidates.append(
+            FrontierCardCandidate(
+                record=record,
+                text_path=text_path,
+                resolved_text_source=resolved_text_source,
+                paper_text=paper_text,
+                pdf_path=pdf_path,
+                pdf_excerpt_path=config.pdf_excerpt_dir / f"{record.paper_id}.first{config.pdf_excerpt_pages}.pdf",
+            )
+        )
+        if config.limit is not None and len(candidates) >= config.limit:
+            break
+    return candidates
+
+
+def build_frontier_card_messages(
+    candidate: FrontierCardCandidate,
+    *,
+    config: FrontierCardConfig,
+) -> list[dict[str, Any]]:
+    system = f"""You are a frontier reference judge for an ICML accepted-paper impact study.
+
+Use the supplied first-{config.pdf_excerpt_pages}-page PDF and extracted main-paper text. The PDF is included so you can inspect figures, tables, diagrams, experimental displays, and visual evidence that may not survive text extraction. Do not use web search, citation memory, author identity, institution, or external knowledge.
+
+Your task is to create a calibrated paper judgment card that will later feed an ensemble/tournament gold ranking. Be strict: broad impact requires a credible path to changing scientific practice, ML practice, theory, evaluation, safety, infrastructure, or reusable community resources. Technical soundness is a gate, not the only objective.
+
+Return only valid JSON."""
+    user_text = f"""Evaluate this ICML accepted paper as a candidate for the strongest papers in {config.paper_set_name}.
+
+Paper id: {candidate.record.paper_id}
+Title: {candidate.record.title}
+
+Use both inputs:
+- First-{config.pdf_excerpt_pages}-page PDF attachment for figures/tables/layout/evidence.
+- Extracted text below for searchable details.
+
+Contribution classes:
+{", ".join(CONTRIBUTION_CLASSES)}
+
+Required JSON shape:
+{{
+  "evaluation_mode": "frontier_pdf_paper_card",
+  "prompt_version": "{config.prompt_version}",
+  "judge": "{config.provider}:{config.model}",
+  "paper_id": "{candidate.record.paper_id}",
+  "title": "title",
+  "primary_contribution_class": "core_ml_algorithm",
+  "secondary_contribution_classes": ["scientific_modeling_tool"],
+  "scores": {{
+    "overall_gold_priority_score": 1,
+    "broad_scientific_impact_score": 1,
+    "ml_field_impact_score": 1,
+    "technical_soundness_score": 1,
+    "novelty_score": 1,
+    "evidence_confidence_score": 1,
+    "visual_evidence_importance_score": 1
+  }},
+  "impact_assessment": {{
+    "two_year_adoption_path": "who uses it and what changes",
+    "five_year_field_effect": "what durable effect could remain",
+    "best_case_for_impact": "strongest plausible impact route",
+    "main_risk": "main reason this may not matter or hold up",
+    "why_not_higher": "calibration reason",
+    "why_not_lower": "calibration reason"
+  }},
+  "evidence_from_pdf": {{
+    "figures_or_tables_that_matter": ["specific observed evidence from the PDF"],
+    "visual_or_tabular_evidence_changes_judgment": "yes/no/maybe plus why",
+    "missing_or_weak_visual_evidence": ["important caveats"]
+  }},
+  "ranking_hooks": {{
+    "beats_papers_when": "conditions under which this should rank above peers",
+    "loses_to_papers_when": "conditions under which this should rank below peers",
+    "category_standout": true,
+    "top_10_case": "case for or against being top 10 in this 50-paper diagnostic"
+  }},
+  "one_sentence_summary": "dense impact summary"
+}}
+
+Scoring calibration:
+- 10: plausible best-of-conference or field-shaping impact.
+- 8-9: clear high-impact finalist with strong evidence.
+- 6-7: solid accepted paper, useful but impact route is narrower or evidence-limited.
+- 4-5: incremental, fragile, or mainly local interest.
+- 1-3: serious soundness/relevance concerns for broad-impact ranking.
+
+Extracted main-paper text:
+<<<PAPER_TEXT
+{candidate.paper_text}
+PAPER_TEXT
+"""
+    return [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_text},
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": candidate.pdf_excerpt_path.name,
+                        "file_data": encode_pdf_data_url(candidate.pdf_excerpt_path),
+                        "path": str(candidate.pdf_excerpt_path),
+                    },
+                },
+            ],
+        },
+    ]
+
+
+def build_frontier_card_ensemble(
+    *,
+    card_paths: list[Path],
+    out: Path,
+    paper_set_name: str,
+    prompt_version: str = FRONTIER_CARD_ENSEMBLE_VERSION,
+) -> dict[str, Any]:
+    rows = load_card_rows(card_paths)
+    by_paper: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if row.get("status") != "ok":
+            continue
+        paper_id = str(row.get("paper_id") or "")
+        if paper_id:
+            by_paper.setdefault(paper_id, []).append(row)
+    ranked_items = [ensemble_item(paper_id, paper_rows) for paper_id, paper_rows in by_paper.items()]
+    ranked_items.sort(
+        key=lambda item: (
+            number(item.get("ensemble_gold_priority_score")),
+            number(item.get("ensemble_broad_scientific_impact_score")),
+            -number(item.get("judge_score_stddev")),
+            number(item.get("ensemble_technical_soundness_score")),
+        ),
+        reverse=True,
+    )
+    for rank, item in enumerate(ranked_items, start=1):
+        item["rank"] = rank
+    payload = {
+        "evaluation_mode": "frontier_pdf_card_ensemble",
+        "prompt_version": prompt_version,
+        "paper_set": paper_set_name,
+        "card_paths": [str(path) for path in card_paths],
+        "candidate_count": len(ranked_items),
+        "judge_count_by_paper": {paper_id: len(paper_rows) for paper_id, paper_rows in sorted(by_paper.items())},
+        "ranked_papers": ranked_items,
+        "category_rankings": build_category_rankings(ranked_items),
+        "method_notes": {
+            "modality": "Each judge card saw the configured first-page PDF excerpt plus extracted main-paper text.",
+            "ranking_method": "Mean normalized frontier-card scores with disagreement retained for later tournament adjudication.",
+            "limitation": "This is a PDF-aware ensemble prior, not the final pairwise tournament ranking.",
+        },
+    }
+    write_json(out, payload)
+    return payload
+
+
+def run_frontier_card_synthesis(
+    *,
+    card_paths: list[Path],
+    out: Path,
+    run_dir: Path,
+    config: FrontierSynthesisConfig,
+    client: ChatCompletionClient | None,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    rows = load_card_rows(card_paths)
+    rows_by_paper: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if row.get("status") != "ok":
+            continue
+        paper_id = str(row.get("paper_id") or "")
+        if paper_id:
+            rows_by_paper.setdefault(paper_id, []).append(row)
+    paper_ids = sorted(rows_by_paper)
+    messages = build_frontier_synthesis_messages(rows_by_paper, config=config)
+    prompt_payload = {
+        "prompt_version": config.prompt_version,
+        "provider": config.provider,
+        "model": config.model,
+        "reasoning_effort": config.reasoning_effort,
+        "paper_set_name": config.paper_set_name,
+        "card_paths": [str(path) for path in card_paths],
+        "candidate_count": len(paper_ids),
+        "candidate_ids": paper_ids,
+        "messages": messages,
+        "prompt_tokens_estimate": sum(estimate_tokens(_message_text_for_estimate(message)) for message in messages),
+    }
+    prompt_path = run_dir / "prompt.json"
+    write_json(prompt_path, prompt_payload)
+    base_result: dict[str, Any] = {
+        "status": "dry_run" if config.dry_run else "pending",
+        "provider": config.provider,
+        "model": config.model,
+        "reasoning_effort": config.reasoning_effort,
+        "prompt_version": config.prompt_version,
+        "paper_set_name": config.paper_set_name,
+        "card_paths": [str(path) for path in card_paths],
+        "out": str(out),
+        "run_dir": str(run_dir),
+        "candidate_count": len(paper_ids),
+        "candidate_ids": paper_ids,
+        "prompt_path": str(prompt_path),
+        "raw_response_path": None,
+        "parsed_response_path": None,
+        "validation_errors": [],
+    }
+    if config.dry_run:
+        result = {**base_result, "elapsed_seconds": round(time.monotonic() - started, 3)}
+        write_json(out, result)
+        write_json(run_dir / "run.json", result)
+        return result
+    if client is None:
+        raise ValueError("client is required unless dry_run=True")
+    try:
+        chat = client.complete(
+            messages=messages,
+            temperature=config.temperature,
+            max_output_tokens=config.max_output_tokens,
+            seed=config.seed,
+            response_format={"type": "json_object"},
+        )
+        raw_response_path = run_dir / "response.json"
+        write_json(raw_response_path, chat.response)
+        parsed = parse_json_response(chat.content)
+        validation_errors = validate_synthesis_ranking(parsed, expected_ids=paper_ids)
+        parsed_response_path = run_dir / "parsed.json"
+        write_json(parsed_response_path, parsed)
+        result = {
+            **base_result,
+            "status": "ok" if not validation_errors else "validation_error",
+            "raw_response_path": str(raw_response_path),
+            "parsed_response_path": str(parsed_response_path),
+            "validation_errors": validation_errors,
+            "served_model": chat.served_model,
+            "usage": chat.usage,
+            "provider_elapsed_seconds": round(chat.elapsed_seconds, 3),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "ranking": parsed,
+        }
+    except Exception as exc:  # noqa: BLE001 - persist failed synthesis attempts.
+        error_path = run_dir / "error.json"
+        write_json(error_path, {"error": repr(exc)})
+        result = {
+            **base_result,
+            "status": "failed",
+            "error_path": str(error_path),
+            "error": repr(exc),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+    write_json(out, result if result["status"] == "failed" else result["ranking"])
+    write_json(run_dir / "run.json", result)
+    return result
+
+
+def run_frontier_card_tournament(
+    *,
+    card_paths: list[Path],
+    seed_ranking_path: Path,
+    out: Path,
+    run_dir: Path,
+    config: FrontierTournamentConfig,
+    client: ChatCompletionClient | None,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    if config.top_n < 2:
+        raise ValueError("top_n must be at least 2")
+    if config.pairs_per_batch < 1:
+        raise ValueError("pairs_per_batch must be at least 1")
+    if config.strategy not in {"all_pairs", "swiss", "swiss_playoff"}:
+        raise ValueError(f"unsupported tournament strategy: {config.strategy}")
+    if config.strategy in {"swiss", "swiss_playoff"} and config.swiss_rounds < 1:
+        raise ValueError("swiss_rounds must be at least 1 for Swiss strategies")
+    if config.strategy == "swiss_playoff":
+        if config.playoff_top_n is None or config.playoff_top_n < 2:
+            raise ValueError("playoff_top_n must be at least 2 for swiss_playoff")
+        if config.playoff_top_n > config.top_n:
+            raise ValueError("playoff_top_n cannot exceed top_n")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "batches").mkdir(parents=True, exist_ok=True)
+
+    seed_payload = json.loads(seed_ranking_path.read_text(encoding="utf-8"))
+    seed_ranked = seed_payload.get("ranked_papers")
+    if not isinstance(seed_ranked, list):
+        raise ValueError(f"seed ranking missing ranked_papers: {seed_ranking_path}")
+    seed_ranked = [row for row in seed_ranked if isinstance(row, dict)]
+    seed_ids = [str(row.get("paper_id") or "") for row in sorted(seed_ranked, key=lambda row: number(row.get("rank")))]
+    seed_ids = [paper_id for paper_id in seed_ids if paper_id]
+    tournament_ids = seed_ids[: config.top_n]
+
+    rows = load_card_rows(card_paths)
+    rows_by_paper: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if row.get("status") != "ok":
+            continue
+        paper_id = str(row.get("paper_id") or "")
+        if paper_id:
+            rows_by_paper.setdefault(paper_id, []).append(row)
+    missing_cards = [paper_id for paper_id in tournament_ids if paper_id not in rows_by_paper]
+    if missing_cards:
+        raise ValueError(f"missing card rows for tournament papers: {missing_cards}")
+
+    planned_pairs = build_tournament_pairs(tournament_ids) if config.strategy == "all_pairs" else []
+    batch_count_estimate = estimate_tournament_batch_count(config)
+    run_payload = {
+        "prompt_version": config.prompt_version,
+        "provider": config.provider,
+        "model": config.model,
+        "reasoning_effort": config.reasoning_effort,
+        "paper_set_name": config.paper_set_name,
+        "strategy": config.strategy,
+        "card_paths": [str(path) for path in card_paths],
+        "seed_ranking_path": str(seed_ranking_path),
+        "out": str(out),
+        "run_dir": str(run_dir),
+        "top_n": config.top_n,
+        "swiss_rounds": config.swiss_rounds,
+        "playoff_top_n": config.playoff_top_n,
+        "pairs_per_batch": config.pairs_per_batch,
+        "tournament_ids": tournament_ids,
+        "pair_count": len(planned_pairs),
+        "batch_count_estimate": batch_count_estimate,
+        "dry_run": config.dry_run,
+    }
+    write_json(run_dir / "run.request.json", run_payload)
+
+    seed_rank_by_id = {paper_id: rank for rank, paper_id in enumerate(seed_ids, start=1)}
+    schedule_result = run_tournament_schedule(
+        tournament_ids=tournament_ids,
+        rows_by_paper=rows_by_paper,
+        seed_ranked=seed_ranked,
+        seed_rank_by_id=seed_rank_by_id,
+        run_dir=run_dir,
+        config=config,
+        client=client,
+        batch_count_estimate=batch_count_estimate,
+    )
+    batch_results = schedule_result["batch_results"]
+    matches = schedule_result["matches"]
+    tournament_stats = schedule_result["tournament_stats"]
+    tournament_order_ids = [str(row.get("paper_id")) for row in tournament_stats]
+
+    failed_batches = [row for row in batch_results if row.get("status") not in {"ok", "dry_run"}]
+    if config.dry_run:
+        result = {
+            **run_payload,
+            "status": "dry_run",
+            "batch_results": batch_results,
+            "schedule": schedule_result["schedule"],
+            "pair_count": schedule_result["scheduled_pair_count"],
+            "batch_count": len(batch_results),
+            "playoff_ids": schedule_result.get("playoff_ids", []),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+        write_json(out, result)
+        write_json(run_dir / "run.json", result)
+        return result
+    if failed_batches:
+        result = {
+            **run_payload,
+            "status": "partial",
+            "ok_batch_count": len(batch_results) - len(failed_batches),
+            "failed_batch_count": len(failed_batches),
+            "failed_batches": failed_batches,
+            "match_count": len(matches),
+            "pair_count": schedule_result["scheduled_pair_count"],
+            "batch_count": len(batch_results),
+            "schedule": schedule_result["schedule"],
+            "playoff_ids": schedule_result.get("playoff_ids", []),
+            "usage": sum_usage(row.get("usage") for row in batch_results),
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        }
+        write_json(out, result)
+        write_json(run_dir / "run.json", result)
+        return result
+
+    payload = build_tournament_gold_payload(
+        seed_payload=seed_payload,
+        seed_ranked=seed_ranked,
+        tournament_ids=tournament_ids,
+        tournament_stats=tournament_stats,
+        config=config,
+        card_paths=card_paths,
+        seed_ranking_path=seed_ranking_path,
+        run_dir=run_dir,
+        matches=matches,
+        batch_results=batch_results,
+        elapsed_seconds=round(time.monotonic() - started, 3),
+        schedule=schedule_result["schedule"],
+        playoff_ids=schedule_result.get("playoff_ids", []),
+    )
+    write_json(out, payload)
+    result = {
+        **run_payload,
+        "status": "ok",
+        "ok_batch_count": len(batch_results),
+        "failed_batch_count": 0,
+        "match_count": len(matches),
+        "pair_count": schedule_result["scheduled_pair_count"],
+        "batch_count": len(batch_results),
+        "playoff_ids": schedule_result.get("playoff_ids", []),
+        "top_ranked_ids": tournament_order_ids[: min(20, len(tournament_order_ids))],
+        "usage": sum_usage(row.get("usage") for row in batch_results),
+        "elapsed_seconds": payload["tournament_summary"]["elapsed_seconds"],
+    }
+    write_json(run_dir / "run.json", result)
+    return result
+
+
+def run_tournament_schedule(
+    *,
+    tournament_ids: list[str],
+    rows_by_paper: dict[str, list[dict[str, Any]]],
+    seed_ranked: list[dict[str, Any]],
+    seed_rank_by_id: dict[str, int],
+    run_dir: Path,
+    config: FrontierTournamentConfig,
+    client: ChatCompletionClient | None,
+    batch_count_estimate: int,
+) -> dict[str, Any]:
+    if config.strategy == "all_pairs":
+        return run_all_pairs_schedule(
+            tournament_ids=tournament_ids,
+            rows_by_paper=rows_by_paper,
+            seed_ranked=seed_ranked,
+            seed_rank_by_id=seed_rank_by_id,
+            run_dir=run_dir,
+            config=config,
+            client=client,
+        )
+    return run_swiss_schedule(
+        tournament_ids=tournament_ids,
+        rows_by_paper=rows_by_paper,
+        seed_ranked=seed_ranked,
+        seed_rank_by_id=seed_rank_by_id,
+        run_dir=run_dir,
+        config=config,
+        client=client,
+        batch_count_estimate=batch_count_estimate,
+    )
+
+
+def run_all_pairs_schedule(
+    *,
+    tournament_ids: list[str],
+    rows_by_paper: dict[str, list[dict[str, Any]]],
+    seed_ranked: list[dict[str, Any]],
+    seed_rank_by_id: dict[str, int],
+    run_dir: Path,
+    config: FrontierTournamentConfig,
+    client: ChatCompletionClient | None,
+) -> dict[str, Any]:
+    pairs = build_tournament_pairs(tournament_ids)
+    pair_batches = batch_tournament_pairs(pairs, config.pairs_per_batch)
+    batch_results, matches = run_pair_batches(
+        pair_batches=pair_batches,
+        rows_by_paper=rows_by_paper,
+        seed_ranked=seed_ranked,
+        start_batch_index=0,
+        batch_count=len(pair_batches),
+        run_dir=run_dir,
+        config=config,
+        client=client,
+    )
+    tournament_stats = aggregate_tournament_matches(
+        matches,
+        tournament_ids=tournament_ids,
+        seed_rank_by_id=seed_rank_by_id,
+    )
+    return {
+        "batch_results": batch_results,
+        "matches": matches,
+        "tournament_stats": tournament_stats,
+        "scheduled_pair_count": len(pairs),
+        "schedule": [
+            {
+                "stage": "all_pairs",
+                "pair_count": len(pairs),
+                "batch_count": len(pair_batches),
+            }
+        ],
+        "playoff_ids": [],
+    }
+
+
+def run_swiss_schedule(
+    *,
+    tournament_ids: list[str],
+    rows_by_paper: dict[str, list[dict[str, Any]]],
+    seed_ranked: list[dict[str, Any]],
+    seed_rank_by_id: dict[str, int],
+    run_dir: Path,
+    config: FrontierTournamentConfig,
+    client: ChatCompletionClient | None,
+    batch_count_estimate: int,
+) -> dict[str, Any]:
+    batch_results: list[dict[str, Any]] = []
+    matches: list[dict[str, Any]] = []
+    standings_matches: list[dict[str, Any]] = []
+    schedule: list[dict[str, Any]] = []
+    played_pair_keys: set[frozenset[str]] = set()
+    standings_ids = list(tournament_ids)
+    batch_index = 0
+
+    for round_index in range(config.swiss_rounds):
+        round_pairs = build_swiss_round_pairs(standings_ids, played_pair_keys)
+        pair_batches = batch_tournament_pairs(round_pairs, config.pairs_per_batch)
+        round_batch_results, round_matches = run_pair_batches(
+            pair_batches=pair_batches,
+            rows_by_paper=rows_by_paper,
+            seed_ranked=seed_ranked,
+            start_batch_index=batch_index,
+            batch_count=batch_count_estimate,
+            run_dir=run_dir,
+            config=config,
+            client=client,
+        )
+        batch_index += len(pair_batches)
+        batch_results.extend(round_batch_results)
+        matches.extend(round_matches)
+        schedule.append(
+            {
+                "stage": "swiss",
+                "round": round_index + 1,
+                "pair_count": len(round_pairs),
+                "batch_count": len(pair_batches),
+                "standings_before_round": standings_ids,
+            }
+        )
+        if any(row.get("status") not in {"ok", "dry_run"} for row in round_batch_results):
+            break
+        standings_input = matches
+        if config.dry_run:
+            standings_matches.extend(synthetic_seed_matches(round_pairs, seed_rank_by_id=seed_rank_by_id))
+            standings_input = standings_matches
+        standings = aggregate_tournament_matches(
+            standings_input,
+            tournament_ids=tournament_ids,
+            seed_rank_by_id=seed_rank_by_id,
+        )
+        standings_ids = [str(row.get("paper_id")) for row in standings]
+
+    playoff_ids: list[str] = []
+    if (
+        config.strategy == "swiss_playoff"
+        and not config.dry_run
+        and not any(row.get("status") not in {"ok", "dry_run"} for row in batch_results)
+    ):
+        swiss_stats = aggregate_tournament_matches(
+            matches,
+            tournament_ids=tournament_ids,
+            seed_rank_by_id=seed_rank_by_id,
+        )
+        playoff_ids = [str(row.get("paper_id")) for row in swiss_stats[: config.playoff_top_n]]
+        playoff_pairs = [
+            pair
+            for pair in build_tournament_pairs(playoff_ids)
+            if frozenset(pair) not in {frozenset((str(match.get("paper_a")), str(match.get("paper_b")))) for match in matches}
+        ]
+        pair_batches = batch_tournament_pairs(playoff_pairs, config.pairs_per_batch)
+        playoff_batch_results, playoff_matches = run_pair_batches(
+            pair_batches=pair_batches,
+            rows_by_paper=rows_by_paper,
+            seed_ranked=seed_ranked,
+            start_batch_index=batch_index,
+            batch_count=batch_count_estimate,
+            run_dir=run_dir,
+            config=config,
+            client=client,
+        )
+        batch_results.extend(playoff_batch_results)
+        matches.extend(playoff_matches)
+        schedule.append(
+            {
+                "stage": "playoff_all_pairs",
+                "playoff_top_n": config.playoff_top_n,
+                "playoff_ids": playoff_ids,
+                "pair_count": len(playoff_pairs),
+                "batch_count": len(pair_batches),
+            }
+        )
+    elif config.strategy == "swiss_playoff" and config.dry_run:
+        playoff_ids = standings_ids[: config.playoff_top_n]
+        playoff_pairs = [
+            pair for pair in build_tournament_pairs(playoff_ids) if frozenset(pair) not in played_pair_keys
+        ]
+        pair_batches = batch_tournament_pairs(playoff_pairs, config.pairs_per_batch)
+        playoff_batch_results, _ = run_pair_batches(
+            pair_batches=pair_batches,
+            rows_by_paper=rows_by_paper,
+            seed_ranked=seed_ranked,
+            start_batch_index=batch_index,
+            batch_count=batch_count_estimate,
+            run_dir=run_dir,
+            config=config,
+            client=client,
+        )
+        batch_results.extend(playoff_batch_results)
+        schedule.append(
+            {
+                "stage": "playoff_all_pairs",
+                "playoff_top_n": config.playoff_top_n,
+                "playoff_ids": playoff_ids,
+                "pair_count": len(playoff_pairs),
+                "batch_count": len(pair_batches),
+                "dry_run_note": "Dry run uses seed-order synthetic match results to plan Swiss standings.",
+            }
+        )
+
+    tournament_stats = aggregate_sparse_or_hybrid_stats(
+        matches,
+        tournament_ids=tournament_ids,
+        seed_rank_by_id=seed_rank_by_id,
+        playoff_ids=playoff_ids,
+        strategy=config.strategy,
+    )
+    return {
+        "batch_results": batch_results,
+        "matches": matches,
+        "tournament_stats": tournament_stats,
+        "scheduled_pair_count": scheduled_pair_count(schedule),
+        "schedule": schedule,
+        "playoff_ids": playoff_ids,
+    }
+
+
+def run_pair_batches(
+    *,
+    pair_batches: list[list[tuple[str, str]]],
+    rows_by_paper: dict[str, list[dict[str, Any]]],
+    seed_ranked: list[dict[str, Any]],
+    start_batch_index: int,
+    batch_count: int,
+    run_dir: Path,
+    config: FrontierTournamentConfig,
+    client: ChatCompletionClient | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    batch_results: list[dict[str, Any]] = []
+    matches: list[dict[str, Any]] = []
+    for offset, pairs in enumerate(pair_batches):
+        batch_result = run_frontier_tournament_batch(
+            pairs=pairs,
+            rows_by_paper=rows_by_paper,
+            seed_ranked=seed_ranked,
+            batch_index=start_batch_index + offset,
+            batch_count=max(batch_count, start_batch_index + len(pair_batches)),
+            run_dir=run_dir,
+            config=config,
+            client=client,
+        )
+        batch_results.append(batch_result)
+        if batch_result.get("status") == "ok":
+            parsed = batch_result.get("parsed")
+            if isinstance(parsed, dict) and isinstance(parsed.get("matches"), list):
+                matches.extend(match for match in parsed["matches"] if isinstance(match, dict))
+    return batch_results, matches
+
+
+def run_frontier_tournament_batch(
+    *,
+    pairs: list[tuple[str, str]],
+    rows_by_paper: dict[str, list[dict[str, Any]]],
+    seed_ranked: list[dict[str, Any]],
+    batch_index: int,
+    batch_count: int,
+    run_dir: Path,
+    config: FrontierTournamentConfig,
+    client: ChatCompletionClient | None,
+) -> dict[str, Any]:
+    batch_dir = run_dir / "batches" / f"batch_{batch_index:03d}"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    parsed_path = batch_dir / "parsed.json"
+    expected = {pair_id_for(a, b): (a, b) for a, b in pairs}
+    cache_reuse_error: str | None = None
+    if parsed_path.exists() and not config.overwrite:
+        try:
+            parsed = json.loads(parsed_path.read_text(encoding="utf-8"))
+            parsed = normalize_tournament_batch(parsed, expected_pairs=expected)
+            validation_errors = validate_tournament_batch(parsed, expected_pairs=expected)
+            if not validation_errors:
+                return {
+                    "status": "ok",
+                    "batch_index": batch_index,
+                    "batch_count": batch_count,
+                    "pair_count": len(pairs),
+                    "parsed_response_path": str(parsed_path),
+                    "validation_errors": [],
+                    "parsed": parsed,
+                    "resumed_from": str(parsed_path),
+                }
+            cache_reuse_error = "; ".join(validation_errors)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            cache_reuse_error = repr(exc)
+
+    messages = build_frontier_tournament_messages(
+        pairs=pairs,
+        rows_by_paper=rows_by_paper,
+        seed_ranked=seed_ranked,
+        batch_index=batch_index,
+        batch_count=batch_count,
+        config=config,
+    )
+    prompt_path = batch_dir / "prompt.json"
+    write_json(
+        prompt_path,
+        {
+            "prompt_version": config.prompt_version,
+            "provider": config.provider,
+            "model": config.model,
+            "reasoning_effort": config.reasoning_effort,
+            "paper_set_name": config.paper_set_name,
+            "batch_index": batch_index,
+            "batch_count": batch_count,
+            "pair_count": len(pairs),
+            "pairs": [{"pair_id": pair_id_for(a, b), "paper_a": a, "paper_b": b} for a, b in pairs],
+            "messages": messages,
+            "prompt_tokens_estimate": sum(estimate_tokens(_message_text_for_estimate(message)) for message in messages),
+        },
+    )
+    base_result: dict[str, Any] = {
+        "status": "dry_run" if config.dry_run else "pending",
+        "batch_index": batch_index,
+        "batch_count": batch_count,
+        "pair_count": len(pairs),
+        "prompt_path": str(prompt_path),
+        "raw_response_path": None,
+        "parsed_response_path": None,
+        "validation_errors": [],
+        "cache_reuse_error": cache_reuse_error,
+    }
+    if config.dry_run:
+        write_json(batch_dir / "run.json", base_result)
+        return base_result
+    if client is None:
+        raise ValueError("client is required unless dry_run=True")
+    try:
+        chat = client.complete(
+            messages=messages,
+            temperature=config.temperature,
+            max_output_tokens=config.max_output_tokens,
+            seed=config.seed,
+            response_format={"type": "json_object"},
+        )
+        raw_response_path = batch_dir / "response.json"
+        write_json(raw_response_path, chat.response)
+        parsed = parse_json_response(chat.content)
+        parsed = normalize_tournament_batch(parsed, expected_pairs=expected)
+        validation_errors = validate_tournament_batch(parsed, expected_pairs=expected)
+        write_json(parsed_path, parsed)
+        result = {
+            **base_result,
+            "status": "ok" if not validation_errors else "validation_error",
+            "raw_response_path": str(raw_response_path),
+            "parsed_response_path": str(parsed_path),
+            "validation_errors": validation_errors,
+            "served_model": chat.served_model,
+            "usage": chat.usage,
+            "provider_elapsed_seconds": round(chat.elapsed_seconds, 3),
+            "parsed": parsed,
+        }
+    except Exception as exc:  # noqa: BLE001 - batch-local persistence enables retry.
+        error_path = batch_dir / "error.json"
+        write_json(error_path, {"error": repr(exc)})
+        result = {
+            **base_result,
+            "status": "failed",
+            "error_path": str(error_path),
+            "error": repr(exc),
+        }
+    write_json(batch_dir / "run.json", {key: value for key, value in result.items() if key != "parsed"})
+    return result
+
+
+def build_frontier_tournament_messages(
+    *,
+    pairs: list[tuple[str, str]],
+    rows_by_paper: dict[str, list[dict[str, Any]]],
+    seed_ranked: list[dict[str, Any]],
+    batch_index: int,
+    batch_count: int,
+    config: FrontierTournamentConfig,
+) -> list[dict[str, Any]]:
+    system = """You are a frontier pairwise judge finalizing an ICML accepted-paper gold ranking.
+
+You are comparing papers using independent PDF-aware evidence cards created by frontier judges after each saw the configured first-page paper PDF excerpt plus extracted main-paper text. Treat those cards as evidence. Do not use web search, author identity, institution, citation memory, or outside knowledge.
+
+For every pair, choose the paper with the stronger expected broad scientific and ML-field impact, using technical soundness and evidence quality as gates. Prefer concrete durable contributions over paper polish. Benchmarks, datasets, infrastructure, safety/eval resources, scientific tools, theory, and algorithms can all be highly impactful, but their impact route should be explicit and credible.
+
+Return only valid JSON."""
+    seed_by_id = {str(row.get("paper_id") or ""): row for row in seed_ranked if str(row.get("paper_id") or "")}
+    batch_ids = sorted({paper_id for pair in pairs for paper_id in pair}, key=lambda paper_id: number(seed_by_id.get(paper_id, {}).get("rank")))
+    paper_blocks = "\n\n".join(
+        format_tournament_paper_block(paper_id, rows_by_paper[paper_id], seed_item=seed_by_id.get(paper_id, {}))
+        for paper_id in batch_ids
+    )
+    pair_lines = "\n".join(
+        f"- pair_id={pair_id_for(a, b)} | paper_a={a} | paper_b={b}"
+        for a, b in pairs
+    )
+    user = f"""Adjudicate tournament batch {batch_index + 1} of {batch_count} for {config.paper_set_name}.
+
+Evaluate each pair independently. A "tie" is allowed only when the expected impact difference is genuinely indistinguishable from the card evidence. For close but real differences, choose a winner with impact_delta="small".
+
+Required JSON shape:
+{{
+  "evaluation_mode": "frontier_pdf_card_pairwise_tournament_batch",
+  "prompt_version": "{config.prompt_version}",
+  "judge": "{config.provider}:{config.model}",
+  "paper_set": "{config.paper_set_name}",
+  "batch_index": {batch_index},
+  "matches": [
+    {{
+      "pair_id": "paperA__paperB",
+      "paper_a": "paper id",
+      "paper_b": "paper id",
+      "winner": "paper_a",
+      "winner_paper_id": "paper id",
+      "confidence": 0.72,
+      "impact_delta": "small",
+      "reason": "One concise comparative reason grounded in the card evidence."
+    }}
+  ]
+}}
+
+Winner rules:
+- winner must be one of: "paper_a", "paper_b", "tie".
+- winner_paper_id must equal paper_a, paper_b, or "" for a tie.
+- confidence must be between 0 and 1.
+- impact_delta must be one of: "large", "medium", "small", "tie".
+- Return exactly these {len(pairs)} pair decisions and no others:
+{pair_lines}
+
+PDF-aware evidence cards:
+{paper_blocks}
+"""
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def format_tournament_paper_block(paper_id: str, rows: list[dict[str, Any]], *, seed_item: dict[str, Any]) -> str:
+    cards = [row.get("card") for row in rows if isinstance(row.get("card"), dict)]
+    title = first_nonempty([*(card.get("title") for card in cards), seed_item.get("title")])
+    primary_class = majority(
+        str(card.get("primary_contribution_class") or "other")
+        for card in cards
+        if isinstance(card, dict)
+    )
+    lines = [f"<PAPER id=\"{paper_id}\">", f"Title: {title}", f"Contribution class: {primary_class}"]
+    for card in cards:
+        scores = card.get("scores") if isinstance(card.get("scores"), dict) else {}
+        lines.extend(
+            [
+                (
+                    "Judge {judge}: overall={overall} broad={broad} ml={ml} soundness={soundness} "
+                    "novelty={novelty} evidence={evidence} visual={visual}"
+                ).format(
+                    judge=truncate_inline(str(card.get("judge") or "unknown"), 72),
+                    overall=scores.get("overall_gold_priority_score"),
+                    broad=scores.get("broad_scientific_impact_score"),
+                    ml=scores.get("ml_field_impact_score"),
+                    soundness=scores.get("technical_soundness_score"),
+                    novelty=scores.get("novelty_score"),
+                    evidence=scores.get("evidence_confidence_score"),
+                    visual=scores.get("visual_evidence_importance_score"),
+                ),
+                f"  Summary: {truncate_inline(card.get('one_sentence_summary'), 260)}",
+                f"  Best case: {truncate_inline(nested_get(card, 'impact_assessment', 'best_case_for_impact'), 320)}",
+                f"  Main risk: {truncate_inline(nested_get(card, 'impact_assessment', 'main_risk'), 260)}",
+                f"  Top-10 case: {truncate_inline(nested_get(card, 'ranking_hooks', 'top_10_case'), 320)}",
+                f"  Visual/table effect: {truncate_inline(nested_get(card, 'evidence_from_pdf', 'visual_or_tabular_evidence_changes_judgment'), 260)}",
+            ]
+        )
+    lines.append("</PAPER>")
+    return "\n".join(str(line) for line in lines)
+
+
+def build_tournament_pairs(paper_ids: list[str]) -> list[tuple[str, str]]:
+    return list(itertools.combinations(paper_ids, 2))
+
+
+def build_swiss_round_pairs(standings_ids: list[str], played_pair_keys: set[frozenset[str]]) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    used: set[str] = set()
+    for paper_id in standings_ids:
+        if paper_id in used:
+            continue
+        opponent = None
+        for candidate_id in standings_ids:
+            key = frozenset((paper_id, candidate_id))
+            if candidate_id == paper_id or candidate_id in used or key in played_pair_keys:
+                continue
+            opponent = candidate_id
+            break
+        if opponent is None:
+            continue
+        used.add(paper_id)
+        used.add(opponent)
+        played_pair_keys.add(frozenset((paper_id, opponent)))
+        pairs.append((paper_id, opponent))
+    return pairs
+
+
+def synthetic_seed_matches(
+    pairs: list[tuple[str, str]],
+    *,
+    seed_rank_by_id: dict[str, int],
+) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for paper_a, paper_b in pairs:
+        winner_paper_id = paper_a if seed_rank_by_id.get(paper_a, 10**9) <= seed_rank_by_id.get(paper_b, 10**9) else paper_b
+        matches.append(
+            {
+                "pair_id": pair_id_for(paper_a, paper_b),
+                "paper_a": paper_a,
+                "paper_b": paper_b,
+                "winner": "paper_a" if winner_paper_id == paper_a else "paper_b",
+                "winner_paper_id": winner_paper_id,
+                "confidence": 0.5,
+                "impact_delta": "small",
+                "reason": "synthetic seed-order result for dry-run schedule planning",
+            }
+        )
+    return matches
+
+
+def batch_tournament_pairs(pairs: list[tuple[str, str]], pairs_per_batch: int) -> list[list[tuple[str, str]]]:
+    if pairs_per_batch < 1:
+        raise ValueError("pairs_per_batch must be positive")
+    return [pairs[index : index + pairs_per_batch] for index in range(0, len(pairs), pairs_per_batch)]
+
+
+def pair_id_for(paper_a: str, paper_b: str) -> str:
+    return f"{paper_a}__{paper_b}"
+
+
+def estimate_tournament_batch_count(config: FrontierTournamentConfig) -> int:
+    if config.strategy == "all_pairs":
+        pair_count = config.top_n * (config.top_n - 1) // 2
+    else:
+        swiss_pairs = config.swiss_rounds * (config.top_n // 2)
+        playoff_pairs = 0
+        if config.strategy == "swiss_playoff" and config.playoff_top_n:
+            playoff_pairs = config.playoff_top_n * (config.playoff_top_n - 1) // 2
+        pair_count = swiss_pairs + playoff_pairs
+    return math.ceil(pair_count / config.pairs_per_batch) if pair_count else 0
+
+
+def scheduled_pair_count(schedule: list[dict[str, Any]]) -> int:
+    return sum(int(number(row.get("pair_count"))) for row in schedule)
+
+
+def normalize_tournament_batch(
+    parsed: dict[str, Any],
+    *,
+    expected_pairs: dict[str, tuple[str, str]],
+) -> dict[str, Any]:
+    matches = parsed.get("matches")
+    if not isinstance(matches, list):
+        return parsed
+    normalized: list[dict[str, Any]] = []
+    expected_by_unordered = {frozenset((a, b)): (pair_id, a, b) for pair_id, (a, b) in expected_pairs.items()}
+    for raw_match in matches:
+        if not isinstance(raw_match, dict):
+            continue
+        match = dict(raw_match)
+        pair_id = str(match.get("pair_id") or "")
+        paper_a = str(match.get("paper_a") or "")
+        paper_b = str(match.get("paper_b") or "")
+        if pair_id not in expected_pairs and paper_a and paper_b:
+            expected = expected_by_unordered.get(frozenset((paper_a, paper_b)))
+            if expected:
+                pair_id, canonical_a, canonical_b = expected
+                match["pair_id"] = pair_id
+                match["paper_a"] = canonical_a
+                match["paper_b"] = canonical_b
+                paper_a, paper_b = canonical_a, canonical_b
+        if pair_id in expected_pairs:
+            paper_a, paper_b = expected_pairs[pair_id]
+            match["pair_id"] = pair_id
+            match["paper_a"] = paper_a
+            match["paper_b"] = paper_b
+
+        winner = str(match.get("winner") or "").strip().lower()
+        winner_paper_id = str(match.get("winner_paper_id") or "").strip()
+        if winner_paper_id == paper_a:
+            winner = "paper_a"
+        elif winner_paper_id == paper_b:
+            winner = "paper_b"
+        elif winner in {"a", "paper a", "paper_a", "first"}:
+            winner = "paper_a"
+            winner_paper_id = paper_a
+        elif winner in {"b", "paper b", "paper_b", "second"}:
+            winner = "paper_b"
+            winner_paper_id = paper_b
+        elif winner in {"tie", "draw", "equal"}:
+            winner = "tie"
+            winner_paper_id = ""
+        match["winner"] = winner
+        match["winner_paper_id"] = winner_paper_id
+        match["confidence"] = clamp(number(match.get("confidence")), 0.0, 1.0)
+        impact_delta = str(match.get("impact_delta") or "").strip().lower()
+        if impact_delta not in {"large", "medium", "small", "tie"}:
+            impact_delta = "tie" if winner == "tie" else "small"
+        if winner == "tie":
+            impact_delta = "tie"
+        match["impact_delta"] = impact_delta
+        normalized.append(match)
+    return {**parsed, "matches": normalized}
+
+
+def validate_tournament_batch(
+    parsed: dict[str, Any],
+    *,
+    expected_pairs: dict[str, tuple[str, str]],
+) -> list[str]:
+    matches = parsed.get("matches")
+    if not isinstance(matches, list):
+        return ["matches must be a list"]
+    errors: list[str] = []
+    pair_ids = [str(match.get("pair_id") or "") for match in matches if isinstance(match, dict)]
+    expected_set = set(expected_pairs)
+    actual_set = set(pair_ids)
+    missing = sorted(expected_set - actual_set)
+    extras = sorted(actual_set - expected_set)
+    duplicates = sorted({pair_id for pair_id in pair_ids if pair_ids.count(pair_id) > 1})
+    if missing:
+        errors.append(f"missing pair_ids: {missing}")
+    if extras:
+        errors.append(f"extra pair_ids: {extras}")
+    if duplicates:
+        errors.append(f"duplicate pair_ids: {duplicates}")
+    for match in matches:
+        if not isinstance(match, dict):
+            errors.append("each match must be an object")
+            continue
+        pair_id = str(match.get("pair_id") or "")
+        if pair_id not in expected_pairs:
+            continue
+        paper_a, paper_b = expected_pairs[pair_id]
+        if str(match.get("paper_a") or "") != paper_a:
+            errors.append(f"{pair_id}: paper_a mismatch")
+        if str(match.get("paper_b") or "") != paper_b:
+            errors.append(f"{pair_id}: paper_b mismatch")
+        winner = str(match.get("winner") or "")
+        winner_paper_id = str(match.get("winner_paper_id") or "")
+        if winner not in {"paper_a", "paper_b", "tie"}:
+            errors.append(f"{pair_id}: winner must be paper_a, paper_b, or tie")
+        elif winner == "paper_a" and winner_paper_id != paper_a:
+            errors.append(f"{pair_id}: winner_paper_id must equal paper_a")
+        elif winner == "paper_b" and winner_paper_id != paper_b:
+            errors.append(f"{pair_id}: winner_paper_id must equal paper_b")
+        elif winner == "tie" and winner_paper_id not in {"", paper_a, paper_b}:
+            errors.append(f"{pair_id}: tie winner_paper_id must be empty or one of the pair ids")
+        confidence = number(match.get("confidence"))
+        if confidence < 0 or confidence > 1:
+            errors.append(f"{pair_id}: confidence must be 0..1")
+        if str(match.get("impact_delta") or "") not in {"large", "medium", "small", "tie"}:
+            errors.append(f"{pair_id}: invalid impact_delta")
+    return errors
+
+
+def aggregate_tournament_matches(
+    matches: list[dict[str, Any]],
+    *,
+    tournament_ids: list[str],
+    seed_rank_by_id: dict[str, int],
+) -> list[dict[str, Any]]:
+    stats: dict[str, dict[str, Any]] = {
+        paper_id: {
+            "paper_id": paper_id,
+            "pairwise_points": 0.0,
+            "wins": 0,
+            "losses": 0,
+            "ties": 0,
+            "match_count": 0,
+            "confidence_margin": 0.0,
+            "large_wins": 0,
+            "medium_wins": 0,
+            "small_wins": 0,
+            "large_losses": 0,
+            "medium_losses": 0,
+            "small_losses": 0,
+            "seed_synthesis_rank": seed_rank_by_id.get(paper_id, 10**9),
+        }
+        for paper_id in tournament_ids
+    }
+    delta_weight = {"large": 1.0, "medium": 0.67, "small": 0.33, "tie": 0.0}
+    for match in matches:
+        pair_id = str(match.get("pair_id") or "")
+        paper_a = str(match.get("paper_a") or "")
+        paper_b = str(match.get("paper_b") or "")
+        if paper_a not in stats or paper_b not in stats:
+            continue
+        confidence = clamp(number(match.get("confidence")), 0.0, 1.0)
+        impact_delta = str(match.get("impact_delta") or "small")
+        margin = confidence * delta_weight.get(impact_delta, 0.33)
+        winner = str(match.get("winner") or "")
+        for paper_id in [paper_a, paper_b]:
+            stats[paper_id]["match_count"] += 1
+        if winner == "tie":
+            stats[paper_a]["pairwise_points"] += 0.5
+            stats[paper_b]["pairwise_points"] += 0.5
+            stats[paper_a]["ties"] += 1
+            stats[paper_b]["ties"] += 1
+            continue
+        winner_id = paper_a if winner == "paper_a" else paper_b if winner == "paper_b" else ""
+        loser_id = paper_b if winner == "paper_a" else paper_a if winner == "paper_b" else ""
+        if not winner_id or not loser_id:
+            continue
+        if impact_delta == "tie":
+            impact_delta = "small"
+            margin = confidence * delta_weight[impact_delta]
+        stats[winner_id]["pairwise_points"] += 1.0
+        stats[winner_id]["wins"] += 1
+        stats[loser_id]["losses"] += 1
+        stats[winner_id]["confidence_margin"] += margin
+        stats[loser_id]["confidence_margin"] -= margin
+        stats[winner_id][f"{impact_delta}_wins"] += 1
+        stats[loser_id][f"{impact_delta}_losses"] += 1
+        stats[winner_id].setdefault("notable_wins", []).append({"opponent": loser_id, "pair_id": pair_id, "impact_delta": impact_delta})
+        stats[loser_id].setdefault("notable_losses", []).append({"opponent": winner_id, "pair_id": pair_id, "impact_delta": impact_delta})
+
+    for item in stats.values():
+        match_count = max(number(item.get("match_count")), 1.0)
+        item["pairwise_point_rate"] = number(item.get("pairwise_points")) / match_count
+        item["confidence_margin_rate"] = number(item.get("confidence_margin")) / match_count
+
+    ordered = sorted(
+        stats.values(),
+        key=lambda item: (
+            -number(item.get("pairwise_point_rate")),
+            -number(item.get("pairwise_points")),
+            -number(item.get("wins")),
+            -number(item.get("confidence_margin_rate")),
+            number(item.get("seed_synthesis_rank")),
+            str(item.get("paper_id")),
+        ),
+    )
+    for rank, item in enumerate(ordered, start=1):
+        item["tournament_rank"] = rank
+        item["pairwise_points"] = round(number(item.get("pairwise_points")), 3)
+        item["pairwise_point_rate"] = round(number(item.get("pairwise_point_rate")), 4)
+        item["confidence_margin"] = round(number(item.get("confidence_margin")), 3)
+        item["confidence_margin_rate"] = round(number(item.get("confidence_margin_rate")), 4)
+        for key in ["notable_wins", "notable_losses"]:
+            if isinstance(item.get(key), list):
+                item[key] = item[key][:5]
+    return ordered
+
+
+def aggregate_sparse_or_hybrid_stats(
+    matches: list[dict[str, Any]],
+    *,
+    tournament_ids: list[str],
+    seed_rank_by_id: dict[str, int],
+    playoff_ids: list[str],
+    strategy: str,
+) -> list[dict[str, Any]]:
+    if strategy != "swiss_playoff" or not playoff_ids:
+        return aggregate_tournament_matches(
+            matches,
+            tournament_ids=tournament_ids,
+            seed_rank_by_id=seed_rank_by_id,
+        )
+    playoff_set = set(playoff_ids)
+    playoff_matches = [
+        match
+        for match in matches
+        if str(match.get("paper_a")) in playoff_set and str(match.get("paper_b")) in playoff_set
+    ]
+    playoff_stats = aggregate_tournament_matches(
+        playoff_matches,
+        tournament_ids=playoff_ids,
+        seed_rank_by_id=seed_rank_by_id,
+    )
+    swiss_stats = aggregate_tournament_matches(
+        matches,
+        tournament_ids=tournament_ids,
+        seed_rank_by_id=seed_rank_by_id,
+    )
+    swiss_by_id = {str(item.get("paper_id")): item for item in swiss_stats}
+    remaining_stats = [dict(swiss_by_id[paper_id]) for paper_id in tournament_ids if paper_id not in playoff_set]
+    remaining_stats.sort(
+        key=lambda item: (
+            -number(item.get("pairwise_point_rate")),
+            -number(item.get("pairwise_points")),
+            -number(item.get("wins")),
+            number(item.get("seed_synthesis_rank")),
+            str(item.get("paper_id")),
+        )
+    )
+    ordered = [dict(item, ranking_source_stage="playoff_all_pairs") for item in playoff_stats] + [
+        dict(item, ranking_source_stage="swiss_only") for item in remaining_stats
+    ]
+    for rank, item in enumerate(ordered, start=1):
+        item["tournament_rank"] = rank
+    return ordered
+
+
+def build_tournament_gold_payload(
+    *,
+    seed_payload: dict[str, Any],
+    seed_ranked: list[dict[str, Any]],
+    tournament_ids: list[str],
+    tournament_stats: list[dict[str, Any]],
+    config: FrontierTournamentConfig,
+    card_paths: list[Path],
+    seed_ranking_path: Path,
+    run_dir: Path,
+    matches: list[dict[str, Any]],
+    batch_results: list[dict[str, Any]],
+    elapsed_seconds: float,
+    schedule: list[dict[str, Any]],
+    playoff_ids: list[str],
+) -> dict[str, Any]:
+    seed_items = [dict(row) for row in sorted(seed_ranked, key=lambda row: number(row.get("rank")))]
+    seed_by_id = {str(row.get("paper_id") or ""): row for row in seed_items}
+    stats_by_id = {str(item.get("paper_id") or ""): item for item in tournament_stats}
+    tournament_order = [str(item.get("paper_id")) for item in tournament_stats]
+    remaining_order = [str(row.get("paper_id") or "") for row in seed_items if str(row.get("paper_id") or "") not in tournament_ids]
+    final_order = tournament_order + [paper_id for paper_id in remaining_order if paper_id]
+    ranked_papers: list[dict[str, Any]] = []
+    for rank, paper_id in enumerate(final_order, start=1):
+        item = dict(seed_by_id[paper_id])
+        seed_rank = int(number(item.get("rank")))
+        item["rank"] = rank
+        item["seed_synthesis_rank"] = seed_rank
+        if paper_id in stats_by_id:
+            item["tournament_stats"] = stats_by_id[paper_id]
+            item["ranking_source"] = "pairwise_tournament"
+        else:
+            item["ranking_source"] = "seed_synthesis_outside_tournament_pool"
+        ranked_papers.append(item)
+    usage = sum_usage(row.get("usage") for row in batch_results)
+    payload = {
+        "evaluation_mode": "frontier_pdf_card_pairwise_tournament_ranking",
+        "prompt_version": config.prompt_version,
+        "judge": f"{config.provider}:{config.model}",
+        "paper_set": config.paper_set_name,
+        "modality": "pairwise_tournament_over_pdf_aware_frontier_cards",
+        "tournament_strategy": config.strategy,
+        "source_seed": {
+            "path": str(seed_ranking_path),
+            "evaluation_mode": seed_payload.get("evaluation_mode"),
+            "prompt_version": seed_payload.get("prompt_version"),
+            "note": "Seed ranking selected the tournament pool and orders papers outside the pool.",
+        },
+        "card_paths": [str(path) for path in card_paths],
+        "ranked_papers": ranked_papers,
+        "category_rankings": build_category_rankings(ranked_papers),
+        "tournament_summary": {
+            "strategy": config.strategy,
+            "top_n": config.top_n,
+            "swiss_rounds": config.swiss_rounds,
+            "playoff_top_n": config.playoff_top_n,
+            "playoff_ids": playoff_ids,
+            "pair_count": len(matches),
+            "scheduled_pair_count": scheduled_pair_count(schedule),
+            "all_pairs_equivalent_pair_count": len(build_tournament_pairs(tournament_ids)),
+            "batch_count": len(batch_results),
+            "pairs_per_batch": config.pairs_per_batch,
+            "schedule": schedule,
+            "usage": usage,
+            "elapsed_seconds": elapsed_seconds,
+            "ranking_method": tournament_ranking_method_note(config),
+            "limitation": tournament_limitation_note(config),
+        },
+        "matches": matches,
+    }
+    return payload
+
+
+def tournament_ranking_method_note(config: FrontierTournamentConfig) -> str:
+    if config.strategy == "all_pairs":
+        return (
+            "All-pairs Copeland-style points over the seed top-N: win=1, tie=0.5, loss=0; "
+            "ties broken by wins, confidence-weighted margin, then seed synthesis rank."
+        )
+    if config.strategy == "swiss_playoff":
+        return (
+            "Swiss rounds identify a provisional playoff set, then all-pairs adjudication ranks that playoff set. "
+            "Papers outside the playoff are ordered by normalized Swiss win points."
+        )
+    return "Swiss rounds rank papers by normalized win points, with seed rank as the final tie-breaker."
+
+
+def tournament_limitation_note(config: FrontierTournamentConfig) -> str:
+    if config.strategy == "all_pairs":
+        return (
+            "Ranks below the tournament pool remain from the previous seed ranking and should not be "
+            "overinterpreted as pairwise-adjudicated."
+        )
+    if config.strategy == "swiss_playoff":
+        return (
+            "Only the playoff subset receives dense all-pairs adjudication. Swiss-only ranks are suitable for "
+            "candidate selection and broad ordering, not final headline claims."
+        )
+    return "Swiss-only ranks are suitable for reranking/candidate selection, not final headline claims."
+
+
+def build_frontier_synthesis_messages(
+    rows_by_paper: dict[str, list[dict[str, Any]]],
+    *,
+    config: FrontierSynthesisConfig,
+) -> list[dict[str, Any]]:
+    system = """You are the final synthesis judge for an ICML accepted-paper reference set.
+
+You do not have direct PDF attachments in this call. Instead, you have three independent frontier-model judgment cards per paper. Those cards were produced after each judge saw the configured first-page PDF excerpt and extracted main-paper text. Treat the cards as evidence, not as votes to average blindly.
+
+Rank by likely broad scientific and machine-learning impact, with technical soundness and evidence quality as gates. Penalize narrow toy-only results, weak evidence, incremental polish, and unclear adoption paths. Elevate papers with credible field-shaping ideas, durable datasets/benchmarks, infrastructure, safety/eval resources, scientific tools, theory, or algorithms.
+
+Return only valid JSON."""
+    paper_blocks = "\n\n".join(format_synthesis_paper_block(paper_id, rows) for paper_id, rows in sorted(rows_by_paper.items()))
+    paper_ids = sorted(rows_by_paper)
+    user = f"""Create a forced 1..{len(paper_ids)} reference ranking for {config.paper_set_name}.
+
+Use the three PDF-aware frontier judge cards for each paper. Do not use web search, author identity, institution, citation memory, or outside knowledge.
+
+Ranking requirements:
+- Return exactly {len(paper_ids)} ranked_papers entries.
+- Every paper_id must appear exactly once: {", ".join(paper_ids)}
+- Scores should be comparative and spread out; do not let conservative per-paper scores collapse the ranking.
+- When judges disagree, prefer the evidence-backed argument over majority vote.
+- Preserve contribution diversity in category rankings, but the overall ranking should still be a single best-paper ordering.
+
+Contribution classes:
+{", ".join(CONTRIBUTION_CLASSES)}
+
+Required JSON shape:
+{{
+  "evaluation_mode": "frontier_pdf_card_synthesis_ranking",
+  "prompt_version": "{config.prompt_version}",
+  "judge": "{config.provider}:{config.model}",
+  "paper_set": "{config.paper_set_name}",
+  "modality": "synthesis_of_three_pdf_aware_frontier_cards",
+  "ranked_papers": [
+    {{
+      "rank": 1,
+      "paper_id": "paper id",
+      "title": "title",
+      "primary_contribution_class": "core_ml_algorithm",
+      "secondary_contribution_classes": ["scientific_modeling_tool"],
+      "category_rank": 1,
+      "overall_priority_score": 10,
+      "broad_scientific_impact_score": 10,
+      "ml_field_impact_score": 10,
+      "technical_soundness_score": 9,
+      "evidence_confidence_score": 8,
+      "advance_to_final_review": true,
+      "why_ranked_here": "comparative reason grounded in the judge cards",
+      "best_case_for_impact": "strongest plausible impact route",
+      "main_risk": "main reason this may not matter or hold up",
+      "judge_disagreement_note": "where relevant, explain disagreement or uncertainty"
+    }}
+  ],
+  "category_rankings": {{
+    "core_ml_algorithm": ["paper_id"],
+    "theory": ["paper_id"],
+    "benchmark_dataset": ["paper_id"],
+    "infrastructure_systems": ["paper_id"],
+    "scientific_modeling_tool": ["paper_id"],
+    "safety_governance_eval": ["paper_id"],
+    "application_method": ["paper_id"],
+    "analysis_position": ["paper_id"],
+    "other": ["paper_id"]
+  }},
+  "calibration_notes": {{
+    "top_10_threshold": "what distinguished the top 10",
+    "major_disagreements": ["paper_id plus explanation"],
+    "visual_evidence_effect": "how PDF visual/table evidence changed the reference ranking"
+  }},
+  "overall_assessment": "short assessment"
+}}
+
+PDF-aware judge cards:
+{paper_blocks}
+"""
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def format_synthesis_paper_block(paper_id: str, rows: list[dict[str, Any]]) -> str:
+    cards = [row.get("card") for row in rows if isinstance(row.get("card"), dict)]
+    title = first_nonempty(card.get("title") for card in cards)
+    lines = [f"<PAPER id=\"{paper_id}\">", f"Title: {title}"]
+    for card in cards:
+        scores = card.get("scores") if isinstance(card.get("scores"), dict) else {}
+        lines.extend(
+            [
+                f"Judge: {card.get('judge')}",
+                f"Class: {card.get('primary_contribution_class')} secondary={card.get('secondary_contribution_classes')}",
+                (
+                    "Scores: overall={overall} broad={broad} ml={ml} soundness={soundness} "
+                    "novelty={novelty} evidence={evidence} visual={visual}"
+                ).format(
+                    overall=scores.get("overall_gold_priority_score"),
+                    broad=scores.get("broad_scientific_impact_score"),
+                    ml=scores.get("ml_field_impact_score"),
+                    soundness=scores.get("technical_soundness_score"),
+                    novelty=scores.get("novelty_score"),
+                    evidence=scores.get("evidence_confidence_score"),
+                    visual=scores.get("visual_evidence_importance_score"),
+                ),
+                f"Summary: {card.get('one_sentence_summary')}",
+                f"Best case: {nested_get(card, 'impact_assessment', 'best_case_for_impact')}",
+                f"Main risk: {nested_get(card, 'impact_assessment', 'main_risk')}",
+                f"Visual evidence effect: {nested_get(card, 'evidence_from_pdf', 'visual_or_tabular_evidence_changes_judgment')}",
+                f"Top-10 case: {nested_get(card, 'ranking_hooks', 'top_10_case')}",
+            ]
+        )
+    lines.append("</PAPER>")
+    return "\n".join(str(line) for line in lines)
+
+
+def validate_synthesis_ranking(parsed: dict[str, Any], *, expected_ids: list[str]) -> list[str]:
+    errors: list[str] = []
+    ranked = parsed.get("ranked_papers")
+    if not isinstance(ranked, list):
+        return ["ranked_papers must be a list"]
+    row_ids = [str(row.get("paper_id") or "") for row in ranked if isinstance(row, dict)]
+    expected_set = set(expected_ids)
+    row_id_set = set(row_ids)
+    missing = sorted(expected_set - row_id_set)
+    extras = sorted(row_id_set - expected_set)
+    duplicates = sorted({paper_id for paper_id in row_ids if row_ids.count(paper_id) > 1})
+    if missing:
+        errors.append(f"missing paper_ids: {missing}")
+    if extras:
+        errors.append(f"extra paper_ids: {extras}")
+    if duplicates:
+        errors.append(f"duplicate paper_ids: {duplicates}")
+    ranks = [int(number(row.get("rank"))) for row in ranked if isinstance(row, dict)]
+    if sorted(ranks) != list(range(1, len(expected_ids) + 1)):
+        errors.append("ranks must be exactly 1..N")
+    return errors
+
+
+def ensemble_item(paper_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    cards = [row.get("card") for row in rows if isinstance(row.get("card"), dict)]
+    score_keys = [
+        "overall_gold_priority_score",
+        "broad_scientific_impact_score",
+        "ml_field_impact_score",
+        "technical_soundness_score",
+        "novelty_score",
+        "evidence_confidence_score",
+        "visual_evidence_importance_score",
+    ]
+    means = {key: mean([card_score(card, key) for card in cards]) for key in score_keys}
+    overall_values = [card_score(card, "overall_gold_priority_score") for card in cards]
+    primary_class = majority(
+        str(card.get("primary_contribution_class") or "other")
+        for card in cards
+        if isinstance(card, dict)
+    )
+    if primary_class not in CONTRIBUTION_CLASSES:
+        primary_class = "other"
+    title = next((str(card.get("title")) for card in cards if card.get("title")), "")
+    return {
+        "rank": None,
+        "paper_id": paper_id,
+        "title": title,
+        "primary_contribution_class": primary_class,
+        "secondary_contribution_classes": sorted(
+            {
+                str(value)
+                for card in cards
+                for value in card.get("secondary_contribution_classes", [])
+                if isinstance(value, str) and value in CONTRIBUTION_CLASSES
+            }
+        ),
+        "overall_priority_score": round(means["overall_gold_priority_score"], 3),
+        "broad_scientific_impact_score": round(means["broad_scientific_impact_score"], 3),
+        "ml_field_impact_score": round(means["ml_field_impact_score"], 3),
+        "technical_soundness_score": round(means["technical_soundness_score"], 3),
+        "novelty_score": round(means["novelty_score"], 3),
+        "evidence_confidence_score": round(means["evidence_confidence_score"], 3),
+        "visual_evidence_importance_score": round(means["visual_evidence_importance_score"], 3),
+        "ensemble_gold_priority_score": round(means["overall_gold_priority_score"], 3),
+        "ensemble_broad_scientific_impact_score": round(means["broad_scientific_impact_score"], 3),
+        "ensemble_technical_soundness_score": round(means["technical_soundness_score"], 3),
+        "judge_count": len(cards),
+        "judge_score_stddev": round(statistics.pstdev(overall_values), 3) if len(overall_values) > 1 else 0.0,
+        "advance_to_final_review": True,
+        "judge_summaries": [
+            {
+                "judge": card.get("judge"),
+                "overall_gold_priority_score": card_score(card, "overall_gold_priority_score"),
+                "broad_scientific_impact_score": card_score(card, "broad_scientific_impact_score"),
+                "technical_soundness_score": card_score(card, "technical_soundness_score"),
+                "best_case_for_impact": nested_get(card, "impact_assessment", "best_case_for_impact"),
+                "main_risk": nested_get(card, "impact_assessment", "main_risk"),
+                "visual_or_tabular_evidence_changes_judgment": nested_get(
+                    card,
+                    "evidence_from_pdf",
+                    "visual_or_tabular_evidence_changes_judgment",
+                ),
+                "one_sentence_summary": card.get("one_sentence_summary"),
+            }
+            for card in cards
+        ],
+        "why_ranked_here": synthesize_why_ranked(cards),
+        "best_case_for_impact": first_nonempty(
+            nested_get(card, "impact_assessment", "best_case_for_impact") for card in cards
+        ),
+        "main_risk": first_nonempty(nested_get(card, "impact_assessment", "main_risk") for card in cards),
+    }
+
+
+def validate_frontier_card(parsed: dict[str, Any], *, expected_paper_id: str) -> list[str]:
+    errors: list[str] = []
+    if str(parsed.get("paper_id") or "") != expected_paper_id:
+        errors.append(f"paper_id mismatch: expected {expected_paper_id}, got {parsed.get('paper_id')}")
+    scores = parsed.get("scores")
+    if not isinstance(scores, dict):
+        errors.append("missing scores object")
+    else:
+        for key in [
+            "overall_gold_priority_score",
+            "broad_scientific_impact_score",
+            "ml_field_impact_score",
+            "technical_soundness_score",
+        ]:
+            value = number(scores.get(key))
+            if value < 1 or value > 10:
+                errors.append(f"{key} must be in 1..10")
+    contribution_class = str(parsed.get("primary_contribution_class") or "")
+    if contribution_class not in CONTRIBUTION_CLASSES:
+        errors.append(f"unknown primary_contribution_class: {contribution_class}")
+    return errors
+
+
+def load_card_rows(paths: list[Path]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in paths:
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                row = json.loads(line)
+                if isinstance(row, dict):
+                    rows.append(row)
+    return rows
+
+
+def encode_pdf_data_url(path: Path) -> str:
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:application/pdf;base64,{data}"
+
+
+def redact_file_data(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [_redact_value(message) for message in messages]
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, child in value.items():
+            if key == "file_data" and isinstance(child, str):
+                redacted[key] = f"[base64 file data redacted, {len(child)} chars]"
+            else:
+                redacted[key] = _redact_value(child)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    return value
+
+
+def _message_text_for_estimate(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(parts)
+    return ""
+
+
+def truncate_text(text: str, limit: int) -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f"\n\n[TRUNCATED for frontier PDF card at {limit} characters]"
+
+
+def truncate_inline(value: Any, limit: int) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def number(value: Any) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if math.isfinite(float(value)):
+            return float(value)
+        return 0.0
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
+
+
+def card_score(card: dict[str, Any], key: str) -> float:
+    scores = card.get("scores") if isinstance(card.get("scores"), dict) else {}
+    return number(scores.get(key))
+
+
+def mean(values: list[float]) -> float:
+    filtered = [value for value in values if value > 0]
+    return sum(filtered) / len(filtered) if filtered else 0.0
+
+
+def majority(values: Any) -> str:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    if not counts:
+        return "other"
+    return sorted(counts.items(), key=lambda item: (item[1], item[0]), reverse=True)[0][0]
+
+
+def nested_get(row: dict[str, Any], *keys: str) -> Any:
+    value: Any = row
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def first_nonempty(values: Any) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def synthesize_why_ranked(cards: list[dict[str, Any]]) -> str:
+    summaries = [
+        str(card.get("one_sentence_summary") or "").strip()
+        for card in cards
+        if str(card.get("one_sentence_summary") or "").strip()
+    ]
+    return " | ".join(summaries[:3])
+
+
+def build_category_rankings(ranked_items: list[dict[str, Any]]) -> dict[str, list[str]]:
+    category_rankings: dict[str, list[str]] = {category: [] for category in CONTRIBUTION_CLASSES}
+    for item in ranked_items:
+        category = str(item.get("primary_contribution_class") or "other")
+        if category not in category_rankings:
+            category = "other"
+        category_rankings[category].append(str(item.get("paper_id")))
+    return category_rankings
+
+
+def sum_usage(usages: Any) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for usage in usages:
+        if not isinstance(usage, dict):
+            continue
+        for key, value in usage.items():
+            if isinstance(value, int):
+                totals[key] = totals.get(key, 0) + value
+    return totals
