@@ -59,6 +59,12 @@ from icml_ai_ac.scoring.frontier_gold import (
     run_frontier_card_synthesis,
     run_frontier_pdf_cards,
 )
+from icml_ai_ac.scoring.bradley_terry import (
+    WEIGHT_MODES,
+    rank_bradley_terry,
+    ranked_meta_from_payload,
+    tournament_pool_from_payload,
+)
 from icml_ai_ac.scoring.ranking import (
     PASS2_PROMPT_VERSION,
     PASS2_FINAL_PROMPT_VERSION,
@@ -75,7 +81,7 @@ from icml_ai_ac.scoring.ranking import (
     run_reference_ranking,
 )
 from icml_ai_ac.scoring.runner import ScoreRunConfig, prepare_run_dir, score_record, write_run_metadata
-from icml_ai_ac.storage import append_jsonl, read_jsonl, read_jsonl_if_exists, read_paper_records, write_json, write_jsonl
+from icml_ai_ac.storage import append_jsonl, read_json, read_jsonl, read_jsonl_if_exists, read_paper_records, write_json, write_jsonl
 from icml_ai_ac.shortlist import build_shortlist
 
 
@@ -693,6 +699,38 @@ def build_parser() -> argparse.ArgumentParser:
     frontier_tournament.add_argument("--dry-run", action="store_true")
     frontier_tournament.add_argument("--overwrite", action="store_true")
     frontier_tournament.set_defaults(func=cmd_rank_frontier_card_tournament)
+
+    bradley_terry = subparsers.add_parser(
+        "rank-bradley-terry",
+        help="Fit a Bradley-Terry model over a frontier tournament's pairwise matches.",
+    )
+    bradley_terry.add_argument(
+        "--tournament",
+        type=Path,
+        required=True,
+        help="Tournament output JSON with a `matches` array (from rank-frontier-card-tournament).",
+    )
+    bradley_terry.add_argument("--out", type=Path, required=True)
+    bradley_terry.add_argument(
+        "--weight",
+        choices=list(WEIGHT_MODES),
+        default="none",
+        help="Comparison weighting: `none` (unit votes) or `confidence` (judge confidence per match).",
+    )
+    bradley_terry.add_argument(
+        "--prior-strength",
+        type=float,
+        default=1.0,
+        help="Virtual wins/losses vs a reference paper; keeps undefeated/winless papers finite. 0 disables smoothing.",
+    )
+    bradley_terry.add_argument(
+        "--pool-only",
+        action="store_true",
+        help="Restrict to the pairwise-adjudicated tournament pool, excluding seed-only tail papers.",
+    )
+    bradley_terry.add_argument("--max-iter", type=int, default=1000)
+    bradley_terry.add_argument("--tol", type=float, default=1e-9)
+    bradley_terry.set_defaults(func=cmd_rank_bradley_terry)
 
     shortlist = subparsers.add_parser("build-shortlist", help="Aggregate score rows into a unique ranked shortlist JSONL.")
     shortlist.add_argument("--scores", type=Path, required=True, action="append")
@@ -2562,6 +2600,37 @@ def cmd_rank_frontier_card_tournament(args: argparse.Namespace) -> int:
         f"{result.get('match_count', 0)}/{result['pair_count']} matches: {result['status']}"
     )
     return 0 if result["status"] in {"ok", "dry_run"} else 2
+
+
+def cmd_rank_bradley_terry(args: argparse.Namespace) -> int:
+    payload = read_json(args.tournament)
+    if not isinstance(payload, dict):
+        print(f"Tournament payload must be a JSON object: {args.tournament}")
+        return 2
+    matches = payload.get("matches")
+    if not isinstance(matches, list):
+        print(f"Tournament payload has no `matches` array: {args.tournament}")
+        return 2
+    restrict = tournament_pool_from_payload(payload) if args.pool_only else None
+    result = rank_bradley_terry(
+        matches,
+        ranked_meta=ranked_meta_from_payload(payload),
+        restrict_to=restrict,
+        weight_mode=args.weight,
+        prior_strength=args.prior_strength,
+        max_iter=args.max_iter,
+        tol=args.tol,
+    )
+    result["source_tournament"] = str(args.tournament)
+    write_json(args.out, result)
+    diagnostics = result["diagnostics"]
+    top = result["ranked_papers"][0]["paper_id"] if result["ranked_papers"] else "-"
+    print(
+        f"Bradley-Terry ranked {diagnostics['player_count']} papers "
+        f"(converged={diagnostics['converged']} in {diagnostics['iterations']} iters, "
+        f"connected={diagnostics['comparison_graph_connected']}); top={top}"
+    )
+    return 0
 
 
 def cmd_build_shortlist(args: argparse.Namespace) -> int:
