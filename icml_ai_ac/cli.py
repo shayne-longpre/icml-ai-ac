@@ -17,6 +17,7 @@ from icml_ai_ac.analysis.taxonomy import (
     run_taxonomy_classification,
     run_taxonomy_induction,
 )
+from icml_ai_ac.analysis.agreement import build_agreement_report, build_axis_decomposition_report
 from icml_ai_ac.finalists import FinalistSelectionConfig, read_ranked_rows, select_finalists
 from icml_ai_ac.http import AccessChallengeError, HttpClient, is_pdf_file, sha256_file
 from icml_ai_ac.metadata import enrich_metadata_rows, summarize_openreview_scores
@@ -822,6 +823,33 @@ def build_parser() -> argparse.ArgumentParser:
     taxonomy_classify.add_argument("--second-reasoning-effort", default="high")
     taxonomy_classify.add_argument("--dry-run", action="store_true")
     taxonomy_classify.set_defaults(func=cmd_divergence_taxonomy_classify)
+
+    agreement = subparsers.add_parser(
+        "human-agreement-report",
+        help="AI-vs-human agreement: recall@k / ROC-AUC for surfacing orals+spotlights, Kendall tau-b, per-tier distributions.",
+    )
+    agreement.add_argument("--manifest", type=Path, required=True, help="Enriched paper manifest JSONL.")
+    agreement.add_argument("--ai-scores", type=Path, required=True, help="First-pass AI score JSONL.")
+    agreement.add_argument(
+        "--strong-ranking",
+        type=Path,
+        default=None,
+        help="Optional strong ranking JSON for the finalist-subset (layered) view.",
+    )
+    agreement.add_argument("--out", type=Path, required=True)
+    agreement.add_argument("--k", type=int, action="append", default=None, help="Top-k for recall/precision. Repeatable (default 10 20 50 100).")
+    agreement.add_argument("--honored-includes-award", action="store_true", help="Count award papers as honored alongside orals/spotlights.")
+    agreement.set_defaults(func=cmd_human_agreement_report)
+
+    axis_decomp = subparsers.add_parser(
+        "ai-axis-decomposition",
+        help="Rank AI axes by how well they predict human honors (impact-vs-polish decomposition).",
+    )
+    axis_decomp.add_argument("--manifest", type=Path, required=True)
+    axis_decomp.add_argument("--ai-scores", type=Path, required=True)
+    axis_decomp.add_argument("--out", type=Path, required=True)
+    axis_decomp.add_argument("--honored-includes-award", action="store_true")
+    axis_decomp.set_defaults(func=cmd_ai_axis_decomposition)
 
     return parser
 
@@ -2805,6 +2833,36 @@ def cmd_divergence_taxonomy_classify(args: argparse.Namespace) -> int:
     aggregate = result.get("aggregate", {})
     print(f"Taxonomy classify: {result['status']}; coded {aggregate.get('cases_coded', 0)} cases")
     return 0 if result["status"] in {"ok", "dry_run"} else 2
+
+
+def cmd_human_agreement_report(args: argparse.Namespace) -> int:
+    rows = load_comparison_rows(manifest=args.manifest, ai_scores=args.ai_scores, strong_ranking=args.strong_ranking)
+    if not rows:
+        print("No papers joined between manifest and AI scores.")
+        return 2
+    report = build_agreement_report(rows, k_values=args.k or [10, 20, 50, 100], include_award=args.honored_includes_award)
+    write_json(args.out, report)
+    full = report["full_coverage"]
+    print(
+        f"Agreement: n={full['n']} tau_b(tier)={full['kendall_tau_b']['vs_tier']} "
+        f"auc(honored_vs_poster)={full['roc_auc']['honored_vs_poster']}"
+    )
+    return 0
+
+
+def cmd_ai_axis_decomposition(args: argparse.Namespace) -> int:
+    rows = load_comparison_rows(manifest=args.manifest, ai_scores=args.ai_scores)
+    if not rows:
+        print("No papers joined between manifest and AI scores.")
+        return 2
+    report = build_axis_decomposition_report(rows, include_award=args.honored_includes_award)
+    write_json(args.out, report)
+    ivp = report["impact_vs_polish"]
+    print(
+        f"Axis decomposition: {len(report['axes'])} axes; "
+        f"conventional-minus-executive tau_b(tier) delta={ivp['delta_conventional_minus_executive']}"
+    )
+    return 0
 
 
 def openreview_public_counts(client: OpenReviewClient, group: dict[str, Any]) -> dict[str, Any]:
