@@ -11,6 +11,7 @@ from typing import Any
 from icml_ai_ac.cheap_models import CHEAP_MODEL_PRESETS, DEFAULT_CHEAP_MODEL, resolve_cheap_models
 from icml_ai_ac.env import load_dotenv
 from icml_ai_ac.eval import evaluate_ranking
+from icml_ai_ac.analysis.human_comparison import build_divergence_report, load_comparison_rows, render_markdown
 from icml_ai_ac.finalists import FinalistSelectionConfig, read_ranked_rows, select_finalists
 from icml_ai_ac.http import AccessChallengeError, HttpClient, is_pdf_file, sha256_file
 from icml_ai_ac.metadata import enrich_metadata_rows, summarize_openreview_scores
@@ -750,6 +751,26 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--out", type=Path, required=True)
     evaluate.add_argument("--k", type=int, action="append", default=None, help="Top-k value to evaluate. Can be repeated.")
     evaluate.set_defaults(func=cmd_eval_ranking)
+
+    divergence = subparsers.add_parser(
+        "human-divergence-report",
+        help="Build an AI-vs-human divergence gallery (overlooked gems and AI blind spots).",
+    )
+    divergence.add_argument("--manifest", type=Path, required=True, help="Enriched paper manifest JSONL (human tier/ratings/awards in extra).")
+    divergence.add_argument("--ai-scores", type=Path, required=True, help="First-pass AI score JSONL (per-paper `scores` schema).")
+    divergence.add_argument(
+        "--strong-ranking",
+        type=Path,
+        default=None,
+        help="Optional tournament/Bradley-Terry ranking JSON for finalist strong ranks.",
+    )
+    divergence.add_argument("--out", type=Path, required=True)
+    divergence.add_argument("--markdown", type=Path, default=None, help="Optional path for a human-readable gallery.")
+    divergence.add_argument("--human-axis", choices=["tier", "reviewer"], default="tier")
+    divergence.add_argument("--top-frac", type=float, default=0.10)
+    divergence.add_argument("--cases-per-direction", type=int, default=20)
+    divergence.add_argument("--min-reviews", type=int, default=0)
+    divergence.set_defaults(func=cmd_human_divergence_report)
 
     return parser
 
@@ -2626,6 +2647,34 @@ def cmd_eval_ranking(args: argparse.Namespace) -> int:
     print(
         f"Evaluated ranking: overlap={metrics['overlap_count']}/{metrics['gold_count']} "
         f"spearman={metrics['rank_correlation']['spearman']}"
+    )
+    return 0
+
+
+def cmd_human_divergence_report(args: argparse.Namespace) -> int:
+    rows = load_comparison_rows(
+        manifest=args.manifest,
+        ai_scores=args.ai_scores,
+        strong_ranking=args.strong_ranking,
+    )
+    if not rows:
+        print("No papers joined between manifest and AI scores.")
+        return 2
+    report = build_divergence_report(
+        rows,
+        human_axis=args.human_axis,
+        top_frac=args.top_frac,
+        cases_per_direction=args.cases_per_direction,
+        min_reviews=args.min_reviews,
+    )
+    write_json(args.out, report)
+    if args.markdown is not None:
+        args.markdown.parent.mkdir(parents=True, exist_ok=True)
+        args.markdown.write_text(render_markdown(report), encoding="utf-8")
+    print(
+        f"Divergence report: {report['counts']['papers']} papers; "
+        f"{report['overlooked_gems']['shown']}/{report['overlooked_gems']['total_matching']} gems, "
+        f"{report['blind_spots']['shown']}/{report['blind_spots']['total_matching']} blind spots"
     )
     return 0
 
