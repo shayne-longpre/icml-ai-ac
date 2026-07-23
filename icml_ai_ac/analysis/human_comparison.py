@@ -50,6 +50,19 @@ RATIONALE_PATHS: dict[str, tuple[str, ...]] = {
     "contamination_sensitivity": ("uncertainty", "contamination_sensitivity"),
 }
 
+# Numeric axes carried on each case so the taxonomy (QL-B) can ground reason
+# codes in the impact-vs-polish contrast rather than the AI's prose alone.
+AXIS_SNAPSHOT_PATHS: dict[str, tuple[str, ...]] = {
+    "executive_ac_priority": ("scores", "executive_ac_priority"),
+    "conventional_acceptance_strength": ("scores", "conventional_acceptance_strength"),
+    "technical_soundness": ("scores", "technical_soundness"),
+    "novelty": ("scores", "novelty"),
+    "broader_science_impact_forecast": ("scores", "broader_science_impact_forecast"),
+    "ml_field_impact_forecast": ("scores", "ml_field_impact_forecast"),
+    "field_building_potential": ("impact_axes", "field_building_potential"),
+    "benchmark_or_dataset_value": ("impact_axes", "benchmark_or_dataset_value"),
+}
+
 
 @dataclass(slots=True)
 class ComparisonRow:
@@ -75,6 +88,7 @@ class ComparisonRow:
     human_percentile: float | None = None
     residual: float | None = None
     rationale: dict[str, Any] = field(default_factory=dict)
+    ai_axes: dict[str, float] = field(default_factory=dict)
 
 
 def load_comparison_rows(
@@ -111,6 +125,7 @@ def load_comparison_rows(
                 ai_reported_percentile=reported_percentile,
                 strong_rank=strong_rank_by_paper.get(record.paper_id),
                 rationale=extract_rationale(scores),
+                ai_axes=extract_axes(scores),
             )
         )
 
@@ -254,6 +269,15 @@ def extract_rationale(scores: dict[str, Any]) -> dict[str, Any]:
     return rationale
 
 
+def extract_axes(scores: dict[str, Any]) -> dict[str, float]:
+    axes: dict[str, float] = {}
+    for label, path in AXIS_SNAPSHOT_PATHS.items():
+        value = as_float(nested_get(scores, *path))
+        if value is not None:
+            axes[label] = value
+    return axes
+
+
 def load_strong_ranks(path: Path) -> dict[str, int]:
     import json
 
@@ -360,6 +384,7 @@ def case_card(row: ComparisonRow) -> dict[str, Any]:
             "strong_rank": row.strong_rank,
         },
         "divergence": {"residual": row.residual, "human_percentile": row.human_percentile},
+        "ai_axes": row.ai_axes,
         "ai_rationale": row.rationale,
     }
 

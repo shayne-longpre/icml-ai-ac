@@ -12,6 +12,11 @@ from icml_ai_ac.cheap_models import CHEAP_MODEL_PRESETS, DEFAULT_CHEAP_MODEL, re
 from icml_ai_ac.env import load_dotenv
 from icml_ai_ac.eval import evaluate_ranking
 from icml_ai_ac.analysis.human_comparison import build_divergence_report, load_comparison_rows, render_markdown
+from icml_ai_ac.analysis.taxonomy import (
+    TaxonomyConfig,
+    run_taxonomy_classification,
+    run_taxonomy_induction,
+)
 from icml_ai_ac.finalists import FinalistSelectionConfig, read_ranked_rows, select_finalists
 from icml_ai_ac.http import AccessChallengeError, HttpClient, is_pdf_file, sha256_file
 from icml_ai_ac.metadata import enrich_metadata_rows, summarize_openreview_scores
@@ -771,6 +776,52 @@ def build_parser() -> argparse.ArgumentParser:
     divergence.add_argument("--cases-per-direction", type=int, default=20)
     divergence.add_argument("--min-reviews", type=int, default=0)
     divergence.set_defaults(func=cmd_human_divergence_report)
+
+    taxonomy_induce = subparsers.add_parser(
+        "divergence-taxonomy-induce",
+        help="Propose a codebook of AI-vs-human divergence reason codes from the gallery (QL-B stage 1).",
+    )
+    add_http_args(taxonomy_induce)
+    taxonomy_induce.add_argument("--report", type=Path, required=True, help="human-divergence-report JSON.")
+    taxonomy_induce.add_argument("--out", type=Path, required=True, help="Candidate codebook JSON (review/edit before classify).")
+    taxonomy_induce.add_argument("--run-dir", type=Path, default=None)
+    taxonomy_induce.add_argument("--provider", choices=["openai", "openrouter"], default="openrouter")
+    taxonomy_induce.add_argument("--model", default=DEFAULT_FRONTIER_MODEL)
+    taxonomy_induce.add_argument("--reasoning-effort", default="high")
+    taxonomy_induce.add_argument("--sample-size", type=int, default=40)
+    taxonomy_induce.add_argument("--max-codes", type=int, default=12)
+    taxonomy_induce.add_argument("--temperature", type=float, default=0.2)
+    taxonomy_induce.add_argument("--max-output-tokens", type=int, default=6000)
+    taxonomy_induce.add_argument("--seed", type=int, default=None)
+    taxonomy_induce.add_argument("--dry-run", action="store_true")
+    taxonomy_induce.set_defaults(func=cmd_divergence_taxonomy_induce)
+
+    taxonomy_classify = subparsers.add_parser(
+        "divergence-taxonomy-classify",
+        help="Classify divergence cases against a frozen codebook and aggregate (QL-B stage 2).",
+    )
+    add_http_args(taxonomy_classify)
+    taxonomy_classify.add_argument("--report", type=Path, required=True)
+    taxonomy_classify.add_argument("--codebook", type=Path, required=True)
+    taxonomy_classify.add_argument("--out", type=Path, required=True)
+    taxonomy_classify.add_argument("--run-dir", type=Path, default=None)
+    taxonomy_classify.add_argument("--provider", choices=["openai", "openrouter"], default="openrouter")
+    taxonomy_classify.add_argument("--model", default=DEFAULT_FRONTIER_MODEL)
+    taxonomy_classify.add_argument("--reasoning-effort", default="high")
+    taxonomy_classify.add_argument("--batch-size", type=int, default=20)
+    taxonomy_classify.add_argument("--max-codes-per-case", type=int, default=3)
+    taxonomy_classify.add_argument("--temperature", type=float, default=0.0)
+    taxonomy_classify.add_argument("--max-output-tokens", type=int, default=8000)
+    taxonomy_classify.add_argument("--seed", type=int, default=None)
+    taxonomy_classify.add_argument("--second-provider", choices=["openai", "openrouter"], default=None)
+    taxonomy_classify.add_argument(
+        "--second-model",
+        default=None,
+        help="Optional independent coder (different family) for per-code Cohen's kappa reliability.",
+    )
+    taxonomy_classify.add_argument("--second-reasoning-effort", default="high")
+    taxonomy_classify.add_argument("--dry-run", action="store_true")
+    taxonomy_classify.set_defaults(func=cmd_divergence_taxonomy_classify)
 
     return parser
 
@@ -2677,6 +2728,83 @@ def cmd_human_divergence_report(args: argparse.Namespace) -> int:
         f"{report['blind_spots']['shown']}/{report['blind_spots']['total_matching']} blind spots"
     )
     return 0
+
+
+def cmd_divergence_taxonomy_induce(args: argparse.Namespace) -> int:
+    config = TaxonomyConfig(
+        provider=args.provider,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        temperature=args.temperature,
+        max_output_tokens=args.max_output_tokens,
+        seed=args.seed,
+        dry_run=args.dry_run,
+    )
+    client = None if args.dry_run else ChatCompletionClient(
+        provider=args.provider,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        timeout_seconds=args.timeout,
+        retries=args.retries,
+        backoff_seconds=args.backoff,
+    )
+    result = run_taxonomy_induction(
+        report_path=args.report,
+        out=args.out,
+        run_dir=args.run_dir,
+        config=config,
+        client=client,
+        sample_size=args.sample_size,
+        max_codes=args.max_codes,
+    )
+    codes = result.get("codes") or []
+    print(f"Taxonomy induction: {result['status']}; {len(codes)} codes over {result.get('sampled_case_count', 0)} sampled cases")
+    return 0 if result["status"] in {"ok", "dry_run"} else 2
+
+
+def cmd_divergence_taxonomy_classify(args: argparse.Namespace) -> int:
+    config = TaxonomyConfig(
+        provider=args.provider,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        temperature=args.temperature,
+        max_output_tokens=args.max_output_tokens,
+        seed=args.seed,
+        dry_run=args.dry_run,
+    )
+    client = None if args.dry_run else ChatCompletionClient(
+        provider=args.provider,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        timeout_seconds=args.timeout,
+        retries=args.retries,
+        backoff_seconds=args.backoff,
+    )
+    second_client = None
+    if args.second_model and not args.dry_run:
+        second_client = ChatCompletionClient(
+            provider=args.second_provider or args.provider,
+            model=args.second_model,
+            reasoning_effort=args.second_reasoning_effort,
+            timeout_seconds=args.timeout,
+            retries=args.retries,
+            backoff_seconds=args.backoff,
+        )
+    result = run_taxonomy_classification(
+        report_path=args.report,
+        codebook_path=args.codebook,
+        out=args.out,
+        run_dir=args.run_dir,
+        config=config,
+        client=client,
+        batch_size=args.batch_size,
+        max_codes_per_case=args.max_codes_per_case,
+        second_client=second_client,
+        second_label=args.second_model,
+    )
+    aggregate = result.get("aggregate", {})
+    print(f"Taxonomy classify: {result['status']}; coded {aggregate.get('cases_coded', 0)} cases")
+    return 0 if result["status"] in {"ok", "dry_run"} else 2
 
 
 def openreview_public_counts(client: OpenReviewClient, group: dict[str, Any]) -> dict[str, Any]:
