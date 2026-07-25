@@ -1,20 +1,24 @@
-"""Join AI ranking signals with human outcomes, and build a divergence gallery.
+"""Join canonical AI ranking signals with human outcomes.
 
 This is the deterministic foundation of the human-vs-AI comparison. It loads:
 
 - an enriched paper manifest (human labels: presentation tier from
   ``extra.is_oral`` / ``extra.is_spotlight``, reviewer means from
   ``extra.openreview_scores``, awards from ``extra.award_labels``), and
-- a first-pass AI score JSONL (per-paper ``scores`` schema: the full-coverage AI
-  signal via ``scores.scores.executive_ac_priority`` plus rationale text), and
+- a full-coverage AI ranking JSONL (preferably the deterministic cheap-ensemble
+  aggregate, with exactly one row per paper), and
 - optionally a strong ranking JSON (tournament / Bradley-Terry) for the finalist
   subset, shown as a cross-reference.
 
-It then reports a full tier x AI-decile crosstab and per-paper divergence
-residuals for *every* paper, and selects two rule-defined tails:
+The loader reports exact join coverage and refuses partial populations unless
+the caller explicitly lowers the coverage threshold. Duplicate AI rows are an
+error rather than an invitation to select the most favorable judgment.
 
-- **overlooked gems** — posters the AI ranks near the top, and
-- **blind spots** — orals / spotlights / award papers the AI ranks low.
+The divergence report supports three distinct human axes:
+
+- presentation tier among accepted papers,
+- published reviewer overall scores, and
+- accepted versus publicly visible rejected papers.
 
 The gallery is an explicit windowed view of the reported distribution (not a
 hand-picked set): the same divergence score orders every paper, and the report
@@ -68,10 +72,12 @@ AXIS_SNAPSHOT_PATHS: dict[str, tuple[str, ...]] = {
 class ComparisonRow:
     paper_id: str
     title: str
+    abstract: str
     contribution_class: str | None
     # human outcome
     tier: str
     tier_rank: int
+    decision_status: str
     is_award: bool
     award_labels: list[Any]
     reviewer_overall: float | None
@@ -80,41 +86,63 @@ class ComparisonRow:
     review_count: int
     # ai signal
     ai_score: float
+    ai_signal_kind: str
     ai_reported_percentile: float | None
     ai_rank: int = 0
     ai_percentile: float = 0.0
     strong_rank: int | None = None
     # derived divergence (filled by build_divergence_report)
     human_percentile: float | None = None
+    comparison_ai_percentile: float | None = None
     residual: float | None = None
     rationale: dict[str, Any] = field(default_factory=dict)
     ai_axes: dict[str, float] = field(default_factory=dict)
 
 
-def load_comparison_rows(
+@dataclass(slots=True)
+class ComparisonDataset:
+    rows: list[ComparisonRow]
+    coverage: dict[str, Any]
+
+
+def load_comparison_dataset(
     *,
     manifest: Path,
     ai_scores: Path,
     strong_ranking: Path | None = None,
-) -> list[ComparisonRow]:
+    min_coverage: float = 1.0,
+) -> ComparisonDataset:
+    if not 0 <= min_coverage <= 1:
+        raise ValueError("min_coverage must be in [0, 1]")
     ai_by_paper = load_ai_scores(ai_scores)
     strong_rank_by_paper = load_strong_ranks(strong_ranking) if strong_ranking else {}
+    records = list(read_paper_records(manifest))
+    manifest_ids = {record.paper_id for record in records}
+    if len(manifest_ids) != len(records):
+        raise ValueError("manifest contains duplicate paper_id rows")
 
     rows: list[ComparisonRow] = []
-    for record in read_paper_records(manifest):
-        scores = ai_by_paper.get(record.paper_id)
-        if scores is None:
+    signal_kinds: dict[str, int] = {}
+    for record in records:
+        ai_row = ai_by_paper.get(record.paper_id)
+        if ai_row is None:
+            continue
+        scores = ai_row.get("scores")
+        if not isinstance(scores, dict):
             continue
         tier, tier_rank = tier_of(record.extra)
         reviewer = reviewer_means(record.extra)
-        ai_score, reported_percentile = ai_position(scores)
+        ai_score, reported_percentile, signal_kind = ai_position(ai_row)
+        signal_kinds[signal_kind] = signal_kinds.get(signal_kind, 0) + 1
         rows.append(
             ComparisonRow(
                 paper_id=record.paper_id,
                 title=record.title or "",
+                abstract=record.abstract or "",
                 contribution_class=contribution_class_of(scores),
                 tier=tier,
                 tier_rank=tier_rank,
+                decision_status=decision_status_of(record.extra),
                 is_award=bool(record.extra.get("is_award_paper")),
                 award_labels=list(record.extra.get("award_labels") or []),
                 reviewer_overall=reviewer["overall"],
@@ -122,6 +150,7 @@ def load_comparison_rows(
                 reviewer_confidence=reviewer["confidence"],
                 review_count=reviewer["count"],
                 ai_score=ai_score,
+                ai_signal_kind=signal_kind,
                 ai_reported_percentile=reported_percentile,
                 strong_rank=strong_rank_by_paper.get(record.paper_id),
                 rationale=extract_rationale(scores),
@@ -129,13 +158,80 @@ def load_comparison_rows(
             )
         )
 
-    # Derive AI rank (1 = best) and AI percentile among the loaded accepted papers.
+    joined_ids = {row.paper_id for row in rows}
+    coverage = {
+        "manifest_papers": len(records),
+        "ai_score_papers": len(ai_by_paper),
+        "joined_papers": len(rows),
+        "coverage_fraction": round(len(rows) / len(records), 6) if records else 0.0,
+        "missing_ai_score_count": len(manifest_ids - joined_ids),
+        "missing_ai_score_ids": sorted(manifest_ids - joined_ids)[:100],
+        "extra_ai_score_count": len(set(ai_by_paper) - manifest_ids),
+        "extra_ai_score_ids": sorted(set(ai_by_paper) - manifest_ids)[:100],
+        "ai_signal_kinds": signal_kinds,
+        "unknown_tier_count": sum(1 for row in rows if row.tier == "unknown"),
+        "unknown_decision_count": sum(1 for row in rows if row.decision_status == "unknown"),
+    }
+    if coverage["coverage_fraction"] < min_coverage:
+        raise ValueError(
+            "AI/manifest coverage "
+            f"{coverage['joined_papers']}/{coverage['manifest_papers']} "
+            f"({coverage['coverage_fraction']:.3f}) is below required {min_coverage:.3f}"
+        )
+
+    _validate_ai_signal_population(
+        rows,
+        require_contiguous=(
+            coverage["missing_ai_score_count"] == 0
+            and coverage["extra_ai_score_count"] == 0
+        ),
+    )
+    _derive_ai_positions(rows)
+    return ComparisonDataset(rows=rows, coverage=coverage)
+
+
+def load_comparison_rows(
+    *,
+    manifest: Path,
+    ai_scores: Path,
+    strong_ranking: Path | None = None,
+    min_coverage: float = 0.0,
+) -> list[ComparisonRow]:
+    return load_comparison_dataset(
+        manifest=manifest,
+        ai_scores=ai_scores,
+        strong_ranking=strong_ranking,
+        min_coverage=min_coverage,
+    ).rows
+
+
+def _derive_ai_positions(rows: list[ComparisonRow]) -> None:
     ai_percentiles = percentile_ranks([row.ai_score for row in rows])
     for row, percentile in zip(rows, ai_percentiles):
         row.ai_percentile = percentile
     for rank, row in enumerate(sorted(rows, key=lambda r: (-r.ai_score, r.paper_id), reverse=False), start=1):
         row.ai_rank = rank
-    return rows
+
+
+def _validate_ai_signal_population(
+    rows: list[ComparisonRow],
+    *,
+    require_contiguous: bool,
+) -> None:
+    signal_kinds = {row.ai_signal_kind for row in rows}
+    if len(signal_kinds) > 1:
+        raise ValueError(
+            "AI score input mixes incompatible ranking signal types: "
+            + ", ".join(sorted(signal_kinds))
+        )
+    if signal_kinds == {"ensemble_aggregate_rank"}:
+        ranks = sorted(int(-row.ai_score) for row in rows)
+        if any(rank < 1 for rank in ranks) or len(set(ranks)) != len(ranks):
+            raise ValueError("ensemble aggregate ranks must be positive and unique")
+        if require_contiguous and ranks != list(range(1, len(rows) + 1)):
+            raise ValueError(
+                "ensemble aggregate ranks must be unique and contiguous over the analyzed population"
+            )
 
 
 def build_divergence_report(
@@ -145,28 +241,107 @@ def build_divergence_report(
     top_frac: float = 0.10,
     cases_per_direction: int = 20,
     min_reviews: int = 0,
+    coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if human_axis not in {"tier", "reviewer"}:
-        raise ValueError("human_axis must be 'tier' or 'reviewer'")
+    if human_axis not in {"tier", "reviewer", "decision"}:
+        raise ValueError("human_axis must be 'tier', 'reviewer', or 'decision'")
     if not 0 < top_frac < 1:
         raise ValueError("top_frac must be in (0, 1)")
+    if cases_per_direction < 1:
+        raise ValueError("cases_per_direction must be at least 1")
+    if min_reviews < 0:
+        raise ValueError("min_reviews must be non-negative")
 
-    eligible = [row for row in rows if row.review_count >= min_reviews]
+    eligible = eligible_for_axis(rows, human_axis=human_axis, min_reviews=min_reviews)
+    if not eligible:
+        raise ValueError(f"no papers have usable human labels for axis {human_axis!r}")
     human_values = human_metric_values(eligible, human_axis)
+    observed_human_values = {value for value in human_values if value is not None}
+    if len(observed_human_values) < 2:
+        raise ValueError(f"human axis {human_axis!r} has fewer than two observed outcome levels")
     scored = [row for row, value in zip(eligible, human_values) if value is not None]
     human_percentiles = percentile_ranks([value for value in human_values if value is not None])
-    for row, percentile in zip(scored, human_percentiles):
-        row.human_percentile = percentile
-        row.residual = round(row.ai_percentile - percentile, 3)
+    comparison_ai_percentiles = percentile_ranks([row.ai_score for row in scored])
+    for row, human_percentile, ai_percentile in zip(
+        scored,
+        human_percentiles,
+        comparison_ai_percentiles,
+    ):
+        row.human_percentile = human_percentile
+        row.comparison_ai_percentile = ai_percentile
+        row.residual = round(ai_percentile - human_percentile, 3)
 
     residual_rows = [row for row in scored if row.residual is not None]
+    top_cut = 100.0 * (1.0 - top_frac)
+    bottom_cut = 100.0 * top_frac
+    if human_axis == "tier":
+        gem_candidates = (
+            row
+            for row in residual_rows
+            if row.tier == "poster"
+            and not row.is_award
+            and (row.comparison_ai_percentile or 0.0) >= top_cut
+            and (row.residual or 0.0) > 0
+        )
+        blind_candidates = (
+            row
+            for row in residual_rows
+            if (row.tier in HONORED_TIERS or row.is_award)
+            and (row.comparison_ai_percentile or 0.0) <= bottom_cut
+            and (row.residual or 0.0) < 0
+        )
+        gem_description = "Accepted posters in the configured AI top tail."
+        blind_description = "Orals, spotlights, or award papers in the configured AI bottom tail."
+    elif human_axis == "decision":
+        gem_candidates = (
+            row
+            for row in residual_rows
+            if row.decision_status == "rejected"
+            and (row.comparison_ai_percentile or 0.0) >= top_cut
+            and (row.residual or 0.0) > 0
+        )
+        blind_candidates = (
+            row
+            for row in residual_rows
+            if row.decision_status == "accepted"
+            and (row.comparison_ai_percentile or 0.0) <= bottom_cut
+            and (row.residual or 0.0) < 0
+        )
+        gem_description = "Publicly visible rejected papers in the configured AI top tail."
+        blind_description = "Accepted papers in the configured AI bottom tail."
+    else:
+        gem_candidates = (
+            row
+            for row in residual_rows
+            if (row.comparison_ai_percentile or 0.0) >= top_cut
+            and (row.human_percentile or 0.0) <= bottom_cut
+            and (row.residual or 0.0) > 0
+        )
+        blind_candidates = (
+            row
+            for row in residual_rows
+            if (row.comparison_ai_percentile or 0.0) <= bottom_cut
+            and (row.human_percentile or 0.0) >= top_cut
+            and (row.residual or 0.0) < 0
+        )
+        gem_description = "Papers in the AI top tail and published-reviewer bottom tail."
+        blind_description = "Papers in the published-reviewer top tail and AI bottom tail."
+
     gems_all = sorted(
-        (row for row in residual_rows if row.tier == "poster" and not row.is_award),
-        key=lambda r: (-(r.residual or 0.0), -r.ai_percentile, r.paper_id),
+        gem_candidates,
+        key=lambda r: (
+            -(r.residual or 0.0),
+            -(r.comparison_ai_percentile or 0.0),
+            r.paper_id,
+        ),
     )
     blind_all = sorted(
-        (row for row in residual_rows if row.tier in HONORED_TIERS or row.is_award),
-        key=lambda r: ((r.residual or 0.0), r.ai_percentile, r.paper_id),
+        blind_candidates,
+        key=lambda r: (
+            (r.residual or 0.0),
+            r.comparison_ai_percentile or 0.0,
+            r.paper_id,
+        ),
     )
     gems = gems_all[:cases_per_direction]
     blind_spots = blind_all[:cases_per_direction]
@@ -181,23 +356,28 @@ def build_divergence_report(
         },
         "counts": {
             "papers": len(rows),
+            "eligible_papers": len(eligible),
             "scored_papers": len(residual_rows),
             "by_tier": tier_counts(rows),
+            "by_decision": decision_counts(rows),
             "award_papers": sum(1 for row in rows if row.is_award),
         },
+        "coverage": coverage,
         "tier_ai_decile_crosstab": tier_ai_decile_crosstab(rows, top_frac=top_frac),
         "residual_summary": residual_summary(residual_rows),
         "overlooked_gems": {
-            "description": "Posters the AI ranks far above their human tier (largest positive AI-minus-human residual).",
+            "description": gem_description,
             "total_matching": len(gems_all),
             "shown": len(gems),
             "cases": [case_card(row) for row in gems],
+            "case_pool": [case_card(row) for row in gems_all],
         },
         "blind_spots": {
-            "description": "Orals/spotlights/awards the AI ranks low (largest negative residual).",
+            "description": blind_description,
             "total_matching": len(blind_all),
             "shown": len(blind_spots),
             "cases": [case_card(row) for row in blind_spots],
+            "case_pool": [case_card(row) for row in blind_all],
         },
     }
 
@@ -206,11 +386,42 @@ def build_divergence_report(
 
 
 def tier_of(extra: dict[str, Any]) -> tuple[str, int]:
+    if decision_status_of(extra) == "rejected":
+        return "unknown", -1
     if extra.get("is_oral"):
         return "oral", 2
     if extra.get("is_spotlight"):
         return "spotlight", 1
-    return "poster", 0
+    if (
+        "is_oral" in extra
+        or "is_spotlight" in extra
+        or str(extra.get("presentation_type") or "").lower() == "poster"
+        or "poster" in str(extra.get("acceptance_tier") or "").lower()
+    ):
+        return "poster", 0
+    return "unknown", -1
+
+
+def decision_status_of(extra: dict[str, Any]) -> str:
+    values = [
+        extra.get("decision"),
+        extra.get("decision_label"),
+        extra.get("venue"),
+        extra.get("acceptance_tier"),
+    ]
+    text = " ".join(str(value).lower() for value in values if value not in (None, ""))
+    if any(label in text for label in ("reject", "desk reject")):
+        return "rejected"
+    if any(label in text for label in ("accept", "oral", "spotlight", "poster")):
+        return "accepted"
+    if (
+        "is_oral" in extra
+        or "is_spotlight" in extra
+        or extra.get("is_award_paper")
+        or extra.get("presentation_type")
+    ):
+        return "accepted"
+    return "unknown"
 
 
 def reviewer_means(extra: dict[str, Any]) -> dict[str, Any]:
@@ -227,9 +438,9 @@ def reviewer_means(extra: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_ai_scores(path: Path) -> dict[str, dict[str, Any]]:
-    """One representative pass-1 score dict per paper (highest executive priority)."""
-    best: dict[str, dict[str, Any]] = {}
-    best_priority: dict[str, float] = {}
+    """Load exactly one canonical AI ranking row per paper."""
+    rows_by_paper: dict[str, dict[str, Any]] = {}
+    duplicates: list[str] = []
     for row in read_jsonl(path):
         if row.get("status") not in {None, "ok"}:
             continue
@@ -237,21 +448,39 @@ def load_ai_scores(path: Path) -> dict[str, dict[str, Any]]:
         scores = row.get("scores")
         if not paper_id or not isinstance(scores, dict):
             continue
-        priority, _ = ai_position(scores)
-        if paper_id not in best or priority > best_priority[paper_id]:
-            best[paper_id] = scores
-            best_priority[paper_id] = priority
-    return best
+        if paper_id in rows_by_paper:
+            duplicates.append(paper_id)
+            continue
+        rows_by_paper[paper_id] = row
+    if duplicates:
+        examples = ", ".join(sorted(set(duplicates))[:10])
+        raise ValueError(
+            f"AI score input has duplicate paper rows ({len(set(duplicates))} papers; examples: {examples}). "
+            "Pass the unique full-coverage ensemble aggregate, not raw repeated judgments."
+        )
+    return rows_by_paper
 
 
-def ai_position(scores: dict[str, Any]) -> tuple[float, float | None]:
+def ai_position(row: dict[str, Any]) -> tuple[float, float | None, str]:
+    scores = row.get("scores") if isinstance(row.get("scores"), dict) else {}
     core = scores.get("scores") if isinstance(scores.get("scores"), dict) else {}
     calibration = scores.get("calibration") if isinstance(scores.get("calibration"), dict) else {}
-    priority = as_float(core.get("executive_ac_priority"))
+    aggregate_rank = as_float(row.get("aggregate_rank"))
+    if aggregate_rank is None and isinstance(row.get("shortlist_metrics"), dict):
+        aggregate_rank = as_float(row.get("rank"))
+    if aggregate_rank is not None and aggregate_rank > 0:
+        priority = -aggregate_rank
+        signal_kind = "ensemble_aggregate_rank"
+    else:
+        priority = as_float(core.get("executive_ac_priority"))
+        signal_kind = "executive_ac_priority"
     if priority is None:
-        priority = as_float(core.get("overall_significance")) or 0.0
+        priority = as_float(core.get("overall_significance"))
+        signal_kind = "overall_significance"
+    if priority is None:
+        raise ValueError(f"AI row {row.get('paper_id')!r} has no supported ranking signal")
     reported = as_float(calibration.get("estimated_percentile_among_accepted_papers"))
-    return float(priority), reported
+    return float(priority), reported, signal_kind
 
 
 def contribution_class_of(scores: dict[str, Any]) -> str | None:
@@ -302,7 +531,29 @@ def human_metric_values(rows: list[ComparisonRow], human_axis: str) -> list[floa
     if human_axis == "tier":
         # Awards are the strongest human honor; rank them above orals.
         return [float(3 if row.is_award else row.tier_rank) for row in rows]
+    if human_axis == "decision":
+        return [
+            1.0 if row.decision_status == "accepted" else 0.0 if row.decision_status == "rejected" else None
+            for row in rows
+        ]
     return [row.reviewer_overall for row in rows]
+
+
+def eligible_for_axis(
+    rows: list[ComparisonRow],
+    *,
+    human_axis: str,
+    min_reviews: int,
+) -> list[ComparisonRow]:
+    if human_axis == "tier":
+        return [row for row in rows if row.tier in {"oral", "spotlight", "poster"}]
+    if human_axis == "decision":
+        return [row for row in rows if row.decision_status in {"accepted", "rejected"}]
+    return [
+        row
+        for row in rows
+        if row.reviewer_overall is not None and row.review_count >= min_reviews
+    ]
 
 
 def percentile_ranks(values: list[float]) -> list[float]:
@@ -312,26 +563,42 @@ def percentile_ranks(values: list[float]) -> list[float]:
         return []
     if n == 1:
         return [50.0]
-    result: list[float] = []
-    for value in values:
-        below = sum(1 for other in values if other < value)
-        equal = sum(1 for other in values if other == value)
-        result.append(round(100.0 * (below + 0.5 * equal) / n, 3))
-    return result
+    ordered = sorted(values)
+    percentile_by_value: dict[float, float] = {}
+    start = 0
+    while start < n:
+        end = start + 1
+        while end < n and ordered[end] == ordered[start]:
+            end += 1
+        percentile_by_value[ordered[start]] = round(
+            100.0 * (start + 0.5 * (end - start)) / n,
+            3,
+        )
+        start = end
+    return [percentile_by_value[value] for value in values]
 
 
 def tier_counts(rows: list[ComparisonRow]) -> dict[str, int]:
-    counts = {"oral": 0, "spotlight": 0, "poster": 0}
+    counts = {"oral": 0, "spotlight": 0, "poster": 0, "unknown": 0}
     for row in rows:
         counts[row.tier] = counts.get(row.tier, 0) + 1
+    return counts
+
+
+def decision_counts(rows: list[ComparisonRow]) -> dict[str, int]:
+    counts = {"accepted": 0, "rejected": 0, "unknown": 0}
+    for row in rows:
+        counts[row.decision_status] = counts.get(row.decision_status, 0) + 1
     return counts
 
 
 def tier_ai_decile_crosstab(rows: list[ComparisonRow], *, top_frac: float) -> dict[str, Any]:
     cut = 100.0 * (1.0 - top_frac)
     table: dict[str, dict[str, int]] = {}
-    for row in rows:
-        bucket = "ai_top" if row.ai_percentile >= cut else "ai_rest"
+    tier_rows = [row for row in rows if row.tier != "unknown"]
+    local_percentiles = percentile_ranks([row.ai_score for row in tier_rows])
+    for row, percentile in zip(tier_rows, local_percentiles):
+        bucket = "ai_top" if percentile >= cut else "ai_rest"
         table.setdefault(row.tier, {"ai_top": 0, "ai_rest": 0})[bucket] += 1
     return {"ai_top_threshold_percentile": round(cut, 3), "table": table}
 
@@ -366,9 +633,11 @@ def case_card(row: ComparisonRow) -> dict[str, Any]:
     return {
         "paper_id": row.paper_id,
         "title": row.title,
+        "abstract": row.abstract,
         "contribution_class": row.contribution_class,
         "human": {
             "tier": row.tier,
+            "decision_status": row.decision_status,
             "is_award": row.is_award,
             "award_labels": row.award_labels,
             "reviewer_overall": row.reviewer_overall,
@@ -377,13 +646,19 @@ def case_card(row: ComparisonRow) -> dict[str, Any]:
             "review_count": row.review_count,
         },
         "ai": {
-            "executive_ac_priority": round(row.ai_score, 4),
+            "ranking_signal": round(row.ai_score, 4),
+            "ranking_signal_kind": row.ai_signal_kind,
+            "executive_ac_priority": row.ai_axes.get("executive_ac_priority"),
             "rank": row.ai_rank,
             "percentile": row.ai_percentile,
             "reported_percentile": row.ai_reported_percentile,
             "strong_rank": row.strong_rank,
         },
-        "divergence": {"residual": row.residual, "human_percentile": row.human_percentile},
+        "divergence": {
+            "residual": row.residual,
+            "human_percentile": row.human_percentile,
+            "comparison_ai_percentile": row.comparison_ai_percentile,
+        },
         "ai_axes": row.ai_axes,
         "ai_rationale": row.rationale,
     }
@@ -414,10 +689,10 @@ def render_case_markdown(card: dict[str, Any]) -> list[str]:
     ai = card["ai"]
     lines = [
         f"### {card['title'] or card['paper_id']} (`{card['paper_id']}`)",
-        f"- **Human:** {human['tier']}"
+        f"- **Human:** decision={human['decision_status']}, tier={human['tier']}"
         + (", award" if human["is_award"] else "")
         + (f", reviewer overall {human['reviewer_overall']}" if human["reviewer_overall"] is not None else ""),
-        f"- **AI:** rank {ai['rank']} (percentile {ai['percentile']}, executive priority {ai['executive_ac_priority']})"
+        f"- **AI:** rank {ai['rank']} (percentile {ai['percentile']}, signal={ai['ranking_signal_kind']})"
         + (f", strong rank {ai['strong_rank']}" if ai["strong_rank"] is not None else ""),
         f"- **Residual (AI - human):** {card['divergence']['residual']}",
     ]

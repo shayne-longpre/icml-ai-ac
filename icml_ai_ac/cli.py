@@ -11,7 +11,11 @@ from typing import Any
 from icml_ai_ac.cheap_models import CHEAP_MODEL_PRESETS, DEFAULT_CHEAP_MODEL, resolve_cheap_models
 from icml_ai_ac.env import load_dotenv
 from icml_ai_ac.eval import evaluate_ranking
-from icml_ai_ac.analysis.human_comparison import build_divergence_report, load_comparison_rows, render_markdown
+from icml_ai_ac.analysis.human_comparison import (
+    build_divergence_report,
+    load_comparison_dataset,
+    render_markdown,
+)
 from icml_ai_ac.analysis.taxonomy import (
     TaxonomyConfig,
     run_taxonomy_classification,
@@ -772,10 +776,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     divergence.add_argument("--out", type=Path, required=True)
     divergence.add_argument("--markdown", type=Path, default=None, help="Optional path for a human-readable gallery.")
-    divergence.add_argument("--human-axis", choices=["tier", "reviewer"], default="tier")
+    divergence.add_argument("--human-axis", choices=["tier", "reviewer", "decision"], default="tier")
     divergence.add_argument("--top-frac", type=float, default=0.10)
     divergence.add_argument("--cases-per-direction", type=int, default=20)
     divergence.add_argument("--min-reviews", type=int, default=0)
+    divergence.add_argument(
+        "--min-coverage",
+        type=float,
+        default=1.0,
+        help="Minimum manifest/AI join fraction; defaults to complete coverage.",
+    )
     divergence.set_defaults(func=cmd_human_divergence_report)
 
     taxonomy_induce = subparsers.add_parser(
@@ -839,6 +849,9 @@ def build_parser() -> argparse.ArgumentParser:
     agreement.add_argument("--out", type=Path, required=True)
     agreement.add_argument("--k", type=int, action="append", default=None, help="Top-k for recall/precision. Repeatable (default 10 20 50 100).")
     agreement.add_argument("--honored-includes-award", action="store_true", help="Count award papers as honored alongside orals/spotlights.")
+    agreement.add_argument("--min-coverage", type=float, default=1.0)
+    agreement.add_argument("--bootstrap-samples", type=int, default=500)
+    agreement.add_argument("--bootstrap-seed", type=int, default=20260725)
     agreement.set_defaults(func=cmd_human_agreement_report)
 
     axis_decomp = subparsers.add_parser(
@@ -849,6 +862,7 @@ def build_parser() -> argparse.ArgumentParser:
     axis_decomp.add_argument("--ai-scores", type=Path, required=True)
     axis_decomp.add_argument("--out", type=Path, required=True)
     axis_decomp.add_argument("--honored-includes-award", action="store_true")
+    axis_decomp.add_argument("--min-coverage", type=float, default=1.0)
     axis_decomp.set_defaults(func=cmd_ai_axis_decomposition)
 
     return parser
@@ -2731,21 +2745,31 @@ def cmd_eval_ranking(args: argparse.Namespace) -> int:
 
 
 def cmd_human_divergence_report(args: argparse.Namespace) -> int:
-    rows = load_comparison_rows(
-        manifest=args.manifest,
-        ai_scores=args.ai_scores,
-        strong_ranking=args.strong_ranking,
-    )
-    if not rows:
+    try:
+        dataset = load_comparison_dataset(
+            manifest=args.manifest,
+            ai_scores=args.ai_scores,
+            strong_ranking=args.strong_ranking,
+            min_coverage=args.min_coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build human comparison: {exc}")
+        return 2
+    if not dataset.rows:
         print("No papers joined between manifest and AI scores.")
         return 2
-    report = build_divergence_report(
-        rows,
-        human_axis=args.human_axis,
-        top_frac=args.top_frac,
-        cases_per_direction=args.cases_per_direction,
-        min_reviews=args.min_reviews,
-    )
+    try:
+        report = build_divergence_report(
+            dataset.rows,
+            human_axis=args.human_axis,
+            top_frac=args.top_frac,
+            cases_per_direction=args.cases_per_direction,
+            min_reviews=args.min_reviews,
+            coverage=dataset.coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build divergence report: {exc}")
+        return 2
     write_json(args.out, report)
     if args.markdown is not None:
         args.markdown.parent.mkdir(parents=True, exist_ok=True)
@@ -2809,7 +2833,17 @@ def cmd_divergence_taxonomy_classify(args: argparse.Namespace) -> int:
         backoff_seconds=args.backoff,
     )
     second_client = None
+    second_config = None
     if args.second_model and not args.dry_run:
+        second_config = TaxonomyConfig(
+            provider=args.second_provider or args.provider,
+            model=args.second_model,
+            reasoning_effort=args.second_reasoning_effort,
+            temperature=args.temperature,
+            max_output_tokens=args.max_output_tokens,
+            seed=args.seed,
+            dry_run=False,
+        )
         second_client = ChatCompletionClient(
             provider=args.second_provider or args.provider,
             model=args.second_model,
@@ -2829,6 +2863,7 @@ def cmd_divergence_taxonomy_classify(args: argparse.Namespace) -> int:
         max_codes_per_case=args.max_codes_per_case,
         second_client=second_client,
         second_label=args.second_model,
+        second_config=second_config,
     )
     aggregate = result.get("aggregate", {})
     print(f"Taxonomy classify: {result['status']}; coded {aggregate.get('cases_coded', 0)} cases")
@@ -2836,26 +2871,69 @@ def cmd_divergence_taxonomy_classify(args: argparse.Namespace) -> int:
 
 
 def cmd_human_agreement_report(args: argparse.Namespace) -> int:
-    rows = load_comparison_rows(manifest=args.manifest, ai_scores=args.ai_scores, strong_ranking=args.strong_ranking)
-    if not rows:
+    try:
+        dataset = load_comparison_dataset(
+            manifest=args.manifest,
+            ai_scores=args.ai_scores,
+            strong_ranking=args.strong_ranking,
+            min_coverage=args.min_coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build human comparison: {exc}")
+        return 2
+    if not dataset.rows:
         print("No papers joined between manifest and AI scores.")
         return 2
-    report = build_agreement_report(rows, k_values=args.k or [10, 20, 50, 100], include_award=args.honored_includes_award)
+    try:
+        report = build_agreement_report(
+            dataset.rows,
+            k_values=args.k or [10, 20, 50, 100],
+            include_award=args.honored_includes_award,
+            coverage=dataset.coverage,
+            bootstrap_samples=args.bootstrap_samples,
+            bootstrap_seed=args.bootstrap_seed,
+        )
+    except ValueError as exc:
+        print(f"Cannot build agreement report: {exc}")
+        return 2
     write_json(args.out, report)
     full = report["full_coverage"]
-    print(
-        f"Agreement: n={full['n']} tau_b(tier)={full['kendall_tau_b']['vs_tier']} "
-        f"auc(honored_vs_poster)={full['roc_auc']['honored_vs_poster']}"
-    )
+    if full is not None:
+        print(
+            f"Agreement: n={full['n']} tau_b(tier)={full['kendall_tau_b']['vs_tier']} "
+            f"auc(honored_vs_poster)={full['roc_auc']['honored_vs_poster']}"
+        )
+    else:
+        decision = report["acceptance_outcome"]
+        print(
+            f"Agreement: n={decision['n']} "
+            f"auc(accepted_vs_rejected)={decision['roc_auc_accepted_vs_rejected']}"
+        )
     return 0
 
 
 def cmd_ai_axis_decomposition(args: argparse.Namespace) -> int:
-    rows = load_comparison_rows(manifest=args.manifest, ai_scores=args.ai_scores)
-    if not rows:
+    try:
+        dataset = load_comparison_dataset(
+            manifest=args.manifest,
+            ai_scores=args.ai_scores,
+            min_coverage=args.min_coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build human comparison: {exc}")
+        return 2
+    if not dataset.rows:
         print("No papers joined between manifest and AI scores.")
         return 2
-    report = build_axis_decomposition_report(rows, include_award=args.honored_includes_award)
+    try:
+        report = build_axis_decomposition_report(
+            dataset.rows,
+            include_award=args.honored_includes_award,
+            coverage=dataset.coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build axis decomposition: {exc}")
+        return 2
     write_json(args.out, report)
     ivp = report["impact_vs_polish"]
     print(

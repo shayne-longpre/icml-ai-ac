@@ -10,14 +10,26 @@ from icml_ai_ac.analysis.agreement import (
 from icml_ai_ac.analysis.human_comparison import ComparisonRow
 
 
-def crow(pid, tier, ai_score, *, reviewer=None, axes=None, is_award=False, strong_rank=None):
-    tier_rank = {"oral": 2, "spotlight": 1, "poster": 0}[tier]
+def crow(
+    pid,
+    tier,
+    ai_score,
+    *,
+    reviewer=None,
+    axes=None,
+    is_award=False,
+    strong_rank=None,
+    decision="accepted",
+):
+    tier_rank = {"oral": 2, "spotlight": 1, "poster": 0, "unknown": -1}[tier]
     return ComparisonRow(
         paper_id=pid,
         title=pid,
+        abstract=f"Abstract for {pid}",
         contribution_class="theory",
         tier=tier,
         tier_rank=tier_rank,
+        decision_status=decision,
         is_award=is_award,
         award_labels=[],
         reviewer_overall=reviewer,
@@ -25,6 +37,7 @@ def crow(pid, tier, ai_score, *, reviewer=None, axes=None, is_award=False, stron
         reviewer_confidence=None,
         review_count=4 if reviewer is not None else 0,
         ai_score=ai_score,
+        ai_signal_kind="ensemble_aggregate_rank",
         ai_reported_percentile=None,
         ai_percentile=ai_score * 10,
         strong_rank=strong_rank,
@@ -59,26 +72,56 @@ class AgreementReportTests(unittest.TestCase):
         ]
 
     def test_agreement_when_ai_tracks_tier(self) -> None:
-        report = build_agreement_report(self.rows(), k_values=[2], include_award=False)
+        report = build_agreement_report(
+            self.rows(),
+            k_values=[2],
+            include_award=False,
+            bootstrap_samples=20,
+        )
         full = report["full_coverage"]
         self.assertEqual(full["roc_auc"]["honored_vs_poster"], 1.0)
         self.assertGreater(full["kendall_tau_b"]["vs_tier"], 0.7)
         self.assertEqual(full["recall_at_k"]["2"]["recall_oral"], 1.0)
         self.assertAlmostEqual(full["recall_at_k"]["2"]["recall_honored"], 2 / 3, places=3)
         self.assertIn("per_tier_ai_percentile", full)
+        self.assertIsNotNone(full["roc_auc_ci95"]["honored_vs_poster"])
 
     def test_strong_subset_layered(self) -> None:
         report = build_agreement_report(self.rows(), k_values=[2])
         strong = report["strong_subset"]
         self.assertIsNotNone(strong)
-        self.assertEqual(strong["n"], 4)
-        self.assertEqual(strong["roc_auc"]["honored_vs_poster"], 1.0)
-        self.assertNotIn("per_tier_ai_percentile", strong)  # only on full coverage
+        self.assertEqual(strong["strong_on_same_subset"]["n"], 4)
+        self.assertEqual(strong["strong_on_same_subset"]["roc_auc"]["honored_vs_poster"], 1.0)
+        self.assertEqual(strong["cheap_on_same_subset"]["n"], 4)
+        self.assertEqual(strong["selection"]["honored_recall"], 1.0)
+        self.assertNotIn("per_tier_ai_percentile", strong["strong_on_same_subset"])
 
     def test_no_strong_ranks_gives_null_subset(self) -> None:
         rows = [crow("p1", "poster", 4.0), crow("o1", "oral", 9.0)]
         report = build_agreement_report(rows, k_values=[1])
         self.assertIsNone(report["strong_subset"])
+
+    def test_strong_selection_reports_honored_attrition(self) -> None:
+        rows = self.rows()
+        rows[2].strong_rank = None
+        report = build_agreement_report(rows, k_values=[2], bootstrap_samples=0)
+        selection = report["strong_subset"]["selection"]
+        self.assertEqual(selection["honored_retained"], 2)
+        self.assertEqual(selection["honored_total"], 3)
+        self.assertAlmostEqual(selection["honored_recall"], 2 / 3, places=3)
+
+    def test_acceptance_outcome_is_separate_from_presentation_tier(self) -> None:
+        rows = [
+            crow("a1", "poster", 9.0, decision="accepted"),
+            crow("a2", "poster", 8.0, decision="accepted"),
+            crow("r1", "unknown", 2.0, decision="rejected"),
+            crow("r2", "unknown", 1.0, decision="rejected"),
+        ]
+        report = build_agreement_report(rows, k_values=[1], bootstrap_samples=20)
+        decision = report["acceptance_outcome"]
+        self.assertEqual(decision["roc_auc_accepted_vs_rejected"], 1.0)
+        self.assertEqual(decision["accepted_count"], 2)
+        self.assertEqual(report["counts"]["tier_labeled_papers"], 2)
 
 
 class AxisDecompositionTests(unittest.TestCase):

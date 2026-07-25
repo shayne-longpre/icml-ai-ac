@@ -25,9 +25,21 @@ def case(pid: str, direction_class: str = "theory") -> dict:
     return {
         "paper_id": pid,
         "title": pid.title(),
+        "abstract": f"Abstract for {pid}.",
         "contribution_class": direction_class,
-        "human": {"tier": "poster", "is_award": False, "reviewer_overall": 3.0, "reviewer_soundness": 2.5},
-        "ai": {"executive_ac_priority": 9.0, "percentile": 92.0},
+        "human": {
+            "decision_status": "accepted",
+            "tier": "poster",
+            "is_award": False,
+            "reviewer_overall": 3.0,
+            "reviewer_soundness": 2.5,
+        },
+        "ai": {
+            "ranking_signal": -1.0,
+            "ranking_signal_kind": "ensemble_aggregate_rank",
+            "executive_ac_priority": 9.0,
+            "percentile": 92.0,
+        },
         "divergence": {"residual": 60.0},
         "ai_axes": {"executive_ac_priority": 9.0, "conventional_acceptance_strength": 3.0, "technical_soundness": 4.0},
         "ai_rationale": {"sweeping_impact_scenario": f"scenario {pid}", "reviewer_vs_executive_delta": "AI higher"},
@@ -80,6 +92,7 @@ class TaxonomyHelperTests(unittest.TestCase):
 
     def test_case_brief_includes_numeric_grounding(self) -> None:
         brief = case_brief(collect_cases(report_fixture())[0])
+        self.assertIn("Abstract for g1", brief)
         self.assertIn("executive_priority=9.0", brief)
         self.assertIn("conventional_acceptance_strength=3.0", brief)
         self.assertIn("residual=60.0", brief)
@@ -93,19 +106,33 @@ class TaxonomyHelperTests(unittest.TestCase):
         self.assertIn("g1, g2, b1, b2", classify[1]["content"])
 
     def test_validate_codebook(self) -> None:
-        clean, errors = validate_codebook(CODEBOOK)
+        clean, errors = validate_codebook(CODEBOOK, max_codes=2)
         self.assertEqual([c["code"] for c in clean], ["impact_over_rigor", "missed_rigor"])
         self.assertEqual(errors, [])
-        _, bad = validate_codebook({"codes": []})
+        _, bad = validate_codebook({"codes": []}, max_codes=2)
         self.assertTrue(bad)
 
     def test_validate_classification_filters_unknown_and_flags_missing(self) -> None:
         payload = {"assignments": [
-            {"paper_id": "g1", "codes": [{"code": "impact_over_rigor"}, {"code": "not_a_code"}]},
+            {
+                "paper_id": "g1",
+                "codes": [
+                    {"code": "impact_over_rigor", "evidence": "grounded evidence"},
+                    {"code": "not_a_code", "evidence": "bad"},
+                ],
+            },
         ]}
-        assignments, errors = validate_classification(payload, expected_ids=["g1", "g2"], code_names={"impact_over_rigor", "missed_rigor"})
+        assignments, errors = validate_classification(
+            payload,
+            expected_ids=["g1", "g2"],
+            code_names={"impact_over_rigor", "missed_rigor"},
+            max_codes_per_case=2,
+        )
         by_id = {a["paper_id"]: a["codes"] for a in assignments}
-        self.assertEqual(by_id["g1"], ["impact_over_rigor"])
+        self.assertEqual(
+            by_id["g1"],
+            [{"code": "impact_over_rigor", "evidence": "grounded evidence"}],
+        )
         self.assertEqual(by_id["g2"], [])
         self.assertTrue(any("unknown code" in e for e in errors))
         self.assertTrue(any("missing assignments" in e for e in errors))
@@ -120,7 +147,8 @@ class TaxonomyHelperTests(unittest.TestCase):
         self.assertEqual(agg["by_direction"]["overlooked_gem"], {"impact_over_rigor": 1})
 
     def test_cohens_kappa(self) -> None:
-        self.assertEqual(cohens_kappa([True, True], [True, True]), 1.0)
+        self.assertIsNone(cohens_kappa([True, True], [True, True]))
+        self.assertIsNone(cohens_kappa([False, False], [False, False]))
         self.assertIsNone(cohens_kappa([], []))
         self.assertEqual(cohens_kappa([True, False, True, False], [True, False, True, True]), 0.5)
 
@@ -166,9 +194,30 @@ class TaxonomyRunTests(unittest.TestCase):
         self.assertEqual(result["aggregate"]["cases_coded"], 4)
         self.assertEqual(result["aggregate"]["code_totals"]["impact_over_rigor"], 2)
         kappa = result["reliability"]["per_code_cohens_kappa"]
-        self.assertEqual(kappa["impact_over_rigor"], 0.5)
-        self.assertEqual(kappa["missed_rigor"], 0.5)
+        self.assertEqual(kappa["impact_over_rigor"]["kappa"], 0.5)
+        self.assertEqual(kappa["missed_rigor"]["kappa"], 0.5)
+        self.assertEqual(result["assignments"][0]["codes"][0]["evidence"], "e")
+        self.assertEqual(result["reliability"]["exact_multilabel_agreement"]["rate"], 0.75)
         self.assertTrue(out.exists())
+
+    def test_failed_batch_is_not_counted_as_coded(self) -> None:
+        def fail(_messages):
+            raise RuntimeError("provider failed")
+
+        result = run_taxonomy_classification(
+            report_path=self.report,
+            codebook_path=self.codebook,
+            out=self.tmp / "failed.json",
+            run_dir=None,
+            config=config(),
+            client=FakeClient(fail),
+            batch_size=10,
+            max_codes_per_case=3,
+        )
+        self.assertEqual(result["status"], "validation_error")
+        self.assertEqual(result["aggregate"]["cases_requested"], 4)
+        self.assertEqual(result["aggregate"]["cases_coded"], 0)
+        self.assertEqual(result["aggregate"]["cases_failed"], 4)
 
     def test_classification_dry_run(self) -> None:
         result = run_taxonomy_classification(
