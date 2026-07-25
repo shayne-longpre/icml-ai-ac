@@ -60,10 +60,11 @@ from icml_ai_ac.scoring.frontier_gold import (
     run_frontier_pdf_cards,
 )
 from icml_ai_ac.scoring.bradley_terry import (
+    STAGE_MODES,
     WEIGHT_MODES,
     rank_bradley_terry,
     ranked_meta_from_payload,
-    tournament_pool_from_payload,
+    select_tournament_stage,
 )
 from icml_ai_ac.scoring.ranking import (
     PASS2_PROMPT_VERSION,
@@ -721,14 +722,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--prior-strength",
         type=float,
         default=1.0,
-        help="Virtual wins/losses vs a reference paper; keeps undefeated/winless papers finite. 0 disables smoothing.",
+        help="Positive virtual wins/losses vs a reference paper; keeps undefeated/winless estimates finite.",
     )
     bradley_terry.add_argument(
-        "--pool-only",
-        action="store_true",
-        help="Restrict to the pairwise-adjudicated tournament pool, excluding seed-only tail papers.",
+        "--stage",
+        choices=list(STAGE_MODES),
+        default="auto",
+        help="Match stage to fit. Auto uses playoff for hybrid tournaments, Swiss for Swiss-only, and all otherwise.",
     )
-    bradley_terry.add_argument("--max-iter", type=int, default=1000)
+    bradley_terry.add_argument("--max-iter", type=int, default=5000)
     bradley_terry.add_argument("--tol", type=float, default=1e-9)
     bradley_terry.set_defaults(func=cmd_rank_bradley_terry)
 
@@ -2611,17 +2613,22 @@ def cmd_rank_bradley_terry(args: argparse.Namespace) -> int:
     if not isinstance(matches, list):
         print(f"Tournament payload has no `matches` array: {args.tournament}")
         return 2
-    restrict = tournament_pool_from_payload(payload) if args.pool_only else None
-    result = rank_bradley_terry(
-        matches,
-        ranked_meta=ranked_meta_from_payload(payload),
-        restrict_to=restrict,
-        weight_mode=args.weight,
-        prior_strength=args.prior_strength,
-        max_iter=args.max_iter,
-        tol=args.tol,
-    )
+    try:
+        selected_matches, restrict, stage_meta = select_tournament_stage(payload, stage=args.stage)
+        result = rank_bradley_terry(
+            selected_matches,
+            ranked_meta=ranked_meta_from_payload(payload),
+            restrict_to=restrict,
+            weight_mode=args.weight,
+            prior_strength=args.prior_strength,
+            max_iter=args.max_iter,
+            tol=args.tol,
+        )
+    except ValueError as exc:
+        print(f"Bradley-Terry configuration error: {exc}")
+        return 2
     result["source_tournament"] = str(args.tournament)
+    result["stage_selection"] = stage_meta
     write_json(args.out, result)
     diagnostics = result["diagnostics"]
     top = result["ranked_papers"][0]["paper_id"] if result["ranked_papers"] else "-"
@@ -2630,7 +2637,7 @@ def cmd_rank_bradley_terry(args: argparse.Namespace) -> int:
         f"(converged={diagnostics['converged']} in {diagnostics['iterations']} iters, "
         f"connected={diagnostics['comparison_graph_connected']}); top={top}"
     )
-    return 0
+    return 0 if diagnostics["converged"] else 2
 
 
 def cmd_build_shortlist(args: argparse.Namespace) -> int:

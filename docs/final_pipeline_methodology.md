@@ -155,6 +155,14 @@ cost-control design is a hybrid tournament:
 4. Use the dense playoff as the headline ranking and Swiss standings as
    supporting evidence outside the playoff.
 
+Fit regularized Bradley-Terry models separately to the Swiss schedule and the
+dense playoff. The Swiss fit adjusts provisional standings for opponent
+difficulty under an uneven schedule. The playoff remains directly auditable by
+win rate because every finalist faces every other finalist; its Bradley-Terry
+ordering and conditional standard errors are reported as a sensitivity
+analysis. These intervals are conditional on the observed judgments and do not
+represent uncertainty over prompts, judge models, or model families.
+
 The tunable knobs are:
 
 ```text
@@ -163,6 +171,7 @@ rank-frontier-card-tournament --top-n
 rank-frontier-card-tournament --swiss-rounds
 rank-frontier-card-tournament --playoff-top-n
 rank-frontier-card-tournament --pairs-per-batch
+rank-bradley-terry --stage auto
 ```
 
 Recommended first production defaults:

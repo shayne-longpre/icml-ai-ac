@@ -5,6 +5,7 @@ from icml_ai_ac.scoring.bradley_terry import (
     is_connected,
     rank_bradley_terry,
     ranked_meta_from_payload,
+    select_tournament_stage,
     tally_matches,
     tournament_pool_from_payload,
 )
@@ -56,7 +57,7 @@ class BradleyTerryTests(unittest.TestCase):
     def test_win_prob_in_unit_interval_and_ordered(self) -> None:
         matches = [decisive("p1", "p2", "p1"), decisive("p1", "p3", "p1"), decisive("p2", "p3", "p2")]
         payload = rank_bradley_terry(matches)
-        probs = [row["win_prob_vs_average"] for row in payload["ranked_papers"]]
+        probs = [row["win_prob_vs_reference"] for row in payload["ranked_papers"]]
         for prob in probs:
             self.assertGreater(prob, 0.0)
             self.assertLess(prob, 1.0)
@@ -74,7 +75,7 @@ class BradleyTerryTests(unittest.TestCase):
         theta = strengths_by_id(payload)
         self.assertAlmostEqual(theta["p1"], theta["p2"], places=6)
         row = payload["ranked_papers"][0]
-        self.assertAlmostEqual(row["win_prob_vs_average"], 0.5, places=3)
+        self.assertAlmostEqual(row["win_prob_vs_reference"], 0.5, places=3)
         self.assertEqual(payload["diagnostics"]["tie_comparison_weight"], 1.0)
 
     def test_confidence_weighting_widens_gap_with_higher_confidence(self) -> None:
@@ -152,9 +153,27 @@ class BradleyTerryTests(unittest.TestCase):
         # The skipped match must not inflate the comparison count.
         self.assertEqual(tallies.opponents["p1"]["p2"], 1.0)
 
+    def test_only_invalid_match_does_not_connect_players(self) -> None:
+        tallies = tally_matches(
+            [{"paper_a": "p1", "paper_b": "p2", "winner": "invalid", "confidence": 0.5}]
+        )
+        self.assertEqual(tallies.players, [])
+        self.assertTrue(is_connected(tallies))
+
     def test_invalid_weight_mode_raises(self) -> None:
         with self.assertRaisesRegex(ValueError, "weight_mode"):
             rank_bradley_terry([decisive("p1", "p2", "p1")], weight_mode="bogus")
+
+    def test_fit_configuration_must_be_positive(self) -> None:
+        matches = [decisive("p1", "p2", "p1")]
+        for kwargs in (
+            {"prior_strength": 0},
+            {"prior_strength": float("nan")},
+            {"max_iter": 0},
+            {"tol": 0},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                rank_bradley_terry(matches, **kwargs)
 
     def test_payload_helpers_from_tournament_shape(self) -> None:
         payload = {
@@ -168,6 +187,61 @@ class BradleyTerryTests(unittest.TestCase):
         meta = ranked_meta_from_payload(payload)
         self.assertEqual(meta["p1"]["title"], "One")
         self.assertEqual(tournament_pool_from_payload(payload), ["p1", "p2"])
+
+    def test_stage_selection_keeps_swiss_and_playoff_evidence_separate(self) -> None:
+        swiss_matches = [
+            decisive("p1", "p3", "p1"),
+            decisive("p2", "p4", "p2"),
+        ]
+        playoff_new = [decisive("p1", "p2", "p1")]
+        payload = {
+            "tournament_strategy": "swiss_playoff",
+            "matches": swiss_matches + playoff_new,
+            "ranked_papers": [
+                {"paper_id": paper_id, "ranking_source": "pairwise_tournament"}
+                for paper_id in ("p1", "p2", "p3", "p4")
+            ],
+            "tournament_summary": {
+                "strategy": "swiss_playoff",
+                "playoff_ids": ["p1", "p2"],
+                "schedule": [
+                    {"stage": "swiss", "pair_count": 2},
+                    {"stage": "playoff_all_pairs", "pair_count": 1},
+                ],
+            },
+        }
+
+        swiss, swiss_ids, swiss_meta = select_tournament_stage(payload, stage="swiss")
+        self.assertEqual(swiss, swiss_matches)
+        self.assertEqual(set(swiss_ids or []), {"p1", "p2", "p3", "p4"})
+        self.assertEqual(swiss_meta["selected_stage"], "swiss")
+
+        playoff, playoff_ids, playoff_meta = select_tournament_stage(payload, stage="auto")
+        self.assertEqual(playoff, [playoff_new[0]])
+        self.assertEqual(playoff_ids, ["p1", "p2"])
+        self.assertEqual(playoff_meta["selected_stage"], "playoff")
+
+    def test_playoff_selection_includes_prior_swiss_pair_between_finalists(self) -> None:
+        payload = {
+            "tournament_strategy": "swiss_playoff",
+            "matches": [
+                decisive("p1", "p2", "p1"),
+                decisive("p1", "p3", "p1"),
+                decisive("p2", "p3", "p2"),
+            ],
+            "tournament_summary": {
+                "strategy": "swiss_playoff",
+                "playoff_ids": ["p1", "p2"],
+                "schedule": [
+                    {"stage": "swiss", "pair_count": 2},
+                    {"stage": "playoff_all_pairs", "pair_count": 1},
+                ],
+            },
+        }
+        matches, ids, _ = select_tournament_stage(payload, stage="playoff")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["pair_id"], "p1__p2")
+        self.assertEqual(ids, ["p1", "p2"])
 
     def test_empty_matches_returns_empty_ranking(self) -> None:
         payload = rank_bradley_terry([])

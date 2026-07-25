@@ -134,7 +134,9 @@ the synthesis and pairwise adjudication model. Small finalist sets use
 all-pairs comparison; larger pools use Swiss pairwise comparisons over a broad
 pool, followed by dense all-pairs comparison within the provisional playoff
 subset. Headline claims come from the dense playoff, while Swiss standings
-provide broader finalist ordering.
+provide broader finalist ordering. Regularized Bradley-Terry strengths adjust
+the sparse Swiss standings for opponent difficulty; direct win rates remain the
+transparent primary check for the balanced all-pairs playoff.
 
 Recommended defaults: cheap shortlist top 20%, Terra/Sonnet semifinal over the
 full shortlist, 250 PDF-aware finalists, 150-paper Swiss pool, 10 Swiss rounds,
