@@ -11,6 +11,17 @@ from typing import Any
 from icml_ai_ac.cheap_models import CHEAP_MODEL_PRESETS, DEFAULT_CHEAP_MODEL, resolve_cheap_models
 from icml_ai_ac.env import load_dotenv
 from icml_ai_ac.eval import evaluate_ranking
+from icml_ai_ac.analysis.human_comparison import (
+    build_divergence_report,
+    load_comparison_dataset,
+    render_markdown,
+)
+from icml_ai_ac.analysis.taxonomy import (
+    TaxonomyConfig,
+    run_taxonomy_classification,
+    run_taxonomy_induction,
+)
+from icml_ai_ac.analysis.agreement import build_agreement_report, build_axis_decomposition_report
 from icml_ai_ac.finalists import FinalistSelectionConfig, read_ranked_rows, select_finalists
 from icml_ai_ac.http import AccessChallengeError, HttpClient, is_pdf_file, sha256_file
 from icml_ai_ac.metadata import enrich_metadata_rows, summarize_openreview_scores
@@ -790,6 +801,109 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--out", type=Path, required=True)
     evaluate.add_argument("--k", type=int, action="append", default=None, help="Top-k value to evaluate. Can be repeated.")
     evaluate.set_defaults(func=cmd_eval_ranking)
+
+    divergence = subparsers.add_parser(
+        "human-divergence-report",
+        help="Build an AI-vs-human divergence gallery (overlooked gems and AI blind spots).",
+    )
+    divergence.add_argument("--manifest", type=Path, required=True, help="Enriched paper manifest JSONL (human tier/ratings/awards in extra).")
+    divergence.add_argument("--ai-scores", type=Path, required=True, help="First-pass AI score JSONL (per-paper `scores` schema).")
+    divergence.add_argument(
+        "--strong-ranking",
+        type=Path,
+        default=None,
+        help="Optional tournament/Bradley-Terry ranking JSON for finalist strong ranks.",
+    )
+    divergence.add_argument("--out", type=Path, required=True)
+    divergence.add_argument("--markdown", type=Path, default=None, help="Optional path for a human-readable gallery.")
+    divergence.add_argument("--human-axis", choices=["tier", "reviewer", "decision"], default="tier")
+    divergence.add_argument("--top-frac", type=float, default=0.10)
+    divergence.add_argument("--cases-per-direction", type=int, default=20)
+    divergence.add_argument("--min-reviews", type=int, default=0)
+    divergence.add_argument(
+        "--min-coverage",
+        type=float,
+        default=1.0,
+        help="Minimum manifest/AI join fraction; defaults to complete coverage.",
+    )
+    divergence.set_defaults(func=cmd_human_divergence_report)
+
+    taxonomy_induce = subparsers.add_parser(
+        "divergence-taxonomy-induce",
+        help="Propose a codebook of AI-vs-human divergence reason codes from the gallery (QL-B stage 1).",
+    )
+    add_http_args(taxonomy_induce)
+    taxonomy_induce.add_argument("--report", type=Path, required=True, help="human-divergence-report JSON.")
+    taxonomy_induce.add_argument("--out", type=Path, required=True, help="Candidate codebook JSON (review/edit before classify).")
+    taxonomy_induce.add_argument("--run-dir", type=Path, default=None)
+    taxonomy_induce.add_argument("--provider", choices=["openai", "openrouter"], default="openrouter")
+    taxonomy_induce.add_argument("--model", default=DEFAULT_FRONTIER_MODEL)
+    taxonomy_induce.add_argument("--reasoning-effort", default="high")
+    taxonomy_induce.add_argument("--sample-size", type=int, default=40)
+    taxonomy_induce.add_argument("--max-codes", type=int, default=12)
+    taxonomy_induce.add_argument("--temperature", type=float, default=0.2)
+    taxonomy_induce.add_argument("--max-output-tokens", type=int, default=6000)
+    taxonomy_induce.add_argument("--seed", type=int, default=None)
+    taxonomy_induce.add_argument("--dry-run", action="store_true")
+    taxonomy_induce.set_defaults(func=cmd_divergence_taxonomy_induce)
+
+    taxonomy_classify = subparsers.add_parser(
+        "divergence-taxonomy-classify",
+        help="Classify divergence cases against a frozen codebook and aggregate (QL-B stage 2).",
+    )
+    add_http_args(taxonomy_classify)
+    taxonomy_classify.add_argument("--report", type=Path, required=True)
+    taxonomy_classify.add_argument("--codebook", type=Path, required=True)
+    taxonomy_classify.add_argument("--out", type=Path, required=True)
+    taxonomy_classify.add_argument("--run-dir", type=Path, default=None)
+    taxonomy_classify.add_argument("--provider", choices=["openai", "openrouter"], default="openrouter")
+    taxonomy_classify.add_argument("--model", default=DEFAULT_FRONTIER_MODEL)
+    taxonomy_classify.add_argument("--reasoning-effort", default="high")
+    taxonomy_classify.add_argument("--batch-size", type=int, default=20)
+    taxonomy_classify.add_argument("--max-codes-per-case", type=int, default=3)
+    taxonomy_classify.add_argument("--temperature", type=float, default=0.0)
+    taxonomy_classify.add_argument("--max-output-tokens", type=int, default=8000)
+    taxonomy_classify.add_argument("--seed", type=int, default=None)
+    taxonomy_classify.add_argument("--second-provider", choices=["openai", "openrouter"], default=None)
+    taxonomy_classify.add_argument(
+        "--second-model",
+        default=None,
+        help="Optional independent coder (different family) for per-code Cohen's kappa reliability.",
+    )
+    taxonomy_classify.add_argument("--second-reasoning-effort", default="high")
+    taxonomy_classify.add_argument("--dry-run", action="store_true")
+    taxonomy_classify.set_defaults(func=cmd_divergence_taxonomy_classify)
+
+    agreement = subparsers.add_parser(
+        "human-agreement-report",
+        help="AI-vs-human agreement: recall@k / ROC-AUC for surfacing orals+spotlights, Kendall tau-b, per-tier distributions.",
+    )
+    agreement.add_argument("--manifest", type=Path, required=True, help="Enriched paper manifest JSONL.")
+    agreement.add_argument("--ai-scores", type=Path, required=True, help="First-pass AI score JSONL.")
+    agreement.add_argument(
+        "--strong-ranking",
+        type=Path,
+        default=None,
+        help="Optional strong ranking JSON for the finalist-subset (layered) view.",
+    )
+    agreement.add_argument("--out", type=Path, required=True)
+    agreement.add_argument("--k", type=int, action="append", default=None, help="Top-k for recall/precision. Repeatable (default 10 20 50 100).")
+    agreement.add_argument("--honored-includes-award", action="store_true", help="Count award papers as honored alongside orals/spotlights.")
+    agreement.add_argument("--min-coverage", type=float, default=1.0)
+    agreement.add_argument("--bootstrap-samples", type=int, default=500)
+    agreement.add_argument("--bootstrap-seed", type=int, default=20260725)
+    agreement.set_defaults(func=cmd_human_agreement_report)
+
+    axis_decomp = subparsers.add_parser(
+        "ai-axis-decomposition",
+        help="Rank AI axes by how well they predict human honors (impact-vs-polish decomposition).",
+    )
+    axis_decomp.add_argument("--manifest", type=Path, required=True)
+    axis_decomp.add_argument("--ai-scores", type=Path, required=True)
+    axis_decomp.add_argument("--out", type=Path, required=True)
+    axis_decomp.add_argument("--honored-includes-award", action="store_true")
+    axis_decomp.add_argument("--min-coverage", type=float, default=1.0)
+    axis_decomp.set_defaults(func=cmd_ai_axis_decomposition)
 
     return parser
 
@@ -2702,6 +2816,205 @@ def cmd_eval_ranking(args: argparse.Namespace) -> int:
     print(
         f"Evaluated ranking: overlap={metrics['overlap_count']}/{metrics['gold_count']} "
         f"spearman={metrics['rank_correlation']['spearman']}"
+    )
+    return 0
+
+
+def cmd_human_divergence_report(args: argparse.Namespace) -> int:
+    try:
+        dataset = load_comparison_dataset(
+            manifest=args.manifest,
+            ai_scores=args.ai_scores,
+            strong_ranking=args.strong_ranking,
+            min_coverage=args.min_coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build human comparison: {exc}")
+        return 2
+    if not dataset.rows:
+        print("No papers joined between manifest and AI scores.")
+        return 2
+    try:
+        report = build_divergence_report(
+            dataset.rows,
+            human_axis=args.human_axis,
+            top_frac=args.top_frac,
+            cases_per_direction=args.cases_per_direction,
+            min_reviews=args.min_reviews,
+            coverage=dataset.coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build divergence report: {exc}")
+        return 2
+    write_json(args.out, report)
+    if args.markdown is not None:
+        args.markdown.parent.mkdir(parents=True, exist_ok=True)
+        args.markdown.write_text(render_markdown(report), encoding="utf-8")
+    print(
+        f"Divergence report: {report['counts']['papers']} papers; "
+        f"{report['overlooked_gems']['shown']}/{report['overlooked_gems']['total_matching']} gems, "
+        f"{report['blind_spots']['shown']}/{report['blind_spots']['total_matching']} blind spots"
+    )
+    return 0
+
+
+def cmd_divergence_taxonomy_induce(args: argparse.Namespace) -> int:
+    config = TaxonomyConfig(
+        provider=args.provider,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        temperature=args.temperature,
+        max_output_tokens=args.max_output_tokens,
+        seed=args.seed,
+        dry_run=args.dry_run,
+    )
+    client = None if args.dry_run else ChatCompletionClient(
+        provider=args.provider,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        timeout_seconds=args.timeout,
+        retries=args.retries,
+        backoff_seconds=args.backoff,
+    )
+    result = run_taxonomy_induction(
+        report_path=args.report,
+        out=args.out,
+        run_dir=args.run_dir,
+        config=config,
+        client=client,
+        sample_size=args.sample_size,
+        max_codes=args.max_codes,
+    )
+    codes = result.get("codes") or []
+    print(f"Taxonomy induction: {result['status']}; {len(codes)} codes over {result.get('sampled_case_count', 0)} sampled cases")
+    return 0 if result["status"] in {"ok", "dry_run"} else 2
+
+
+def cmd_divergence_taxonomy_classify(args: argparse.Namespace) -> int:
+    config = TaxonomyConfig(
+        provider=args.provider,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        temperature=args.temperature,
+        max_output_tokens=args.max_output_tokens,
+        seed=args.seed,
+        dry_run=args.dry_run,
+    )
+    client = None if args.dry_run else ChatCompletionClient(
+        provider=args.provider,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        timeout_seconds=args.timeout,
+        retries=args.retries,
+        backoff_seconds=args.backoff,
+    )
+    second_client = None
+    second_config = None
+    if args.second_model and not args.dry_run:
+        second_config = TaxonomyConfig(
+            provider=args.second_provider or args.provider,
+            model=args.second_model,
+            reasoning_effort=args.second_reasoning_effort,
+            temperature=args.temperature,
+            max_output_tokens=args.max_output_tokens,
+            seed=args.seed,
+            dry_run=False,
+        )
+        second_client = ChatCompletionClient(
+            provider=args.second_provider or args.provider,
+            model=args.second_model,
+            reasoning_effort=args.second_reasoning_effort,
+            timeout_seconds=args.timeout,
+            retries=args.retries,
+            backoff_seconds=args.backoff,
+        )
+    result = run_taxonomy_classification(
+        report_path=args.report,
+        codebook_path=args.codebook,
+        out=args.out,
+        run_dir=args.run_dir,
+        config=config,
+        client=client,
+        batch_size=args.batch_size,
+        max_codes_per_case=args.max_codes_per_case,
+        second_client=second_client,
+        second_label=args.second_model,
+        second_config=second_config,
+    )
+    aggregate = result.get("aggregate", {})
+    print(f"Taxonomy classify: {result['status']}; coded {aggregate.get('cases_coded', 0)} cases")
+    return 0 if result["status"] in {"ok", "dry_run"} else 2
+
+
+def cmd_human_agreement_report(args: argparse.Namespace) -> int:
+    try:
+        dataset = load_comparison_dataset(
+            manifest=args.manifest,
+            ai_scores=args.ai_scores,
+            strong_ranking=args.strong_ranking,
+            min_coverage=args.min_coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build human comparison: {exc}")
+        return 2
+    if not dataset.rows:
+        print("No papers joined between manifest and AI scores.")
+        return 2
+    try:
+        report = build_agreement_report(
+            dataset.rows,
+            k_values=args.k or [10, 20, 50, 100],
+            include_award=args.honored_includes_award,
+            coverage=dataset.coverage,
+            bootstrap_samples=args.bootstrap_samples,
+            bootstrap_seed=args.bootstrap_seed,
+        )
+    except ValueError as exc:
+        print(f"Cannot build agreement report: {exc}")
+        return 2
+    write_json(args.out, report)
+    full = report["full_coverage"]
+    if full is not None:
+        print(
+            f"Agreement: n={full['n']} tau_b(tier)={full['kendall_tau_b']['vs_tier']} "
+            f"auc(honored_vs_poster)={full['roc_auc']['honored_vs_poster']}"
+        )
+    else:
+        decision = report["acceptance_outcome"]
+        print(
+            f"Agreement: n={decision['n']} "
+            f"auc(accepted_vs_rejected)={decision['roc_auc_accepted_vs_rejected']}"
+        )
+    return 0
+
+
+def cmd_ai_axis_decomposition(args: argparse.Namespace) -> int:
+    try:
+        dataset = load_comparison_dataset(
+            manifest=args.manifest,
+            ai_scores=args.ai_scores,
+            min_coverage=args.min_coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build human comparison: {exc}")
+        return 2
+    if not dataset.rows:
+        print("No papers joined between manifest and AI scores.")
+        return 2
+    try:
+        report = build_axis_decomposition_report(
+            dataset.rows,
+            include_award=args.honored_includes_award,
+            coverage=dataset.coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build axis decomposition: {exc}")
+        return 2
+    write_json(args.out, report)
+    ivp = report["impact_vs_polish"]
+    print(
+        f"Axis decomposition: {len(report['axes'])} axes; "
+        f"conventional-minus-executive tau_b(tier) delta={ivp['delta_conventional_minus_executive']}"
     )
     return 0
 

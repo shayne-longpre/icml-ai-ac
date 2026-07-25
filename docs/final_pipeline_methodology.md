@@ -183,6 +183,32 @@ Swiss rounds: 10
 Dense playoff: 60
 ```
 
+## Stage 7: Human-Outcome Comparison
+
+The comparison layer consumes a unique, full-coverage ensemble ranking rather
+than raw repeated model judgments or a truncated shortlist. It fails when the
+manifest join falls below the declared coverage threshold and reports missing
+and extra IDs. Analyses are separated by human signal:
+
+1. presentation tier and awards among accepted papers;
+2. published reviewer overall scores where available; and
+3. acceptance versus the public opt-in rejected subset.
+
+Agreement reports include tier-aware recall, ROC-AUC with deterministic
+stratified-bootstrap intervals, Kendall tau-b, and per-tier distributions.
+Strong-stage agreement is paired: the cheap and strong rankings are evaluated
+on the same finalist subset, while advancement recall records human-honored
+papers lost before that stage.
+
+Divergence galleries use preregistered AI and human rank tails rather than
+labeling every poster or honored paper as divergent. Qualitative coding receives
+the paper title, abstract, contribution class, human outcome, and AI axes.
+Candidate codes are induced on a balanced sample, reviewed and frozen, then
+applied to the full divergence tail. Held-out summaries exclude codebook
+examples. A second model reports per-code Cohen's kappa together with code
+prevalence and raw agreement; failed or invalid classifications are excluded
+rather than treated as negative labels.
+
 ## Gold-Set Evaluation
 
 The current diagnostic reference is a 50-paper ICML 2025 accepted-paper set. The

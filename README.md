@@ -142,6 +142,16 @@ Recommended defaults: cheap shortlist top 20%, Terra/Sonnet semifinal over the
 full shortlist, 250 PDF-aware finalists, 150-paper Swiss pool, 10 Swiss rounds,
 and a 60-paper dense playoff.
 
+### 6. Human Comparison
+
+We compare the canonical full-coverage ensemble ranking with presentation tier,
+published reviewer ratings, awards, and, where public, acceptance versus
+rejection. Coverage must be explicit and complete; strong-stage comparisons
+evaluate cheap and strong rankings on the same finalist subset and separately
+report which human-honored papers survived selection. Divergence case studies
+use fixed rank tails, and an independently coded, frozen taxonomy reports
+recurring reasons with held-out summaries and inter-model agreement.
+
 ## Gold-Set Validation
 
 We validated the ranking design on a 50-paper ICML 2025 accepted-paper testbed.
