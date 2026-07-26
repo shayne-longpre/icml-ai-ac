@@ -11,6 +11,7 @@ from icml_ai_ac.anonymize import (
     anonymize_pdf,
     anonymize_representation,
     contains_author_identity,
+    filter_author_identities,
 )
 from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.scoring.runner import resolve_record_pdf_path, resolve_record_text_path
@@ -21,6 +22,7 @@ class AnonymizationTests(unittest.TestCase):
         self.assertTrue(contains_author_identity("Leello Dadi", "Leello Tadesse Dadi"))
         self.assertTrue(contains_author_identity("Christoph Schnörr", "Christoph Schnoerr"))
         self.assertTrue(contains_author_identity("Mark N. Müller", "Mark Niklas Mueller"))
+        self.assertTrue(contains_author_identity("O˘guz Kaan Y¨uksel 1", "Oğuz Yüksel"))
         self.assertFalse(contains_author_identity("Mueller et al. provide a baseline.", "Mark Niklas Mueller"))
 
     def test_pdf_redaction_removes_identity_but_preserves_paper_content(self) -> None:
@@ -47,6 +49,7 @@ class AnonymizationTests(unittest.TestCase):
             audit = anonymize_pdf(
                 source_pdf=source,
                 out_pdf=output,
+                title="A Useful Machine Learning Paper",
                 authors=["Ada Lovelace", "Grace Hopper"],
                 max_pages=9,
             )
@@ -83,6 +86,7 @@ class AnonymizationTests(unittest.TestCase):
             audit = anonymize_pdf(
                 source_pdf=source,
                 out_pdf=output,
+                title="A Useful Machine Learning Paper",
                 authors=["Ada Lovelace", "Stale Metadata Author"],
                 max_pages=9,
             )
@@ -113,12 +117,100 @@ class AnonymizationTests(unittest.TestCase):
             audit = anonymize_pdf(
                 source_pdf=source,
                 out_pdf=output,
+                title="A Useful Machine Learning Paper",
                 authors=["Stale Metadata Author"],
                 max_pages=9,
             )
 
             self.assertEqual(audit["status"], "needs_review")
             self.assertFalse(audit["first_page_author_band_redacted"])
+
+    def test_pdf_redaction_removes_entire_superscripted_identity_band(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            output = root / "anonymized.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text((72, 72), "A Useful Machine Learning Paper", fontsize=16)
+            page.insert_text((72, 108), "Laura Lutzow1,2", fontsize=11)
+            page.insert_text((350, 108), "laura@example.edu", fontsize=9)
+            page.insert_text((72, 122), "1 Example University", fontsize=9)
+            page.insert_text((72, 145), "Abstract", fontsize=12)
+            page.insert_text((72, 165), "Scientific content.", fontsize=10)
+            document.save(source)
+            document.close()
+
+            audit = anonymize_pdf(
+                source_pdf=source,
+                out_pdf=output,
+                title="A Useful Machine Learning Paper",
+                authors=["Laura Lützow"],
+                max_pages=9,
+            )
+
+            anonymized = pymupdf.open(output)
+            text = "\n".join(page.get_text() for page in anonymized)
+            anonymized.close()
+            self.assertEqual(audit["status"], "ok")
+            self.assertIn("known_author", audit["first_page_identity_band_reason"])
+            self.assertIn("email", audit["first_page_identity_band_reason"])
+            self.assertNotIn("Laura", text)
+            self.assertNotIn("Example University", text)
+            self.assertIn("Scientific content.", text)
+
+    def test_pdf_redaction_accepts_an_already_anonymous_byline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            output = root / "anonymized.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text((72, 72), "A Useful Machine Learning Paper", fontsize=16)
+            page.insert_text((220, 108), "Anonymous Author(s)", fontsize=11)
+            page.insert_text((72, 145), "Abstract", fontsize=12)
+            page.insert_text((72, 165), "Scientific content.", fontsize=10)
+            page.insert_text(
+                (72, 700),
+                "For ICML 2026 reviewers: follow the Reviewer Console policy.",
+                fontsize=8,
+            )
+            page.insert_text(
+                (72, 714),
+                "The assigned LLM policy might differ from registration.",
+                fontsize=8,
+            )
+            document.save(source)
+            document.close()
+
+            audit = anonymize_pdf(
+                source_pdf=source,
+                out_pdf=output,
+                title="A Useful Machine Learning Paper",
+                authors=["Camera Ready Author"],
+                max_pages=9,
+            )
+
+            anonymized = pymupdf.open(output)
+            text = "\n".join(page.get_text() for page in anonymized)
+            anonymized.close()
+            self.assertEqual(audit["status"], "ok")
+            self.assertEqual(
+                audit["first_page_identity_band_reason"],
+                ["anonymous_author"],
+            )
+            self.assertNotIn("Anonymous Author", text)
+            self.assertNotIn("Reviewer Console", text)
+            self.assertNotIn("assigned LLM policy", text)
+            self.assertIn("Scientific content.", text)
+
+    def test_short_uppercase_metadata_identity_is_ignored(self) -> None:
+        active, ignored = filter_author_identities(
+            ["Lei Wei", "TT", "Xi"],
+        )
+
+        self.assertEqual(active, ["Lei Wei", "Xi"])
+        self.assertEqual(ignored, ["TT"])
 
     def test_text_anonymization_removes_front_matter_and_acknowledgements(self) -> None:
         text = """Title: A Useful Paper

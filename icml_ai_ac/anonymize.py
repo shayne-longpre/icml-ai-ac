@@ -13,7 +13,7 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, write_jsonl
 
 
-ANONYMIZATION_VERSION = "direct_identity_redaction_v13"
+ANONYMIZATION_VERSION = "direct_identity_redaction_v14"
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
     r"(?i)(?:"
@@ -35,6 +35,7 @@ IDENTITY_LINE_PATTERN = re.compile(
 )
 TEXT_IDENTITY_LINE_PATTERN = re.compile(
     r"(?i)(?:"
+    r"^\s*(?:anonymous|anonymized)\s+author(?:s)?(?:\s*\([^)]*\))?\s*$|"
     r"^\s*[*†‡]?\s*(?:equal\s+contribution|correspondence\s+to|department\b|"
     r"school\s+of\b|faculty\s+of\b|laboratory\b|institute\b|"
     r"international\s+conference\s+on\s+machine\b)|"
@@ -52,6 +53,19 @@ AFFILIATION_FRAGMENT_PATTERN = re.compile(
     r"\b(?:USA|U\.S\.A\.|UK|U\.K\.|Canada|China|France|Germany|"
     r"Switzerland|Belgium|Australia|Japan|Korea|Singapore)\b"
     r")"
+)
+ANONYMOUS_AUTHOR_PATTERN = re.compile(
+    r"(?i)^\s*(?:anonymous|anonymized)\s+author(?:s)?(?:\s*\([^)]*\))?\s*$"
+)
+SOURCE_CUE_PATTERN = re.compile(
+    r"(?i)^\s*(?:"
+    r"arxiv:\d{4}\.\d+|"
+    r"for\s+icml\s+\d{4}\s+reviewers:|"
+    r"\.?authorerr:"
+    r")"
+)
+REVIEWER_FOOTER_PATTERN = re.compile(
+    r"(?i)^\s*for\s+icml\s+\d{4}\s+reviewers:"
 )
 
 
@@ -147,6 +161,7 @@ def anonymize_record(
     config: AnonymizationConfig,
     fingerprint: str | None = None,
 ) -> tuple[PaperRecord, dict[str, Any]]:
+    active_authors, ignored_authors = filter_author_identities(record.authors)
     source_pdf = Path(record.pdf_path) if record.pdf_path else None
     audit: dict[str, Any] = {
         "paper_id": record.paper_id,
@@ -154,6 +169,8 @@ def anonymize_record(
         "anonymization_version": ANONYMIZATION_VERSION,
         "fingerprint": fingerprint,
         "authors_supplied": len(record.authors),
+        "authors_used": len(active_authors),
+        "ignored_author_identities": ignored_authors,
         "error": None,
     }
     if source_pdf is None or not source_pdf.exists():
@@ -178,7 +195,8 @@ def anonymize_record(
         pdf_audit = anonymize_pdf(
             source_pdf=source_pdf,
             out_pdf=out_pdf,
-            authors=record.authors,
+            title=record.title or "",
+            authors=active_authors,
             max_pages=config.max_pages,
         )
         text_audits: dict[str, Any] = {}
@@ -187,7 +205,7 @@ def anonymize_record(
             source_text = source_path.read_text(encoding="utf-8")
             sanitized, text_audit = anonymize_representation(
                 source_text,
-                authors=record.authors,
+                authors=active_authors,
                 strip_front_matter=name in {"full_repr", "scoring_repr"},
             )
             out_text_paths[name].write_text(sanitized, encoding="utf-8")
@@ -276,14 +294,17 @@ def anonymize_pdf(
     *,
     source_pdf: Path,
     out_pdf: Path,
+    title: str,
     authors: list[str],
     max_pages: int,
 ) -> dict[str, Any]:
+    authors, ignored_author_identities = filter_author_identities(authors)
     previous_error_display = pymupdf.TOOLS.mupdf_display_errors()
     pymupdf.TOOLS.mupdf_warnings(reset=1)
     pymupdf.TOOLS.mupdf_display_errors(False)
     output: pymupdf.Document | None = None
     first_page_author_band_redacted = False
+    first_page_identity_band_reason: list[str] = []
     try:
         source = pymupdf.open(source_pdf)
         try:
@@ -304,6 +325,18 @@ def anonymize_pdf(
             page_rects: list[pymupdf.Rect] = []
             first_page_author_rects: list[pymupdf.Rect] = []
             words = page.get_text("words", sort=True)
+            page_lines = iter_page_lines(page)
+            if page_index == 0:
+                identity_band, identity_reasons = find_first_page_identity_band(
+                    page=page,
+                    lines=page_lines,
+                    title=title,
+                    authors=authors,
+                )
+                if identity_band is not None:
+                    page_rects.append(identity_band)
+                    first_page_author_band_redacted = True
+                    first_page_identity_band_reason = identity_reasons
             for author in authors:
                 rects: list[pymupdf.Rect] = []
                 for variant in author_name_variants(author):
@@ -318,11 +351,12 @@ def anonymize_pdf(
                         first_page_author_rects.extend(
                             rect for rect in rects if rect.y0 < page.rect.height * 0.42
                         )
-            if first_page_author_rects:
+            if first_page_author_rects and not first_page_author_band_redacted:
                 y0 = max(0.0, min(rect.y0 for rect in first_page_author_rects) - 2.0)
                 y1 = min(page.rect.height, max(rect.y1 for rect in first_page_author_rects) + 2.0)
                 page_rects.append(pymupdf.Rect(0.0, y0, page.rect.width, y1))
                 first_page_author_band_redacted = True
+                first_page_identity_band_reason = ["known_author_rect"]
             author_band_bottom = (
                 max(rect.y1 for rect in first_page_author_rects)
                 if first_page_author_rects
@@ -331,12 +365,27 @@ def anonymize_pdf(
             abstract_hits = list(page.search_for("Abstract")) if page_index == 0 else []
             abstract_top = min((rect.y0 for rect in abstract_hits), default=None)
 
-            for line_text, line_rect in iter_page_lines(page):
+            for line_text, line_rect in page_lines:
                 has_author_identity = any(
                     contains_author_identity(line_text, author)
                     for author in authors
                 )
-                if has_author_identity or EMAIL_PATTERN.search(line_text):
+                if page_index == 0 and REVIEWER_FOOTER_PATTERN.search(line_text):
+                    page_rects.append(
+                        pymupdf.Rect(
+                            0.0,
+                            max(0.0, line_rect.y0 - 2.0),
+                            page.rect.width,
+                            page.rect.height,
+                        )
+                    )
+                    identity_line_count += 1
+                elif (
+                    has_author_identity
+                    or EMAIL_PATTERN.search(line_text)
+                    or (page_index == 0 and ANONYMOUS_AUTHOR_PATTERN.search(line_text))
+                    or (page_index == 0 and SOURCE_CUE_PATTERN.search(line_text))
+                ):
                     page_rects.append(
                         expand_rect(line_rect, page=page, x_padding=2.0, y_padding=2.0)
                     )
@@ -427,7 +476,9 @@ def anonymize_pdf(
         "url_redaction_count": url_redaction_count,
         "author_hits": author_hits,
         "authors_not_located": authors_not_located,
+        "ignored_author_identities": ignored_author_identities,
         "first_page_author_band_redacted": first_page_author_band_redacted,
+        "first_page_identity_band_reason": first_page_identity_band_reason,
         "source_repair_diagnostic_count": len(diagnostics),
         "source_repair_diagnostics": diagnostics[:20],
         **validation,
@@ -462,6 +513,7 @@ def anonymize_representation(
     authors: list[str],
     strip_front_matter: bool,
 ) -> tuple[str, dict[str, Any]]:
+    authors, ignored_author_identities = filter_author_identities(authors)
     sanitized = text
     front_matter_removed = False
     if strip_front_matter:
@@ -511,6 +563,7 @@ def anonymize_representation(
         "email_replacement_count": email_count,
         "url_replacement_count": url_count,
         "residual_authors": residual_authors,
+        "ignored_author_identities": ignored_author_identities,
     }
 
 
@@ -630,6 +683,71 @@ def iter_page_lines(page: pymupdf.Page) -> list[tuple[str, pymupdf.Rect]]:
     return lines
 
 
+def find_first_page_identity_band(
+    *,
+    page: pymupdf.Page,
+    lines: list[tuple[str, pymupdf.Rect]],
+    title: str,
+    authors: list[str],
+) -> tuple[pymupdf.Rect | None, list[str]]:
+    normalized_title = normalize_identity_text(title)
+    if not normalized_title:
+        return None, []
+    abstract_rects = [
+        rect
+        for text, rect in lines
+        if normalize_identity_text(text) == "abstract"
+    ]
+    if not abstract_rects:
+        return None, []
+    abstract_top = min(rect.y0 for rect in abstract_rects)
+    title_rects = []
+    for text, rect in lines:
+        if rect.y1 >= abstract_top:
+            continue
+        normalized_line = normalize_identity_text(text)
+        if (
+            len(normalized_line) >= 8
+            and (
+                normalized_line in normalized_title
+                or normalized_title in normalized_line
+            )
+        ):
+            title_rects.append(rect)
+    if not title_rects:
+        return None, []
+    title_bottom = max(rect.y1 for rect in title_rects)
+    header_lines = [
+        (text, rect)
+        for text, rect in lines
+        if rect.y0 >= title_bottom - 0.5 and rect.y1 < abstract_top
+    ]
+    if not header_lines:
+        return None, []
+
+    reasons: list[str] = []
+    if any(
+        contains_author_identity(text, author)
+        for text, _ in header_lines
+        for author in authors
+    ):
+        reasons.append("known_author")
+    if any(EMAIL_PATTERN.search(text) for text, _ in header_lines):
+        reasons.append("email")
+    if any(AFFILIATION_FRAGMENT_PATTERN.search(text) for text, _ in header_lines):
+        reasons.append("affiliation")
+    if any(ANONYMOUS_AUTHOR_PATTERN.search(text) for text, _ in header_lines):
+        reasons.append("anonymous_author")
+    if not reasons:
+        return None, []
+
+    y0 = max(0.0, min(rect.y0 for _, rect in header_lines) - 3.0)
+    y1 = min(page.rect.height, abstract_top - 2.0)
+    if y1 <= y0:
+        return None, []
+    return pymupdf.Rect(0.0, y0, page.rect.width, y1), reasons
+
+
 def dedupe_rects(rects: list[pymupdf.Rect]) -> list[pymupdf.Rect]:
     unique: list[pymupdf.Rect] = []
     seen: set[tuple[int, int, int, int]] = set()
@@ -713,6 +831,23 @@ def normalize_transliteration(value: str) -> str:
     return value.replace("ae", "a").replace("oe", "o").replace("ue", "u")
 
 
+def filter_author_identities(authors: list[str]) -> tuple[list[str], list[str]]:
+    active: list[str] = []
+    ignored: list[str] = []
+    seen: set[str] = set()
+    for author in authors:
+        key = normalize_identity_text(author)
+        letters = "".join(character for character in author if character.isalpha())
+        looks_like_short_acronym = len(letters) <= 3 and letters.isupper()
+        if not key or looks_like_short_acronym:
+            ignored.append(author)
+            continue
+        if key not in seen:
+            seen.add(key)
+            active.append(author)
+    return active, ignored
+
+
 def author_name_variants(author: str) -> list[str]:
     variants = [author]
     tokens = re.findall(r"[^\W\d_]+(?:[-'][^\W\d_]+)*", author, flags=re.UNICODE)
@@ -741,7 +876,7 @@ def line_contains_name_variant(line: str, variant: str) -> bool:
     target = normalize_identity_text(variant)
     tokens = [
         normalize_identity_token(token)
-        for token in re.findall(r"[^\W_]+(?:[-'][^\W_]+)*", line, flags=re.UNICODE)
+        for token in re.findall(r"[^\W\d_]+(?:[-'][^\W\d_]+)*", line, flags=re.UNICODE)
     ]
     for start, token in enumerate(tokens):
         if not token or not target.startswith(token):
@@ -759,6 +894,21 @@ def line_contains_name_variant(line: str, variant: str) -> bool:
                 break
         if accumulated == target:
             return True
+    name_tokens = [
+        normalize_identity_token(token)
+        for token in re.findall(r"[^\W\d_]+(?:[-'][^\W\d_]+)*", variant, flags=re.UNICODE)
+    ]
+    name_tokens = [token for token in name_tokens if token]
+    if len(name_tokens) >= 2:
+        normalized_line = "".join(token for token in tokens if token)
+        first_name = name_tokens[0]
+        last_name = name_tokens[-1]
+        first_at = normalized_line.find(first_name)
+        if first_at >= 0:
+            first_end = first_at + len(first_name)
+            last_at = normalized_line.find(last_name, first_end)
+            if 0 <= last_at - first_end <= 40:
+                return True
     return False
 
 

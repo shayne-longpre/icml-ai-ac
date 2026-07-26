@@ -183,9 +183,13 @@ python3 -m icml_ai_ac.cli anonymize-papers \
   --max-pages 9
 ```
 
-The command removes the first-page author band, known author-name occurrences,
-affiliation and correspondence lines, emails, acknowledgements, mail links,
-and PDF author/XML metadata. It validates every derivative and omits
+The command removes a first-page identity band established from the title,
+abstract boundary, and author/email/affiliation/anonymous-byline signals, plus
+known author-name occurrences, correspondence lines, emails, acknowledgements,
+mail links, source/reviewer footers, and PDF author/XML metadata. It tolerates
+inserted middle names and fragmented superscript text, while ignoring
+implausibly short uppercase metadata identities that would over-redact notation.
+It validates every derivative and omits
 non-passing rows from the output manifest. Its append-only journal supports
 exact resume; rerunning the unchanged 103-paper production-layout probe reused
 103/103 rows in under half a second.

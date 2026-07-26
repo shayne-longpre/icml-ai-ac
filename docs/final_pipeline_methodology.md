@@ -32,9 +32,12 @@ preserving experiments, tables, baselines, ablations, and method details that
 were missing from earlier compact representations.
 
 Before scoring, a separate resumable stage creates identity-redacted derivatives
-of the first nine PDF pages and all text representations. It removes the
-first-page author band, author-name occurrences, affiliation and correspondence
-lines, emails, acknowledgements, mail links, and PDF author/XML metadata.
+of the first nine PDF pages and all text representations. It removes a
+layout-validated first-page identity band, author-name occurrences, affiliation
+and correspondence lines, emails, acknowledgements, mail links,
+source/reviewer footers, and PDF author/XML metadata. The detector handles
+fragmented superscripts, camera-ready middle-name drift, and already-anonymous
+bylines, while rejecting implausibly short uppercase metadata identities.
 Canonical PDFs and parsed text remain immutable. Each derivative is
 fingerprinted against its source, checked for residual known identities and
 email addresses, and excluded from scoring unless validation passes. Source
