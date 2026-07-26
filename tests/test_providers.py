@@ -6,12 +6,60 @@ from unittest.mock import patch
 
 from icml_ai_ac.scoring.providers import (
     ChatCompletionClient,
+    ChatResponseContentError,
+    extract_content,
+    is_batch_blocking_provider_error,
     post_json_with_retries,
     redact_provider_error_detail,
 )
 
 
 class ProviderTests(unittest.TestCase):
+    def test_batch_blocking_provider_errors_cover_auth_and_rate_limits(self) -> None:
+        for status in (400, 401, 403, 404, 422, 429):
+            self.assertTrue(is_batch_blocking_provider_error(RuntimeError(f"HTTP {status} from provider")))
+        self.assertTrue(is_batch_blocking_provider_error(RuntimeError("HTTP Error 429: rate limited")))
+        self.assertFalse(is_batch_blocking_provider_error(TimeoutError("request timed out")))
+
+    def test_content_error_retains_usage_without_dumping_response(self) -> None:
+        response = {"model": "served", "usage": {"cost": 0.25}, "secret": "not in message"}
+        error = ChatResponseContentError("missing text", response=response)
+
+        self.assertEqual(str(error), "missing text")
+        self.assertEqual(error.usage, {"cost": 0.25})
+        self.assertEqual(error.served_model, "served")
+
+    def test_extract_content_accepts_text_blocks(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "{\"status\":"},
+                            {"type": "text", "text": "\"ok\"}"},
+                        ]
+                    }
+                }
+            ]
+        }
+
+        self.assertEqual(extract_content(response), '{"status":\n"ok"}')
+
+    def test_extract_content_identifies_message_refusal(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "refusal": "I cannot help with that request.",
+                    }
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(ValueError, "refusal"):
+            extract_content(response)
+
     def test_openrouter_structured_calls_disable_returned_reasoning_by_default(self) -> None:
         captured: dict[str, object] = {}
 
@@ -132,11 +180,13 @@ class ProviderTests(unittest.TestCase):
                     ],
                     temperature=0.0,
                     max_output_tokens=100,
+                    seed=20260725,
                     response_format={"type": "json_object"},
                 )
 
         self.assertEqual(captured["url"], "https://api.openai.com/v1/responses")
         self.assertEqual(captured["reasoning"], {"effort": "xhigh"})
+        self.assertNotIn("seed", captured)
         self.assertEqual(captured["text"], {"format": {"type": "json_object"}})
         input_items = captured["input"]
         self.assertIsInstance(input_items, list)

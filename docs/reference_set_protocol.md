@@ -20,7 +20,9 @@ review process would prioritize.
    set of strong judges. Each card should see the configured PDF excerpt plus
    extracted main-paper text, with retrieval off.
 3. Synthesize the cards into a full 1..50 seed ranking.
-4. Run pairwise tournament adjudication over the top seed subset.
+4. Run pairwise tournament adjudication over the top seed subset with
+   deterministic randomization of pair batches, A/B presentation, and evidence
+   order. Do not expose seed ranks in the adjudication prompt.
 5. Store the reference ranking as JSON with a `ranked_papers` array and evaluate
    candidate pipelines against it with `eval-ranking`.
 
@@ -67,7 +69,7 @@ review process would prioritize.
 
 ```bash
 python3 -m icml_ai_ac.cli eval-ranking \
-  --gold data/reference/icml_2025_accepted_50_frontier_pdf_tournament_gold.json \
+  --gold data/reference/icml_2025_accepted_50_frontier_pdf_tournament_gold_randomized_v3.json \
   --candidate data/scores/icml_2025_pass1_ensemble_v2_3models_shortlist45_classbalanced3.jsonl \
   --out data/evals/cheap_ensemble_vs_tournament_gold.json \
   --k 5 --k 10 --k 20

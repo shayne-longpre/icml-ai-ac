@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import itertools
 import json
 import math
+import random
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -15,13 +17,14 @@ from icml_ai_ac.pdf_utils import write_pdf_page_excerpt
 from icml_ai_ac.scoring.providers import ChatCompletionClient
 from icml_ai_ac.scoring.runner import estimate_tokens, read_text_path, resolve_record_text_path
 from icml_ai_ac.scoring.schema import CONTRIBUTION_CLASSES, parse_json_response
+from icml_ai_ac.scoring.usage import sum_usage
 from icml_ai_ac.storage import read_paper_records, write_json, write_jsonl
 
 
 FRONTIER_CARD_PROMPT_VERSION = "frontier_pdf_paper_card_v1"
 FRONTIER_CARD_ENSEMBLE_VERSION = "frontier_pdf_card_ensemble_v1"
 FRONTIER_SYNTHESIS_PROMPT_VERSION = "frontier_pdf_card_synthesis_rank_v1"
-FRONTIER_TOURNAMENT_PROMPT_VERSION = "frontier_pdf_card_pairwise_tournament_v1"
+FRONTIER_TOURNAMENT_PROMPT_VERSION = "frontier_pdf_card_pairwise_tournament_v3"
 
 
 @dataclass(slots=True)
@@ -45,6 +48,8 @@ class FrontierCardConfig:
     dry_run: bool
     overwrite: bool
     openrouter_pdf_engine: str | None
+    fallback_model: str | None
+    fallback_reasoning_effort: str | None
 
 
 @dataclass(slots=True)
@@ -96,6 +101,7 @@ def run_frontier_pdf_cards(
     run_dir: Path,
     config: FrontierCardConfig,
     client: ChatCompletionClient | None,
+    fallback_client: ChatCompletionClient | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     candidates = select_frontier_card_candidates(manifest=manifest, config=config)
@@ -103,7 +109,13 @@ def run_frontier_pdf_cards(
         (run_dir / child).mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     for index, candidate in enumerate(candidates, start=1):
-        row = run_frontier_pdf_card(
+        existing_failure: dict[str, Any] | None = None
+        primary_card_path = run_dir / "cards" / f"{candidate.record.paper_id}.json"
+        if config.fallback_model and primary_card_path.exists() and not config.overwrite:
+            existing = json.loads(primary_card_path.read_text(encoding="utf-8"))
+            if existing.get("status") not in {"ok", "dry_run"}:
+                existing_failure = existing
+        row = existing_failure or run_frontier_pdf_card(
             candidate,
             index=index,
             total=len(candidates),
@@ -111,12 +123,56 @@ def run_frontier_pdf_cards(
             config=config,
             client=client,
         )
+        if (
+            row.get("status") not in {"ok", "dry_run"}
+            and config.fallback_model
+            and fallback_client is not None
+        ):
+            primary_row = row
+            fallback_config = replace(
+                config,
+                model=config.fallback_model,
+                reasoning_effort=config.fallback_reasoning_effort,
+                fallback_model=None,
+                fallback_reasoning_effort=None,
+                overwrite=False,
+            )
+            fallback_row = run_frontier_pdf_card(
+                candidate,
+                index=index,
+                total=len(candidates),
+                run_dir=run_dir / "fallbacks" / candidate.record.paper_id,
+                config=fallback_config,
+                client=fallback_client,
+            )
+            fallback_row["fallback_from_model"] = config.model
+            fallback_row["fallback_reason"] = primary_row.get("error") or primary_row.get("validation_errors")
+            fallback_row["primary_attempt"] = {
+                key: primary_row.get(key)
+                for key in (
+                    "status",
+                    "model",
+                    "served_model",
+                    "error",
+                    "error_path",
+                    "validation_errors",
+                    "usage",
+                )
+                if primary_row.get(key) is not None
+            }
+            fallback_row["attempt_usage"] = sum_usage(
+                (primary_row.get("usage"), fallback_row.get("usage"))
+            )
+            row = fallback_row
+            if row.get("status") == "ok":
+                write_json(run_dir / "cards" / f"{candidate.record.paper_id}.json", row)
         rows.append(row)
         write_jsonl(out, rows)
     summary = {
         "status": "dry_run" if config.dry_run else "ok",
         "provider": config.provider,
         "model": config.model,
+        "fallback_model": config.fallback_model,
         "reasoning_effort": config.reasoning_effort,
         "prompt_version": config.prompt_version,
         "paper_set_name": config.paper_set_name,
@@ -128,8 +184,9 @@ def run_frontier_pdf_cards(
         "failed_count": sum(1 for row in rows if row.get("status") == "failed"),
         "validation_error_count": sum(1 for row in rows if row.get("status") == "validation_error"),
         "dry_run_count": sum(1 for row in rows if row.get("status") == "dry_run"),
+        "fallback_count": sum(1 for row in rows if row.get("fallback_from_model")),
         "elapsed_seconds": round(time.monotonic() - started, 3),
-        "usage": sum_usage(row.get("usage") for row in rows),
+        "usage": sum_usage(row.get("attempt_usage") or row.get("usage") for row in rows),
     }
     if summary["failed_count"] or summary["validation_error_count"]:
         summary["status"] = "partial" if not config.dry_run else "dry_run"
@@ -174,6 +231,7 @@ def run_frontier_pdf_card(
         "prompt_path": None,
         "validation_errors": [],
     }
+    chat = None
     try:
         excerpt_info = write_pdf_page_excerpt(
             source_pdf=candidate.pdf_path,
@@ -230,6 +288,12 @@ def run_frontier_pdf_card(
             "card": parsed,
         }
     except Exception as exc:  # noqa: BLE001 - persist row-local failures for retry.
+        response = getattr(exc, "response", None)
+        raw_response_path = run_dir / "responses" / f"{paper_id}.json"
+        if isinstance(response, dict) and not raw_response_path.exists():
+            write_json(raw_response_path, response)
+        usage = chat.usage if chat is not None else getattr(exc, "usage", {})
+        served_model = chat.served_model if chat is not None else getattr(exc, "served_model", None)
         error_path = run_dir / "errors" / f"{paper_id}.json"
         write_json(error_path, {"paper_id": paper_id, "error": repr(exc)})
         row = {
@@ -238,6 +302,12 @@ def run_frontier_pdf_card(
             "error_path": str(error_path),
             "error": repr(exc),
         }
+        if raw_response_path.exists():
+            row["raw_response_path"] = str(raw_response_path)
+        if isinstance(usage, dict) and usage:
+            row["usage"] = usage
+        if served_model:
+            row["served_model"] = served_model
     write_json(card_path, row)
     return row
 
@@ -468,6 +538,7 @@ def run_frontier_card_synthesis(
         return result
     if client is None:
         raise ValueError("client is required unless dry_run=True")
+    chat = None
     try:
         chat = client.complete(
             messages=messages,
@@ -495,6 +566,12 @@ def run_frontier_card_synthesis(
             "ranking": parsed,
         }
     except Exception as exc:  # noqa: BLE001 - persist failed synthesis attempts.
+        response = getattr(exc, "response", None)
+        raw_response_path = run_dir / "response.json"
+        if isinstance(response, dict) and not raw_response_path.exists():
+            write_json(raw_response_path, response)
+        usage = chat.usage if chat is not None else getattr(exc, "usage", {})
+        served_model = chat.served_model if chat is not None else getattr(exc, "served_model", None)
         error_path = run_dir / "error.json"
         write_json(error_path, {"error": repr(exc)})
         result = {
@@ -504,6 +581,12 @@ def run_frontier_card_synthesis(
             "error": repr(exc),
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
+        if raw_response_path.exists():
+            result["raw_response_path"] = str(raw_response_path)
+        if isinstance(usage, dict) and usage:
+            result["usage"] = usage
+        if served_model:
+            result["served_model"] = served_model
     write_json(out, result if result["status"] == "failed" else result["ranking"])
     write_json(run_dir / "run.json", result)
     return result
@@ -573,6 +656,10 @@ def run_frontier_card_tournament(
         "swiss_rounds": config.swiss_rounds,
         "playoff_top_n": config.playoff_top_n,
         "pairs_per_batch": config.pairs_per_batch,
+        "pair_schedule": "deterministic_random",
+        "pair_schedule_seed": config.seed or 0,
+        "pair_orientation": "deterministic_random",
+        "pair_orientation_seed": config.seed or 0,
         "tournament_ids": tournament_ids,
         "pair_count": len(planned_pairs),
         "batch_count_estimate": batch_count_estimate,
@@ -706,7 +793,7 @@ def run_all_pairs_schedule(
     config: FrontierTournamentConfig,
     client: ChatCompletionClient | None,
 ) -> dict[str, Any]:
-    pairs = build_tournament_pairs(tournament_ids)
+    pairs = randomize_tournament_pairs(build_tournament_pairs(tournament_ids), seed=config.seed or 0)
     pair_batches = batch_tournament_pairs(pairs, config.pairs_per_batch)
     batch_results, matches = run_pair_batches(
         pair_batches=pair_batches,
@@ -760,6 +847,10 @@ def run_swiss_schedule(
 
     for round_index in range(config.swiss_rounds):
         round_pairs = build_swiss_round_pairs(standings_ids, played_pair_keys)
+        round_pairs = randomize_tournament_pairs(
+            round_pairs,
+            seed=(config.seed or 0) + round_index,
+        )
         pair_batches = batch_tournament_pairs(round_pairs, config.pairs_per_batch)
         round_batch_results, round_matches = run_pair_batches(
             pair_batches=pair_batches,
@@ -813,6 +904,7 @@ def run_swiss_schedule(
             for pair in build_tournament_pairs(playoff_ids)
             if frozenset(pair) not in {frozenset((str(match.get("paper_a")), str(match.get("paper_b")))) for match in matches}
         ]
+        playoff_pairs = randomize_tournament_pairs(playoff_pairs, seed=(config.seed or 0) + 10_000)
         pair_batches = batch_tournament_pairs(playoff_pairs, config.pairs_per_batch)
         playoff_batch_results, playoff_matches = run_pair_batches(
             pair_batches=pair_batches,
@@ -840,6 +932,7 @@ def run_swiss_schedule(
         playoff_pairs = [
             pair for pair in build_tournament_pairs(playoff_ids) if frozenset(pair) not in played_pair_keys
         ]
+        playoff_pairs = randomize_tournament_pairs(playoff_pairs, seed=(config.seed or 0) + 10_000)
         pair_batches = batch_tournament_pairs(playoff_pairs, config.pairs_per_batch)
         playoff_batch_results, _ = run_pair_batches(
             pair_batches=pair_batches,
@@ -927,27 +1020,6 @@ def run_frontier_tournament_batch(
     batch_dir.mkdir(parents=True, exist_ok=True)
     parsed_path = batch_dir / "parsed.json"
     expected = {pair_id_for(a, b): (a, b) for a, b in pairs}
-    cache_reuse_error: str | None = None
-    if parsed_path.exists() and not config.overwrite:
-        try:
-            parsed = json.loads(parsed_path.read_text(encoding="utf-8"))
-            parsed = normalize_tournament_batch(parsed, expected_pairs=expected)
-            validation_errors = validate_tournament_batch(parsed, expected_pairs=expected)
-            if not validation_errors:
-                return {
-                    "status": "ok",
-                    "batch_index": batch_index,
-                    "batch_count": batch_count,
-                    "pair_count": len(pairs),
-                    "parsed_response_path": str(parsed_path),
-                    "validation_errors": [],
-                    "parsed": parsed,
-                    "resumed_from": str(parsed_path),
-                }
-            cache_reuse_error = "; ".join(validation_errors)
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
-            cache_reuse_error = repr(exc)
-
     messages = build_frontier_tournament_messages(
         pairs=pairs,
         rows_by_paper=rows_by_paper,
@@ -957,27 +1029,82 @@ def run_frontier_tournament_batch(
         config=config,
     )
     prompt_path = batch_dir / "prompt.json"
-    write_json(
-        prompt_path,
-        {
-            "prompt_version": config.prompt_version,
-            "provider": config.provider,
-            "model": config.model,
-            "reasoning_effort": config.reasoning_effort,
-            "paper_set_name": config.paper_set_name,
-            "batch_index": batch_index,
-            "batch_count": batch_count,
-            "pair_count": len(pairs),
-            "pairs": [{"pair_id": pair_id_for(a, b), "paper_a": a, "paper_b": b} for a, b in pairs],
-            "messages": messages,
-            "prompt_tokens_estimate": sum(estimate_tokens(_message_text_for_estimate(message)) for message in messages),
-        },
-    )
+    prompt_payload = {
+        "prompt_version": config.prompt_version,
+        "provider": config.provider,
+        "model": config.model,
+        "reasoning_effort": config.reasoning_effort,
+        "paper_set_name": config.paper_set_name,
+        "batch_index": batch_index,
+        "batch_count": batch_count,
+        "pair_count": len(pairs),
+        "pairs": [{"pair_id": pair_id_for(a, b), "paper_a": a, "paper_b": b} for a, b in pairs],
+        "temperature": config.temperature,
+        "max_output_tokens": config.max_output_tokens,
+        "seed": config.seed,
+        "messages": messages,
+        "prompt_tokens_estimate": sum(estimate_tokens(_message_text_for_estimate(message)) for message in messages),
+    }
+    fingerprint = tournament_prompt_fingerprint(prompt_payload)
+    prompt_payload["fingerprint"] = fingerprint
+    cache_reuse_error: str | None = None
+    if parsed_path.exists() and not config.overwrite:
+        try:
+            existing_prompt = json.loads(prompt_path.read_text(encoding="utf-8"))
+            if not isinstance(existing_prompt, dict):
+                raise ValueError("cached prompt is not a JSON object")
+            existing_fingerprint = str(existing_prompt.get("fingerprint") or "")
+            if existing_fingerprint:
+                if existing_fingerprint != fingerprint:
+                    raise ValueError("cached prompt fingerprint does not match this request")
+            else:
+                legacy_prompt = {
+                    key: value
+                    for key, value in existing_prompt.items()
+                    if key != "fingerprint"
+                }
+                expected_legacy_prompt = {
+                    key: prompt_payload.get(key)
+                    for key in legacy_prompt
+                }
+                if legacy_prompt != expected_legacy_prompt:
+                    raise ValueError("cached legacy prompt does not match this request")
+            parsed = json.loads(parsed_path.read_text(encoding="utf-8"))
+            parsed = normalize_tournament_batch(parsed, expected_pairs=expected)
+            validation_errors = validate_tournament_batch(parsed, expected_pairs=expected)
+            if not validation_errors:
+                write_json(prompt_path, prompt_payload)
+                cached_result = {
+                    "status": "ok",
+                    "batch_index": batch_index,
+                    "batch_count": batch_count,
+                    "pair_count": len(pairs),
+                    "fingerprint": fingerprint,
+                    "prompt_path": str(prompt_path),
+                    "parsed_response_path": str(parsed_path),
+                    "validation_errors": [],
+                    "parsed": parsed,
+                    "resumed_from": str(parsed_path),
+                }
+                run_state_path = batch_dir / "run.json"
+                if run_state_path.exists():
+                    run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
+                    if isinstance(run_state.get("usage"), dict):
+                        cached_result["usage"] = run_state["usage"]
+                    if run_state.get("served_model"):
+                        cached_result["served_model"] = run_state["served_model"]
+                return cached_result
+            cache_reuse_error = "; ".join(validation_errors)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            cache_reuse_error = repr(exc)
+
+    write_json(prompt_path, prompt_payload)
     base_result: dict[str, Any] = {
         "status": "dry_run" if config.dry_run else "pending",
         "batch_index": batch_index,
         "batch_count": batch_count,
         "pair_count": len(pairs),
+        "fingerprint": fingerprint,
         "prompt_path": str(prompt_path),
         "raw_response_path": None,
         "parsed_response_path": None,
@@ -989,6 +1116,7 @@ def run_frontier_tournament_batch(
         return base_result
     if client is None:
         raise ValueError("client is required unless dry_run=True")
+    chat = None
     try:
         chat = client.complete(
             messages=messages,
@@ -1015,6 +1143,12 @@ def run_frontier_tournament_batch(
             "parsed": parsed,
         }
     except Exception as exc:  # noqa: BLE001 - batch-local persistence enables retry.
+        response = getattr(exc, "response", None)
+        raw_response_path = batch_dir / "response.json"
+        if isinstance(response, dict) and not raw_response_path.exists():
+            write_json(raw_response_path, response)
+        usage = chat.usage if chat is not None else getattr(exc, "usage", {})
+        served_model = chat.served_model if chat is not None else getattr(exc, "served_model", None)
         error_path = batch_dir / "error.json"
         write_json(error_path, {"error": repr(exc)})
         result = {
@@ -1023,8 +1157,20 @@ def run_frontier_tournament_batch(
             "error_path": str(error_path),
             "error": repr(exc),
         }
+        if raw_response_path.exists():
+            result["raw_response_path"] = str(raw_response_path)
+        if isinstance(usage, dict) and usage:
+            result["usage"] = usage
+        if served_model:
+            result["served_model"] = served_model
     write_json(batch_dir / "run.json", {key: value for key, value in result.items() if key != "parsed"})
     return result
+
+
+def tournament_prompt_fingerprint(payload: dict[str, Any]) -> str:
+    canonical = {key: value for key, value in payload.items() if key != "fingerprint"}
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def build_frontier_tournament_messages(
@@ -1044,7 +1190,8 @@ For every pair, choose the paper with the stronger expected broad scientific and
 
 Return only valid JSON."""
     seed_by_id = {str(row.get("paper_id") or ""): row for row in seed_ranked if str(row.get("paper_id") or "")}
-    batch_ids = sorted({paper_id for pair in pairs for paper_id in pair}, key=lambda paper_id: number(seed_by_id.get(paper_id, {}).get("rank")))
+    batch_ids = sorted({paper_id for pair in pairs for paper_id in pair})
+    random.Random((config.seed or 0) + batch_index).shuffle(batch_ids)
     paper_blocks = "\n\n".join(
         format_tournament_paper_block(paper_id, rows_by_paper[paper_id], seed_item=seed_by_id.get(paper_id, {}))
         for paper_id in batch_ids
@@ -1131,6 +1278,21 @@ def format_tournament_paper_block(paper_id: str, rows: list[dict[str, Any]], *, 
 
 def build_tournament_pairs(paper_ids: list[str]) -> list[tuple[str, str]]:
     return list(itertools.combinations(paper_ids, 2))
+
+
+def randomize_tournament_pairs(
+    pairs: list[tuple[str, str]],
+    *,
+    seed: int,
+) -> list[tuple[str, str]]:
+    """Randomize pair batching and A/B presentation without changing the schedule."""
+    rng = random.Random(seed)
+    randomized = list(pairs)
+    rng.shuffle(randomized)
+    return [
+        (paper_b, paper_a) if rng.random() < 0.5 else (paper_a, paper_b)
+        for paper_a, paper_b in randomized
+    ]
 
 
 def build_swiss_round_pairs(standings_ids: list[str], played_pair_keys: set[frozenset[str]]) -> list[tuple[str, str]]:
@@ -1498,7 +1660,11 @@ def build_tournament_gold_payload(
             "path": str(seed_ranking_path),
             "evaluation_mode": seed_payload.get("evaluation_mode"),
             "prompt_version": seed_payload.get("prompt_version"),
-            "note": "Seed ranking selected the tournament pool and orders papers outside the pool.",
+            "note": (
+                "Seed ranking selects the tournament pool and orders papers outside it. "
+                "Pair batching, A/B orientation, and evidence-block order are separately "
+                "and deterministically randomized."
+            ),
         },
         "card_paths": [str(path) for path in card_paths],
         "ranked_papers": ranked_papers,
@@ -1514,6 +1680,10 @@ def build_tournament_gold_payload(
             "all_pairs_equivalent_pair_count": len(build_tournament_pairs(tournament_ids)),
             "batch_count": len(batch_results),
             "pairs_per_batch": config.pairs_per_batch,
+            "pair_schedule": "deterministic_random",
+            "pair_schedule_seed": config.seed or 0,
+            "pair_orientation": "deterministic_random",
+            "pair_orientation_seed": config.seed or 0,
             "schedule": schedule,
             "usage": usage,
             "elapsed_seconds": elapsed_seconds,
@@ -1914,14 +2084,3 @@ def build_category_rankings(ranked_items: list[dict[str, Any]]) -> dict[str, lis
             category = "other"
         category_rankings[category].append(str(item.get("paper_id")))
     return category_rankings
-
-
-def sum_usage(usages: Any) -> dict[str, int]:
-    totals: dict[str, int] = {}
-    for usage in usages:
-        if not isinstance(usage, dict):
-            continue
-        for key, value in usage.items():
-            if isinstance(value, int):
-                totals[key] = totals.get(key, 0) + value
-    return totals

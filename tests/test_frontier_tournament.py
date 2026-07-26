@@ -6,6 +6,8 @@ from icml_ai_ac.scoring.frontier_gold import (
     build_tournament_pairs,
     normalize_tournament_batch,
     pair_id_for,
+    randomize_tournament_pairs,
+    tournament_prompt_fingerprint,
     validate_tournament_batch,
 )
 
@@ -30,6 +32,47 @@ class FrontierTournamentTests(unittest.TestCase):
     def test_pair_batch_size_must_be_positive(self) -> None:
         with self.assertRaisesRegex(ValueError, "pairs_per_batch must be positive"):
             batch_tournament_pairs([("p1", "p2")], 0)
+
+    def test_pair_schedule_and_orientation_are_deterministically_randomized(self) -> None:
+        pairs = build_tournament_pairs(["p1", "p2", "p3", "p4"])
+        randomized = randomize_tournament_pairs(pairs, seed=17)
+
+        self.assertEqual(randomized, randomize_tournament_pairs(pairs, seed=17))
+        self.assertEqual(
+            {frozenset(pair) for pair in randomized},
+            {frozenset(pair) for pair in pairs},
+        )
+        self.assertNotEqual(
+            [frozenset(pair) for pair in randomized],
+            [frozenset(pair) for pair in pairs],
+        )
+        original_orientation = {
+            frozenset(pair): pair
+            for pair in pairs
+        }
+        self.assertTrue(
+            any(pair != original_orientation[frozenset(pair)] for pair in randomized)
+        )
+        self.assertTrue(
+            any(pair == original_orientation[frozenset(pair)] for pair in randomized)
+        )
+
+    def test_tournament_prompt_fingerprint_covers_decoding_configuration(self) -> None:
+        payload = {
+            "model": "judge",
+            "pairs": [{"paper_a": "p1", "paper_b": "p2"}],
+            "temperature": 0.0,
+            "messages": [{"role": "user", "content": "compare"}],
+        }
+
+        self.assertEqual(
+            tournament_prompt_fingerprint(payload),
+            tournament_prompt_fingerprint({**payload, "fingerprint": "ignored"}),
+        )
+        self.assertNotEqual(
+            tournament_prompt_fingerprint(payload),
+            tournament_prompt_fingerprint({**payload, "temperature": 0.2}),
+        )
 
     def test_normalize_and_validate_pairwise_batch(self) -> None:
         expected = {pair_id_for("p1", "p2"): ("p1", "p2")}

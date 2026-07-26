@@ -145,6 +145,8 @@ def select_finalists(
     for paper_id in fill_order:
         if len(selected) >= config.limit:
             break
+        if paper_id in selected:
+            continue
         add_selected(selected, paper_id, "semifinal_fill")
 
     rows = [
@@ -190,12 +192,14 @@ def select_finalists(
 
 
 def read_ranked_rows(path: Path) -> list[dict[str, Any]]:
-    if path.suffix == ".jsonl":
+    text = path.read_text(encoding="utf-8")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
         rows = list(read_jsonl(path))
         if rows and not any(row.get("rank") for row in rows):
             rows = sorted(rows, key=shortlist_sort_key, reverse=True)
     else:
-        payload = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(payload, dict) and "ranking" in payload and isinstance(payload["ranking"], dict):
             payload = payload["ranking"]
         if isinstance(payload, dict) and isinstance(payload.get("ranked_papers"), list):

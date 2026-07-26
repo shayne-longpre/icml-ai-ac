@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -9,10 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from icml_ai_ac.models import PaperRecord
-from icml_ai_ac.scoring.providers import ChatCompletionClient
+from icml_ai_ac.scoring.providers import ChatCompletionClient, is_batch_blocking_provider_error
 from icml_ai_ac.scoring.runner import estimate_tokens, read_text_path, resolve_record_text_path
 from icml_ai_ac.scoring.schema import CONTRIBUTION_CLASSES, parse_json_response
-from icml_ai_ac.storage import read_paper_records, write_json, write_jsonl
+from icml_ai_ac.scoring.usage import sum_usage
+from icml_ai_ac.storage import read_json, read_paper_records, write_json, write_jsonl
 
 
 PASS1_BATCH_PROMPT_VERSION = "pass1_cheap_forced_batch_rank_v1"
@@ -230,9 +232,15 @@ def run_pass1_batch_suite(
                 "batch_size": len(batch_candidates),
                 "candidate_ids": [candidate.record.paper_id for candidate in batch_candidates],
                 "text_source": config.text_source,
+                "reasoning_effort": config.reasoning_effort,
+                "temperature": config.temperature,
+                "max_output_tokens": config.max_output_tokens,
+                "seed": config.seed,
                 "messages": messages,
                 "prompt_tokens_estimate": sum(estimate_tokens(message["content"]) for message in messages),
             }
+            fingerprint = batch_prompt_fingerprint(prompt_payload)
+            prompt_payload["fingerprint"] = fingerprint
             write_json(prompt_path, prompt_payload)
             if config.dry_run:
                 batch_rows = build_dry_run_rows(batch_candidates, config=batch_config, prompt_path=prompt_path)
@@ -244,12 +252,28 @@ def run_pass1_batch_suite(
                         "partition_index": partition_index,
                         "batch_index": batch_index,
                         "candidate_count": len(batch_candidates),
+                        "fingerprint": fingerprint,
                         "prompt_path": str(prompt_path),
                     }
                 )
                 continue
             if client is None:
                 raise RuntimeError("live batch suite requires a provider client")
+            cached = load_cached_pass1_batch(
+                batch_dir=batch_dir,
+                fingerprint=fingerprint,
+                candidates=batch_candidates,
+                config=batch_config,
+                prompt_path=prompt_path,
+                partition_index=partition_index,
+                batch_index=batch_index,
+            )
+            if cached is not None:
+                batch_rows, batch_result = cached
+                rows.extend(batch_rows)
+                batch_results.append(batch_result)
+                continue
+            chat = None
             try:
                 chat = client.complete(
                     messages=messages,
@@ -282,16 +306,25 @@ def run_pass1_batch_suite(
                         "partition_index": partition_index,
                         "batch_index": batch_index,
                         "candidate_count": len(batch_candidates),
+                        "fingerprint": fingerprint,
                         "prompt_path": str(prompt_path),
                         "raw_response_path": str(raw_response_path),
                         "parsed_response_path": str(parsed_response_path),
                         "usage": chat.usage,
                         "served_model": chat.served_model,
                         "provider_elapsed_seconds": round(chat.elapsed_seconds, 3),
+                        "resumed": False,
                     }
                 )
+                write_json(batch_dir / "batch.json", batch_results[-1])
             except Exception as exc:  # noqa: BLE001 - keep running later batches.
                 failures += 1
+                response = getattr(exc, "response", None)
+                raw_response_path = batch_dir / "response.json"
+                if isinstance(response, dict) and not raw_response_path.exists():
+                    write_json(raw_response_path, response)
+                usage = chat.usage if chat is not None else getattr(exc, "usage", {})
+                served_model = chat.served_model if chat is not None else getattr(exc, "served_model", None)
                 error_path = batch_dir / "error.json"
                 write_json(error_path, {"error": repr(exc)})
                 batch_results.append(
@@ -300,12 +333,20 @@ def run_pass1_batch_suite(
                         "partition_index": partition_index,
                         "batch_index": batch_index,
                         "candidate_count": len(batch_candidates),
+                        "fingerprint": fingerprint,
                         "prompt_path": str(prompt_path),
                         "error_path": str(error_path),
                         "error": repr(exc),
                     }
                 )
-                if is_non_retryable_provider_request_error(exc):
+                if raw_response_path.exists():
+                    batch_results[-1]["raw_response_path"] = str(raw_response_path)
+                if isinstance(usage, dict) and usage:
+                    batch_results[-1]["usage"] = usage
+                if served_model:
+                    batch_results[-1]["served_model"] = served_model
+                write_json(batch_dir / "batch.json", batch_results[-1])
+                if is_batch_blocking_provider_error(exc):
                     blocked_reason = repr(exc)
             if config.request_delay_seconds:
                 time.sleep(config.request_delay_seconds)
@@ -322,7 +363,9 @@ def run_pass1_batch_suite(
         "attempted_batch_count": len(batch_results),
         "skipped_batch_count": planned_batches - len(batch_results),
         "failure_count": failures,
+        "resumed_batch_count": sum(bool(result.get("resumed")) for result in batch_results),
         "blocked_reason": blocked_reason,
+        "usage": sum_usage(result.get("usage") for result in batch_results),
         "batch_results": batch_results,
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
@@ -330,9 +373,52 @@ def run_pass1_batch_suite(
     return result
 
 
-def is_non_retryable_provider_request_error(exc: Exception) -> bool:
-    """Identify request-wide client errors that will repeat for every batch."""
-    return str(exc).lower().startswith("http 400 from provider:")
+def batch_prompt_fingerprint(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_cached_pass1_batch(
+    *,
+    batch_dir: Path,
+    fingerprint: str,
+    candidates: list[BatchCandidate],
+    config: Pass1BatchConfig,
+    prompt_path: Path,
+    partition_index: int,
+    batch_index: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    state_path = batch_dir / "batch.json"
+    raw_response_path = batch_dir / "response.json"
+    parsed_response_path = batch_dir / "parsed.json"
+    if not state_path.exists() or not raw_response_path.exists() or not parsed_response_path.exists():
+        return None
+    try:
+        state = read_json(state_path)
+        if (
+            not isinstance(state, dict)
+            or state.get("status") != "ok"
+            or state.get("fingerprint") != fingerprint
+        ):
+            return None
+        parsed = read_json(parsed_response_path)
+        if not isinstance(parsed, dict):
+            return None
+        rows = batch_response_to_rows(
+            parsed,
+            candidates=candidates,
+            config=config,
+            prompt_path=prompt_path,
+            raw_response_path=raw_response_path,
+            parsed_response_path=parsed_response_path,
+            usage=state.get("usage") if isinstance(state.get("usage"), dict) else {},
+        )
+        annotate_suite_rows(rows, partition_index=partition_index, batch_index=batch_index)
+        for row in rows:
+            row["served_model"] = state.get("served_model")
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return rows, {**state, "resumed": True}
 
 
 def select_batch_candidates(

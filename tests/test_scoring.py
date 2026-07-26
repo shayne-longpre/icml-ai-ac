@@ -26,11 +26,24 @@ class ScoringTests(unittest.TestCase):
 
     def test_production_frontier_panel_spans_three_model_families(self) -> None:
         self.assertEqual(
-            [(judge.model, judge.reasoning_effort) for judge in PRODUCTION_FRONTIER_JUDGES],
             [
-                ("openai/gpt-5.6-sol", "xhigh"),
-                ("anthropic/claude-fable-5", "high"),
-                ("google/gemini-3.1-pro-preview", "high"),
+                (
+                    judge.model,
+                    judge.reasoning_effort,
+                    judge.fallback_model,
+                    judge.fallback_reasoning_effort,
+                )
+                for judge in PRODUCTION_FRONTIER_JUDGES
+            ],
+            [
+                ("openai/gpt-5.6-sol", "xhigh", None, None),
+                (
+                    "anthropic/claude-fable-5",
+                    "high",
+                    "anthropic/claude-opus-4.8",
+                    "high",
+                ),
+                ("google/gemini-3.1-pro-preview", "high", None, None),
             ],
         )
 

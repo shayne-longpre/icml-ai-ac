@@ -35,10 +35,11 @@ cause provider failures. Text remains included alongside the PDF excerpt.
 
 ## Stage 1: Contribution Routing
 
-A cheap model first classifies papers by contribution route using compact text:
-title, abstract, introduction, and conclusion-style content. These labels are
-used for stratified batching and class-balanced selection. They are not treated
-as quality judgments.
+Gemini 3.1 Flash Lite first classifies papers by contribution route using
+compact title, abstract, introduction, and conclusion-style text. These labels
+support stratified batching and class-balanced selection; they are not quality
+judgments. Classification runs in small fingerprinted batches, and reruns reuse
+valid batches while retrying only missing or invalid ones.
 
 ## Stage 2: Cheap Ensemble Triage
 
@@ -48,7 +49,10 @@ ensemble: `nvidia/nemotron-3-ultra-550b-a55b`,
 `x-ai/grok-4.3`. The design uses listwise forced-ranking batches rather than
 independent absolute 1-10 scores, because early Qwen runs produced compressed
 score distributions. The cheap ensemble's goal is high recall into the
-strong-model stages; its ordering is not trusted for headline ranking.
+strong-model stages; its ordering is not trusted for headline ranking. Each
+paper is placed in two deterministic class-stratified partitions by default.
+Prompts, responses, model IDs, usage, and fingerprints are persisted for
+resume after interruption.
 
 The shortlist builder aggregates multiple cheap score files, normalizes by
 source model so one model cannot dominate by producing more rows, and selects a
@@ -58,6 +62,7 @@ later ranking layers can reuse the cheap evidence. The key production knobs are:
 
 ```text
 score-pass1-ensemble --model-preset
+score-pass1-ensemble --model-workers 4
 score-pass1-ensemble --aggregate-out
 build-shortlist --limit
 ```
@@ -67,12 +72,18 @@ of parsed papers.
 
 ## Stage 3: Strong Semifinal Ranking
 
-Two independent text-only judges rank the full cheap shortlist over the
-main-paper scoring text: GPT-5.6 Terra high through OpenAI and Claude Sonnet 5
-high through OpenRouter. Each judge must return exact paper coverage. A local,
-deterministic ensemble then averages equal-weight normalized ranks. It stores
-both source rows, requested and served model IDs, source ranks, consensus rank,
-and normalized judge disagreement.
+Two independent text-only judges evaluate the same complete cheap shortlist
+over main-paper scoring text: GPT-5.6 Terra high through OpenAI and Claude
+Sonnet 5 high through OpenRouter. Corpus-wide single responses are infeasible,
+so each judge uses the same repeated, class-stratified listwise batches. We
+average each paper's normalized local rank across partitions, require one valid
+judgment per partition, and then average the judges' global normalized ranks.
+Every batch is fingerprinted and resumable. Exact partition coverage and a
+connected overlapping-batch comparison graph are required before aggregation.
+
+The output retains source judgments, prompts, requested and served model IDs,
+local and global ranks, within-judge batch variation, and between-judge
+disagreement.
 
 Equal weighting avoids an unsupported calibration claim. Normalized ranks avoid
 mixing model-specific absolute score scales. Consensus ties prefer lower judge
@@ -83,12 +94,13 @@ ordering and rationales but is not allowed to make a narrow final cut.
 The production commands are:
 
 ```text
-rank-pass2 --provider openai --model gpt-5.6-terra --reasoning-effort high
-rank-pass2 --provider openrouter --model anthropic/claude-sonnet-5 --reasoning-effort high
+rank-pass2-batches --provider openai --model gpt-5.6-terra --reasoning-effort high
+rank-pass2-batches --provider openrouter --model anthropic/claude-sonnet-5 --reasoning-effort high
 ensemble-semifinal-rankings --ranking ... --ranking ... --label terra --label sonnet
 ```
 
-The recommended default is to give both judges the same complete shortlist.
+The recommended default gives both judges the same complete shortlist, size-8
+batches, two partition seeds, and contribution labels.
 Claude Opus 4.8 is an optional adjudicator for high-disagreement cases or a
 small robustness sample, not a default full-shortlist judge.
 
@@ -129,12 +141,20 @@ Each card stores both the requested and served model ID so provider routing is
 auditable. The important design principle is to pay the PDF cost once per
 finalist and reuse the resulting cards for ranking.
 
+Fable has an explicit Opus 4.8 high fallback. A failed primary attempt and its
+usage remain stored alongside the fallback reason and successful fallback card;
+provider routing is never silently treated as a Fable judgment.
+
 One-paper live smoke cards completed 3/3 with valid structured outputs and no
 served-model substitutions. Reported costs were $0.258 for Sol, $0.608 for
 Fable, and $0.065 for Gemini, or $0.93 total. This is an interface/cost check,
 not a claim that the refreshed panel has independently replaced the historical
 accepted-50 gold. A 250-finalist run projects to roughly $233 at this observed
 paper size.
+
+In the 12-paper production preflight, all 36 cards completed; one Fable paper
+required the explicit Opus fallback. Successful card usage was about $12.00,
+which projects to roughly $250 for 250 finalists before paper-size variation.
 
 The finalist file flows directly into card generation:
 
@@ -154,6 +174,12 @@ cost-control design is a hybrid tournament:
 3. Run all-pairs comparisons only within that subset.
 4. Use the dense playoff as the headline ranking and Swiss standings as
    supporting evidence outside the playoff.
+
+The synthesis seed chooses the tournament pool but is not shown as a rank.
+Pair assignment to batches, A/B presentation, and evidence-block order are
+separately and deterministically randomized. This prevents seed order and
+position from becoming implicit adjudication signals while preserving exact
+reproducibility.
 
 Fit regularized Bradley-Terry models separately to the Swiss schedule and the
 dense playoff. The Swiss fit adjusts provisional standings for opponent
@@ -219,28 +245,44 @@ baseline only. The upgraded reference uses:
 2. A GPT-5.5 synthesis over the three cards.
 3. A GPT-5.5 xhigh all-pairs tournament over the synthesis top 30.
 
-The tournament completed 435/435 comparisons in 18 resumable batches, cost about
-$8.10 in OpenRouter usage, and took about 57.5 minutes. Ranks 1-30 are
-pairwise-adjudicated; ranks 31-50 remain from the synthesis seed.
+The corrected tournament completed 435/435 comparisons in 18 resumable batches.
+Pair batching, A/B presentation, and evidence order were deterministically
+randomized; outcomes were balanced at 221 A wins and 214 B wins. Valid batches
+cost $8.52 in reported OpenRouter usage and used 38 minutes of provider time.
+One malformed response was rejected and retried, adding about $0.41 without
+repeating valid batches. Ranks 1-30 are pairwise-adjudicated; ranks 31-50 remain
+from the synthesis seed. The connected regularized Bradley-Terry fit had
+Spearman 0.997 against direct all-pairs points, shared 9/10 top-10 papers, and
+moved no paper by more than two positions.
+
+The July 25 production preflight used 48 real ICML 2026 papers stratified across
+awards, orals, spotlights, regular-paper review-score bands, and missing scores.
+The cheap top-32 retained all nine award papers. Twelve finalists completed
+36/36 frontier cards and 66/66 pairwise comparisons. A/B wins were balanced
+32/34; direct all-pairs and Bradley-Terry orderings agreed exactly. Card
+synthesis achieved Spearman 0.972 and top-5/top-10 recall 1.0 against the
+tournament. Semifinal and cheap ordering achieved Spearman 0.664 and 0.546.
+These figures test pipeline behavior, not human-alignment prevalence, because
+the sample was deliberately stratified.
 
 Against this tournament gold:
 
 | Candidate pipeline artifact | Main result |
 | --- | --- |
-| Old text-only gold | Spearman 0.2875 vs tournament gold |
-| PDF card ensemble | Spearman 0.9608 |
-| PDF card synthesis | Spearman 0.9769 |
-| Cheap ensemble top45 | Captured 10/10 gold top-10 and 19/20 gold top-20 |
-| GPT stage-2 top35 cut | Missed 2 gold top-10 and 3 gold top-20 papers |
-| Conservative finalist selector top45 | Captured 10/10 gold top-10 and 19/20 gold top-20 |
+| Old text-only gold | Spearman 0.290 |
+| PDF card ensemble | Spearman 0.962; 9/10 same-k top-10 |
+| PDF card synthesis | Spearman 0.984; 10/10 same-k top-10 |
+| Current four-model cheap top45 | 10/10 gold top-10 by rank 20; 18/20 gold top-20 by rank 30 |
+| Old GPT stage-2 top35 cut | 8/10 gold top-10 and 15/20 gold top-20 by rank 30 |
+| Swiss-10 plus top-20 playoff simulation | 255/435 comparisons; Spearman 0.996; 10/10 top-10 and 19/20 top-20 |
 
 The principal empirical lesson is that the cheap ensemble is already effective
 as a generous recall filter, while the aggressive strong-model narrowing step
 was the main recall failure. The final pipeline therefore favors conservative
 candidate preservation before PDF-aware carding and tournament adjudication.
-The Terra/Sonnet ensemble was added after this historical evaluation and must be
-compared with Terra alone at the same finalist budget before production results
-are frozen.
+The Terra/Sonnet ensemble was added after these accepted-50 artifacts. Its
+incremental value should therefore be measured on the production finalists
+rather than inferred from non-identical historical candidate sets.
 
 ## July 2026 Model Refresh
 
@@ -268,12 +310,13 @@ for 6,628 papers.
 ## Tournament Cost Evaluation
 
 The all-pairs top-30 tournament is the highest-confidence reference. To estimate
-whether a cheaper production tournament is viable, the paid all-pairs outcomes
-were reused to simulate sparse schedules. A 10-round Swiss pass plus all-pairs
-among the provisional top 20 used 256 pair comparisons instead of 435, recovered
-9/10 of the exact all-pairs top 10, placed all 10 all-pairs top-10 papers within
-its top 15, and reached Spearman 0.9764 against all-pairs. Pure neighborhood
-round-robin schedules were much weaker.
+whether a cheaper production tournament is viable, `simulate-hybrid-tournament`
+replays the production Swiss pairing and playoff logic from already-paid
+all-pairs outcomes. This measures schedule loss without new model calls, though
+it assumes pair judgments are stable across batch contexts. On randomized v3,
+10 Swiss rounds followed by a top-20 dense playoff used 255/435 comparisons,
+recovered 10/10 all-pairs top-10 and 19/20 top-20 papers, and had Spearman
+0.996. Pure neighborhood round-robin schedules were much weaker.
 
 This supports Swiss as a broad reranking step before the final dense playoff,
 not as the final ranking by itself.

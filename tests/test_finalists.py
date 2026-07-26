@@ -76,6 +76,7 @@ class FinalistSelectionTests(unittest.TestCase):
             self.assertIn("p5", selected_ids)
             self.assertIn("p3", selected_ids)
             self.assertTrue(any("cheap_semifinal_disagreement_save" in row["selection_reasons"] for row in rows))
+            self.assertNotIn("semifinal_fill", rows[0]["selection_reasons"])
 
     def test_read_ranked_rows_rejects_duplicate_paper_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -94,6 +95,18 @@ class FinalistSelectionTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "duplicate paper_id"):
                 read_ranked_rows(path)
+
+    def test_read_ranked_rows_uses_content_not_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "semifinal.jsonl"
+            path.write_text(
+                json.dumps({"ranked_papers": [semifinal_row("p1", 1)]}),
+                encoding="utf-8",
+            )
+
+            rows = read_ranked_rows(path)
+
+            self.assertEqual([row["paper_id"] for row in rows], ["p1"])
 
     def test_select_finalists_preserves_semifinal_judge_disagreements(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
