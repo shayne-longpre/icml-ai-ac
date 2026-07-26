@@ -204,6 +204,37 @@ class AnonymizationTests(unittest.TestCase):
             self.assertNotIn("assigned LLM policy", text)
             self.assertIn("Scientific content.", text)
 
+    def test_pdf_redaction_removes_urls_after_superscript_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            output = root / "anonymized.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text((72, 72), "A Useful Machine Learning Paper", fontsize=16)
+            page.insert_text((72, 108), "Ada Lovelace", fontsize=11)
+            page.insert_text((72, 145), "Abstract", fontsize=12)
+            page.insert_text((72, 165), "Scientific content.", fontsize=10)
+            page.insert_text((72, 700), "2https://example.edu/project", fontsize=8)
+            document.save(source)
+            document.close()
+
+            audit = anonymize_pdf(
+                source_pdf=source,
+                out_pdf=output,
+                title="A Useful Machine Learning Paper",
+                authors=["Ada Lovelace"],
+                max_pages=9,
+            )
+
+            anonymized = pymupdf.open(output)
+            text = "\n".join(page.get_text() for page in anonymized)
+            anonymized.close()
+            self.assertEqual(audit["status"], "ok")
+            self.assertNotIn("https://", text)
+            self.assertNotIn("example.edu", text)
+            self.assertIn("Scientific content.", text)
+
     def test_short_uppercase_metadata_identity_is_ignored(self) -> None:
         active, ignored = filter_author_identities(
             ["Lei Wei", "TT", "Xi"],

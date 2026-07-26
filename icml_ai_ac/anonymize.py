@@ -13,11 +13,11 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, write_jsonl
 
 
-ANONYMIZATION_VERSION = "direct_identity_redaction_v14"
+ANONYMIZATION_VERSION = "direct_identity_redaction_v15"
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
     r"(?i)(?:"
-    r"\bhttps?://[^\s<>()\[\]{}]*|"
+    r"https?://[^\s<>()\[\]{}]*|"
     r"\bwww\.[^\s<>()\[\]{}]+|"
     r"\b(?:[a-z0-9-]+\.)+(?:com|org|net|edu|ai|io|dev|co)"
     r"(?:/[^\s<>()\[\]{}]*)?"
