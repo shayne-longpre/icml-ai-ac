@@ -14,17 +14,17 @@ from typing import Any
 
 from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.pdf_utils import write_pdf_page_excerpt
-from icml_ai_ac.scoring.providers import ChatCompletionClient
+from icml_ai_ac.scoring.providers import ChatCompletionClient, is_batch_blocking_provider_error
 from icml_ai_ac.scoring.runner import estimate_tokens, read_text_path, resolve_record_text_path
 from icml_ai_ac.scoring.schema import CONTRIBUTION_CLASSES, parse_json_response
 from icml_ai_ac.scoring.usage import sum_usage
 from icml_ai_ac.storage import read_paper_records, write_json, write_jsonl
 
 
-FRONTIER_CARD_PROMPT_VERSION = "frontier_pdf_paper_card_v1"
+FRONTIER_CARD_PROMPT_VERSION = "frontier_pdf_paper_card_v2"
 FRONTIER_CARD_ENSEMBLE_VERSION = "frontier_pdf_card_ensemble_v1"
-FRONTIER_SYNTHESIS_PROMPT_VERSION = "frontier_pdf_card_synthesis_rank_v1"
-FRONTIER_TOURNAMENT_PROMPT_VERSION = "frontier_pdf_card_pairwise_tournament_v3"
+FRONTIER_SYNTHESIS_PROMPT_VERSION = "frontier_pdf_card_synthesis_rank_v2"
+FRONTIER_TOURNAMENT_PROMPT_VERSION = "frontier_pdf_card_pairwise_tournament_v4"
 
 
 @dataclass(slots=True)
@@ -108,14 +108,35 @@ def run_frontier_pdf_cards(
     for child in ["prompts", "responses", "parsed", "cards", "errors"]:
         (run_dir / child).mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
+    blocked_reason: str | None = None
     for index, candidate in enumerate(candidates, start=1):
+        existing_completed: dict[str, Any] | None = None
         existing_failure: dict[str, Any] | None = None
         primary_card_path = run_dir / "cards" / f"{candidate.record.paper_id}.json"
         if config.fallback_model and primary_card_path.exists() and not config.overwrite:
             existing = json.loads(primary_card_path.read_text(encoding="utf-8"))
-            if existing.get("status") not in {"ok", "dry_run"}:
+            fallback_config = replace(
+                config,
+                model=config.fallback_model,
+                reasoning_effort=config.fallback_reasoning_effort,
+                fallback_model=None,
+                fallback_reasoning_effort=None,
+                overwrite=False,
+            )
+            if (
+                existing.get("status") == "ok"
+                and existing.get("fallback_from_model") == config.model
+                and existing.get("fingerprint")
+                == frontier_card_request_fingerprint(candidate, config=fallback_config)
+            ):
+                existing_completed = {**existing, "resumed_from": str(primary_card_path)}
+            if (
+                existing.get("status") not in {"ok", "dry_run"}
+                and not existing.get("blocking_provider_error")
+                and existing.get("fingerprint") == frontier_card_request_fingerprint(candidate, config=config)
+            ):
                 existing_failure = existing
-        row = existing_failure or run_frontier_pdf_card(
+        row = existing_completed or existing_failure or run_frontier_pdf_card(
             candidate,
             index=index,
             total=len(candidates),
@@ -125,6 +146,7 @@ def run_frontier_pdf_cards(
         )
         if (
             row.get("status") not in {"ok", "dry_run"}
+            and not row.get("blocking_provider_error")
             and config.fallback_model
             and fallback_client is not None
         ):
@@ -168,6 +190,9 @@ def run_frontier_pdf_cards(
                 write_json(run_dir / "cards" / f"{candidate.record.paper_id}.json", row)
         rows.append(row)
         write_jsonl(out, rows)
+        if row.get("blocking_provider_error"):
+            blocked_reason = str(row.get("blocked_reason") or row.get("error") or "provider-wide error")
+            break
     summary = {
         "status": "dry_run" if config.dry_run else "ok",
         "provider": config.provider,
@@ -180,15 +205,18 @@ def run_frontier_pdf_cards(
         "out": str(out),
         "run_dir": str(run_dir),
         "candidate_count": len(candidates),
+        "attempted_count": len(rows),
+        "skipped_count": len(candidates) - len(rows),
         "ok_count": sum(1 for row in rows if row.get("status") == "ok"),
         "failed_count": sum(1 for row in rows if row.get("status") == "failed"),
         "validation_error_count": sum(1 for row in rows if row.get("status") == "validation_error"),
         "dry_run_count": sum(1 for row in rows if row.get("status") == "dry_run"),
         "fallback_count": sum(1 for row in rows if row.get("fallback_from_model")),
+        "blocked_reason": blocked_reason,
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "usage": sum_usage(row.get("attempt_usage") or row.get("usage") for row in rows),
     }
-    if summary["failed_count"] or summary["validation_error_count"]:
+    if summary["failed_count"] or summary["validation_error_count"] or summary["skipped_count"]:
         summary["status"] = "partial" if not config.dry_run else "dry_run"
     write_json(run_dir / "run.json", summary)
     return summary
@@ -205,9 +233,10 @@ def run_frontier_pdf_card(
 ) -> dict[str, Any]:
     paper_id = candidate.record.paper_id
     card_path = run_dir / "cards" / f"{paper_id}.json"
+    request_fingerprint = frontier_card_request_fingerprint(candidate, config=config)
     if card_path.exists() and not config.overwrite:
         existing = json.loads(card_path.read_text(encoding="utf-8"))
-        if existing.get("status") == "ok":
+        if existing.get("status") == "ok" and existing.get("fingerprint") == request_fingerprint:
             return {**existing, "resumed_from": str(card_path)}
 
     base_result: dict[str, Any] = {
@@ -226,6 +255,7 @@ def run_frontier_pdf_card(
         "pdf_excerpt_path": str(candidate.pdf_excerpt_path),
         "candidate_index": index,
         "candidate_total": total,
+        "fingerprint": request_fingerprint,
         "raw_response_path": None,
         "parsed_response_path": None,
         "prompt_path": None,
@@ -301,7 +331,10 @@ def run_frontier_pdf_card(
             "status": "failed",
             "error_path": str(error_path),
             "error": repr(exc),
+            "blocking_provider_error": is_batch_blocking_provider_error(exc),
         }
+        if row["blocking_provider_error"]:
+            row["blocked_reason"] = repr(exc)
         if raw_response_path.exists():
             row["raw_response_path"] = str(raw_response_path)
         if isinstance(usage, dict) and usage:
@@ -310,6 +343,39 @@ def run_frontier_pdf_card(
             row["served_model"] = served_model
     write_json(card_path, row)
     return row
+
+
+def frontier_card_request_fingerprint(
+    candidate: FrontierCardCandidate,
+    *,
+    config: FrontierCardConfig,
+) -> str:
+    pdf_sha256 = candidate.record.extra.get("pdf_sha256")
+    if not isinstance(pdf_sha256, str) or not pdf_sha256:
+        stat = candidate.pdf_path.stat()
+        pdf_sha256 = f"stat:{stat.st_size}:{stat.st_mtime_ns}"
+    payload = {
+        "paper_id": candidate.record.paper_id,
+        "title": candidate.record.title,
+        "provider": config.provider,
+        "model": config.model,
+        "reasoning_effort": config.reasoning_effort,
+        "prompt_version": config.prompt_version,
+        "paper_set_name": config.paper_set_name,
+        "text_source": config.text_source,
+        "resolved_text_source": candidate.resolved_text_source,
+        "paper_text_sha256": hashlib.sha256(candidate.paper_text.encode("utf-8")).hexdigest(),
+        "pdf_sha256": pdf_sha256,
+        "pdf_excerpt_pages": config.pdf_excerpt_pages,
+        "pdf_optimize_threshold_bytes": config.pdf_optimize_threshold_bytes,
+        "pdf_settings": config.pdf_settings,
+        "temperature": config.temperature,
+        "max_output_tokens": config.max_output_tokens,
+        "seed": config.seed,
+        "openrouter_pdf_engine": config.openrouter_pdf_engine,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def select_frontier_card_candidates(*, manifest: Path, config: FrontierCardConfig) -> list[FrontierCardCandidate]:
@@ -344,14 +410,15 @@ def build_frontier_card_messages(
     *,
     config: FrontierCardConfig,
 ) -> list[dict[str, Any]]:
-    system = f"""You are a frontier reference judge for an ICML accepted-paper impact study.
+    system = f"""You are a frontier reference judge for an ICML paper impact study.
 
 Use the supplied first-{config.pdf_excerpt_pages}-page PDF and extracted main-paper text. The PDF is included so you can inspect figures, tables, diagrams, experimental displays, and visual evidence that may not survive text extraction. Do not use web search, citation memory, author identity, institution, or external knowledge.
+No reviews, reviewer scores, area-chair comments, decisions, presentation tiers, or awards are provided. Do not infer paper quality from possible venue or outcome cues in the document.
 
 Your task is to create a calibrated paper judgment card that will later feed an ensemble/tournament gold ranking. Be strict: broad impact requires a credible path to changing scientific practice, ML practice, theory, evaluation, safety, infrastructure, or reusable community resources. Technical soundness is a gate, not the only objective.
 
 Return only valid JSON."""
-    user_text = f"""Evaluate this ICML accepted paper as a candidate for the strongest papers in {config.paper_set_name}.
+    user_text = f"""Evaluate this paper as a candidate for the strongest papers in {config.paper_set_name}.
 
 Paper id: {candidate.record.paper_id}
 Title: {candidate.record.title}
@@ -699,11 +766,22 @@ def run_frontier_card_tournament(
         write_json(run_dir / "run.json", result)
         return result
     if failed_batches:
+        blocked_reason = next(
+            (
+                str(row.get("blocked_reason") or row.get("error"))
+                for row in failed_batches
+                if row.get("blocking_provider_error")
+            ),
+            None,
+        )
         result = {
             **run_payload,
             "status": "partial",
             "ok_batch_count": len(batch_results) - len(failed_batches),
             "failed_batch_count": len(failed_batches),
+            "attempted_batch_count": len(batch_results),
+            "estimated_skipped_batch_count": max(0, batch_count_estimate - len(batch_results)),
+            "blocked_reason": blocked_reason,
             "failed_batches": failed_batches,
             "match_count": len(matches),
             "pair_count": schedule_result["scheduled_pair_count"],
@@ -1002,6 +1080,8 @@ def run_pair_batches(
             parsed = batch_result.get("parsed")
             if isinstance(parsed, dict) and isinstance(parsed.get("matches"), list):
                 matches.extend(match for match in parsed["matches"] if isinstance(match, dict))
+        if batch_result.get("blocking_provider_error"):
+            break
     return batch_results, matches
 
 
@@ -1156,7 +1236,10 @@ def run_frontier_tournament_batch(
             "status": "failed",
             "error_path": str(error_path),
             "error": repr(exc),
+            "blocking_provider_error": is_batch_blocking_provider_error(exc),
         }
+        if result["blocking_provider_error"]:
+            result["blocked_reason"] = repr(exc)
         if raw_response_path.exists():
             result["raw_response_path"] = str(raw_response_path)
         if isinstance(usage, dict) and usage:
@@ -1182,9 +1265,10 @@ def build_frontier_tournament_messages(
     batch_count: int,
     config: FrontierTournamentConfig,
 ) -> list[dict[str, Any]]:
-    system = """You are a frontier pairwise judge finalizing an ICML accepted-paper gold ranking.
+    system = """You are a frontier pairwise judge finalizing an ICML paper impact ranking.
 
 You are comparing papers using independent PDF-aware evidence cards created by frontier judges after each saw the configured first-page paper PDF excerpt plus extracted main-paper text. Treat those cards as evidence. Do not use web search, author identity, institution, citation memory, or outside knowledge.
+No reviews, reviewer scores, area-chair comments, decisions, presentation tiers, or awards are included in the cards. Do not infer paper quality from possible venue or outcome cues.
 
 For every pair, choose the paper with the stronger expected broad scientific and ML-field impact, using technical soundness and evidence quality as gates. Prefer concrete durable contributions over paper polish. Benchmarks, datasets, infrastructure, safety/eval resources, scientific tools, theory, and algorithms can all be highly impactful, but their impact route should be explicit and credible.
 
@@ -1728,9 +1812,10 @@ def build_frontier_synthesis_messages(
     *,
     config: FrontierSynthesisConfig,
 ) -> list[dict[str, Any]]:
-    system = """You are the final synthesis judge for an ICML accepted-paper reference set.
+    system = """You are the final synthesis judge for an ICML paper impact set.
 
 You do not have direct PDF attachments in this call. Instead, you have three independent frontier-model judgment cards per paper. Those cards were produced after each judge saw the configured first-page PDF excerpt and extracted main-paper text. Treat the cards as evidence, not as votes to average blindly.
+No reviews, reviewer scores, area-chair comments, decisions, presentation tiers, or awards are included in the cards. Do not infer paper quality from possible venue or outcome cues.
 
 Rank by likely broad scientific and machine-learning impact, with technical soundness and evidence quality as gates. Penalize narrow toy-only results, weak evidence, incremental polish, and unclear adoption paths. Elevate papers with credible field-shaping ideas, durable datasets/benchmarks, infrastructure, safety/eval resources, scientific tools, theory, or algorithms.
 

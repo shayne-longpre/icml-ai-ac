@@ -9,7 +9,10 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.scoring.ranking import write_ranking_score_rows
 from icml_ai_ac.scoring.ranking import (
     Pass2BatchedRankingConfig,
+    Pass2RankingConfig,
+    RankingCandidate,
     balance_pass2_batches,
+    build_pass2_ranking_messages,
     run_pass2_batched_ranking,
     validate_pass2_comparison_connectivity,
 )
@@ -53,6 +56,42 @@ class FakeRankingClient:
 
 
 class RankingTests(unittest.TestCase):
+    def test_pass2_prompt_excludes_human_outcome_metadata(self) -> None:
+        record = PaperRecord(
+            paper_id="p1",
+            source="SENTINEL_HUMAN_SOURCE",
+            title="Paper",
+            decision_label="SENTINEL_HUMAN_DECISION",
+        )
+        candidate = RankingCandidate(
+            record=record,
+            pass1_row={"scores": {"summary": {"one_sentence_contribution": "test"}}},
+            text_path="paper.txt",
+            resolved_text_source="scoring",
+            paper_text="Paper content only.",
+        )
+        config = Pass2RankingConfig(
+            provider="openrouter",
+            model="test",
+            reasoning_effort=None,
+            prompt_version="test",
+            text_source="scoring",
+            top_fraction=1,
+            limit=None,
+            per_paper_char_budget=1000,
+            temperature=0,
+            max_output_tokens=1000,
+            seed=None,
+            dry_run=True,
+        )
+
+        messages = build_pass2_ranking_messages([candidate], config=config)
+        prompt_text = "\n".join(str(message["content"]) for message in messages)
+
+        self.assertNotIn("SENTINEL_HUMAN_SOURCE", prompt_text)
+        self.assertNotIn("SENTINEL_HUMAN_DECISION", prompt_text)
+        self.assertIn("No reviews, reviewer scores", prompt_text)
+
     def test_batched_ranking_has_exact_coverage_and_resumes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

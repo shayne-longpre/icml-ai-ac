@@ -6,7 +6,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from icml_ai_ac.models import PaperRecord
-from icml_ai_ac.scoring.batch import Pass1BatchSuiteConfig, run_pass1_batch_suite
+from icml_ai_ac.scoring.batch import (
+    BatchCandidate,
+    Pass1BatchConfig,
+    Pass1BatchSuiteConfig,
+    build_pass1_batch_messages,
+    run_pass1_batch_suite,
+)
 from icml_ai_ac.storage import write_jsonl
 
 
@@ -48,6 +54,35 @@ class FakeClient:
 
 
 class Pass1BatchResumeTests(unittest.TestCase):
+    def test_batch_prompt_excludes_human_outcome_metadata(self) -> None:
+        record = PaperRecord(
+            paper_id="p1",
+            source="SENTINEL_HUMAN_SOURCE",
+            title="Paper",
+            decision_label="SENTINEL_HUMAN_DECISION",
+        )
+        candidate = BatchCandidate(record, "paper.txt", "scoring", "Paper content.")
+        config = Pass1BatchConfig(
+            provider="openrouter",
+            model="test",
+            prompt_version="test",
+            text_source="scoring",
+            limit=None,
+            paper_ids=set(),
+            per_paper_char_budget=1000,
+            temperature=0,
+            max_output_tokens=1000,
+            seed=None,
+            dry_run=True,
+        )
+
+        messages = build_pass1_batch_messages([candidate], config=config)
+        prompt_text = "\n".join(message["content"] for message in messages)
+
+        self.assertNotIn("SENTINEL_HUMAN_SOURCE", prompt_text)
+        self.assertNotIn("SENTINEL_HUMAN_DECISION", prompt_text)
+        self.assertIn("No reviews, reviewer scores", prompt_text)
+
     def test_suite_resumes_only_matching_valid_batches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

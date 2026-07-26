@@ -13,10 +13,14 @@ contribution routes: algorithms, theory, benchmarks/datasets, infrastructure,
 scientific tools, safety/evaluation, applications, and analysis papers.
 
 All model stages are paper-grounded. Retrieval, web search, citation memory,
-author identity, institution, and external tools are excluded from scoring
-prompts. The only allowed evidence is stored metadata, extracted paper text,
-PDF-derived visual/table evidence where explicitly supplied, and previous
-pipeline judgments.
+and external tools are excluded from scoring. Models are instructed to ignore
+author identity, institution, and venue prestige, although ordinary
+camera-ready paper text and PDFs can still contain names and proceedings
+markings. Reviews, reviewer scores, area-chair comments, decisions,
+presentation tiers, and awards are structurally excluded. The only allowed
+evidence is the paper identifier and title, extracted paper text, PDF-derived
+visual/table evidence where explicitly supplied, and previous AI pipeline
+judgments. Human outcomes are joined only after the AI ranking is frozen.
 
 ## Paper Representation
 
@@ -219,6 +223,10 @@ Dense playoff: 60
 
 ## Stage 7: Human-Outcome Comparison
 
+Human-outcome metadata is stored separately from every scoring prompt and is
+joined only in this stage. This preserves a paper-only counterfactual ranking
+while still allowing complete post hoc agreement and divergence analysis.
+
 The comparison layer consumes a unique, full-coverage ensemble ranking rather
 than raw repeated model judgments or a truncated shortlist. It fails when the
 manifest join falls below the declared coverage threshold and reports missing
@@ -337,3 +345,13 @@ output rankings. Later invocations reuse successful paper-level or batch-level
 artifacts and retry only missing or failed units. Evaluation uses top-k recall,
 gold-top-N-in-candidate-top-M recall, rank correlation over shared papers, and
 gold-anchored contribution-class recall.
+
+Provider-wide request failures stop a model stream rather than generating
+thousands of repeated failures. This includes insufficient-credit HTTP 402
+responses as well as authentication, permission, incompatible-request, and
+exhausted rate-limit errors. Repeating the same command with the same run
+directory resumes from matching fingerprints. Frontier-card fingerprints cover
+the model, prompt version, decoding settings, paper text, and PDF provenance,
+preventing an old successful card from being silently reused under a changed
+configuration. The concise operational checklist is
+`docs/final_run_plan.md`.

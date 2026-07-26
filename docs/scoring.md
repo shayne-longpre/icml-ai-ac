@@ -51,7 +51,12 @@ recall. The historical `qwen/qwen3-32b`, `qwen/qwen3.6-35b-a3b`, and
 reproducibility.
 
 Do not use web search or retrieval during scoring. The prompt explicitly asks
-for paper-only judgment and tells the model to ignore author identity.
+for paper-only judgment and tells the model to ignore author identity. Author
+names and proceedings markings can still occur in normal camera-ready text or
+PDF pages; they are not used as explicit ranking features. Reviews, reviewer
+ratings, area-chair comments, decisions, presentation tiers, and awards are not
+serialized into any model-facing prompt. They remain separate until the post
+hoc human-comparison stage.
 
 OpenRouter structured calls default to `reasoning: {"effort": "none",
 "exclude": true}`. This avoids paying for returned reasoning tokens and reduces
@@ -137,6 +142,14 @@ The aggregate JSONL stores `shortlist_metrics.aggregate_priority`,
 `source_model_priorities`, `source_model_count`, source paths, advance votes,
 and per-source rows. Later ranking layers can use this as a prior or audit
 signal without rerunning the cheap calls.
+
+All production model runs use stable run directories and content/configuration
+fingerprints. Exact reruns reuse validated batches or cards and retry only
+failed or missing units. HTTP 402 insufficient-credit responses stop the
+remaining model stream, as do authentication, permission, incompatible-request,
+and exhausted rate-limit responses. Replenish credits and invoke the identical
+command without `--overwrite` to continue. See `docs/final_run_plan.md` for the
+full operational and artifact contract.
 
 The lower-level shortlist builder still accepts multiple score files directly.
 It normalizes priority by source model so a model with more partitions does not

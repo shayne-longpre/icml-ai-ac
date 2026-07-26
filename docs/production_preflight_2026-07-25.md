@@ -91,14 +91,19 @@ The preflight found and fixed:
 7. seed-correlated tournament A/B position and pair-batch order;
 8. missing connectivity validation for repeated listwise semifinal batches;
    and
-9. repeated batch requests after authentication, permission, or rate-limit
-   failures.
+9. repeated batch requests after authentication, permission, billing-credit,
+   or rate-limit failures; and
+10. human outcome labels in legacy single-paper and strong-ranking prompt
+    formatters.
 
 All model batches now persist fingerprints, exact coverage, prompts, responses,
 requested and served model IDs, and scalar usage. Reruns reuse only matching
 valid batches. The pipeline stops short of aggregation when coverage or
 comparison-graph invariants fail, and stops the remaining suite after the first
-request-wide `400`, `401`, `403`, `404`, `422`, or exhausted `429` response.
+request-wide `400`, `401`, `402`, `403`, `404`, `422`, or exhausted `429`
+response. Production prompt versions exclude reviews, ratings, area-chair
+comments, decisions, tiers, and awards; human metadata is joined only after AI
+ranking is complete.
 
 ## Launch Assessment
 

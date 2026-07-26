@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.scoring.classification import (
     ContributionClassificationConfig,
+    build_classification_messages,
     classification_response_to_rows,
     run_contribution_classification,
 )
@@ -63,6 +64,25 @@ def classification_config() -> ContributionClassificationConfig:
 
 
 class ContributionClassificationTests(unittest.TestCase):
+    def test_classification_prompt_has_no_human_outcome_inputs(self) -> None:
+        candidates = [
+            {
+                "paper_id": "p1",
+                "title": "Paper",
+                "resolved_text_source": "compact",
+                "text": "Paper content.",
+                "decision_label": "SENTINEL_HUMAN_DECISION",
+                "openreview_scores": "SENTINEL_HUMAN_SCORES",
+            }
+        ]
+
+        messages = build_classification_messages(candidates, config=classification_config())
+        prompt_text = "\n".join(message["content"] for message in messages)
+
+        self.assertNotIn("SENTINEL_HUMAN_DECISION", prompt_text)
+        self.assertNotIn("SENTINEL_HUMAN_SCORES", prompt_text)
+        self.assertIn("No reviews, reviewer scores", prompt_text)
+
     def test_failed_parsing_retains_billed_usage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

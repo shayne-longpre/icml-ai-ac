@@ -16,12 +16,12 @@ from icml_ai_ac.scoring.usage import sum_usage
 from icml_ai_ac.storage import ensure_parent, read_json, read_paper_records, write_json, write_jsonl
 
 
-PASS2_PROMPT_VERSION = "pass2_strong_batch_rank_v3"
-PASS2_BATCHED_PROMPT_VERSION = "pass2_strong_resumable_batches_v1"
-PASS2_STAGE1_PROMPT_VERSION = "pass2_stage1_strong_semifinal_v1"
-PASS2_FINAL_PROMPT_VERSION = "pass2_stage2_strong_final_v1"
-REFERENCE_PROMPT_VERSION = "reference_gold_rank_v1"
-REFERENCE_REPAIR_PROMPT_VERSION = "reference_gold_rank_repair_v1"
+PASS2_PROMPT_VERSION = "pass2_strong_batch_rank_v4"
+PASS2_BATCHED_PROMPT_VERSION = "pass2_strong_resumable_batches_v2"
+PASS2_STAGE1_PROMPT_VERSION = "pass2_stage1_strong_semifinal_v2"
+PASS2_FINAL_PROMPT_VERSION = "pass2_stage2_strong_final_v2"
+REFERENCE_PROMPT_VERSION = "reference_gold_rank_v2"
+REFERENCE_REPAIR_PROMPT_VERSION = "reference_gold_rank_repair_v2"
 
 
 @dataclass(slots=True)
@@ -1380,6 +1380,7 @@ def build_pass2_ranking_messages(
     system = """You are the strong-model second-stage judge for a machine learning conference paper study.
 
 Rank candidate papers by likely broad scientific and machine-learning impact. Use only the supplied paper text and first-pass outputs. Ignore author identity, institution, venue prestige, and outside knowledge.
+No reviews, reviewer scores, area-chair comments, decisions, presentation tiers, or awards are provided. Do not infer paper quality from possible venue or outcome cues in the document.
 
 This run is text-only and retrieval-free: you do not have PDF page images, figure images, table images, file search, web search, vector stores, or external tools. Treat missing visual/table detail as an uncertainty, not as a factual flaw.
 
@@ -1464,6 +1465,7 @@ def build_reference_ranking_messages(
     system = """You are the strongest available reference judge for a machine learning conference paper study.
 
 Create an independent reference ranking for evaluation of a cheaper first-pass -> strong-model pipeline. Use only the supplied extracted paper text. Do not use web search, retrieval, citation memory, author identity, institution, venue prestige, or outside knowledge.
+No reviews, reviewer scores, area-chair comments, decisions, presentation tiers, or awards are provided. Do not infer paper quality from possible venue or outcome cues in the document.
 
 This run is text-only and retrieval-free: you do not have PDF page images, figure images, table images, file search, vector stores, or external tools. Treat missing visual/table detail as an uncertainty, not as a factual flaw.
 
@@ -1642,7 +1644,6 @@ def format_candidate(candidate: RankingCandidate) -> str:
     first_pass = compact_first_pass(candidate.pass1_row)
     return f"""<CANDIDATE paper_id="{candidate.record.paper_id}">
 Title: {candidate.record.title or ""}
-Decision label: {candidate.record.decision_label or ""}
 Text source: {candidate.resolved_text_source}
 Text path: {candidate.text_path}
 
@@ -1663,7 +1664,6 @@ def format_reference_candidates(candidates: list[ReferenceCandidate]) -> str:
 def format_reference_candidate(candidate: ReferenceCandidate) -> str:
     return f"""<PAPER paper_id="{candidate.record.paper_id}">
 Title: {candidate.record.title or ""}
-Decision label: {candidate.record.decision_label or ""}
 Text source: {candidate.resolved_text_source}
 Text path: {candidate.text_path}
 

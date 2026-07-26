@@ -47,14 +47,21 @@ class ScoringTests(unittest.TestCase):
             ],
         )
 
-    def test_prompt_omits_author_line_and_includes_schema(self) -> None:
-        record = PaperRecord(paper_id="p1", source="accepted", title="Test Paper")
+    def test_prompt_omits_author_and_human_outcome_fields(self) -> None:
+        record = PaperRecord(
+            paper_id="p1",
+            source="SENTINEL_HUMAN_SOURCE",
+            title="Test Paper",
+            decision_label="SENTINEL_HUMAN_DECISION",
+        )
         compact = "Title: Test Paper\nAuthors: A, B\n\nAbstract:\nA contribution."
 
         prompt = build_pass1_prompt(record, compact)
 
         self.assertIn("Required JSON schema", prompt.user)
         self.assertNotIn("Authors: A, B", prompt.user)
+        self.assertNotIn("SENTINEL_HUMAN_SOURCE", prompt.user)
+        self.assertNotIn("SENTINEL_HUMAN_DECISION", prompt.user)
         self.assertIn("Do not use web search", prompt.system)
 
     def test_validate_scoring_output_accepts_required_scores(self) -> None:
@@ -125,7 +132,7 @@ class ScoringTests(unittest.TestCase):
             config = ScoreRunConfig(
                 provider="openrouter",
                 model=DEFAULT_CHEAP_MODEL,
-                prompt_version="pass1_executive_ac_v4",
+                prompt_version="pass1_executive_ac_v5",
                 temperature=0.2,
                 max_output_tokens=1000,
                 seed=None,

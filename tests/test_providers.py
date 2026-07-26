@@ -16,7 +16,7 @@ from icml_ai_ac.scoring.providers import (
 
 class ProviderTests(unittest.TestCase):
     def test_batch_blocking_provider_errors_cover_auth_and_rate_limits(self) -> None:
-        for status in (400, 401, 403, 404, 422, 429):
+        for status in (400, 401, 402, 403, 404, 422, 429):
             self.assertTrue(is_batch_blocking_provider_error(RuntimeError(f"HTTP {status} from provider")))
         self.assertTrue(is_batch_blocking_provider_error(RuntimeError("HTTP Error 429: rate limited")))
         self.assertFalse(is_batch_blocking_provider_error(TimeoutError("request timed out")))

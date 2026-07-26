@@ -215,7 +215,7 @@ class ChatCompletionClient:
 
 def is_batch_blocking_provider_error(exc: Exception) -> bool:
     """Return whether a request error should stop the remaining batch suite."""
-    blocking_statuses = {400, 401, 403, 404, 422, 429}
+    blocking_statuses = {400, 401, 402, 403, 404, 422, 429}
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code in blocking_statuses
     message = str(exc).lower()

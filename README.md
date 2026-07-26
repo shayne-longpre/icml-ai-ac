@@ -59,6 +59,13 @@ As of **2026-07-15**:
 
 ## Methodology
 
+All ranking stages are paper-only: reviews, reviewer ratings, area-chair
+comments, decisions, presentation tiers, and awards are excluded from model
+inputs and joined only after the AI ranking is frozen. Retrieval and web search
+are disabled. Models are instructed to ignore author identity and venue
+prestige, although normal camera-ready papers may still show author names and
+proceedings markings.
+
 ### 1. Corpus and PDF Processing
 
 We use the ICML virtual-site JSON feed as the accepted-paper inventory, resolve
@@ -299,6 +306,7 @@ and potentially gets right.
 ## Internal Methodology Docs
 
 - Detailed pipeline: [`docs/final_pipeline_methodology.md`](docs/final_pipeline_methodology.md)
+- Final run plan: [`docs/final_run_plan.md`](docs/final_run_plan.md)
 - Production preflight: [`docs/production_preflight_2026-07-25.md`](docs/production_preflight_2026-07-25.md)
 - Scoring and model details: [`docs/scoring.md`](docs/scoring.md)
 - Crawling and PDF acquisition: [`docs/crawling.md`](docs/crawling.md)

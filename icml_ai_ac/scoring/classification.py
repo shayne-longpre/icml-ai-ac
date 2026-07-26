@@ -15,7 +15,7 @@ from icml_ai_ac.scoring.usage import sum_usage
 from icml_ai_ac.storage import read_json, read_paper_records, write_json, write_jsonl
 
 
-CLASSIFY_PROMPT_VERSION = "contribution_classification_v1"
+CLASSIFY_PROMPT_VERSION = "contribution_classification_v2"
 
 
 @dataclass(slots=True)
@@ -342,7 +342,9 @@ def select_classification_candidates(
 def build_classification_messages(candidates: list[dict[str, Any]], *, config: ContributionClassificationConfig) -> list[dict[str, str]]:
     system = """Classify machine learning papers by primary contribution route.
 
-Use only the supplied compact paper text. Do not use author identity, venue prestige, outside memory, retrieval, or web search. Return only valid JSON."""
+Use only the supplied compact paper text. Do not use author identity, venue prestige, outside memory, retrieval, or web search.
+No reviews, reviewer scores, area-chair comments, decisions, presentation tiers, or awards are provided. Do not infer a label from possible venue or outcome cues in the document.
+Return only valid JSON."""
     user = f"""Classify each paper into one primary contribution class and optional secondary classes.
 
 Allowed classes:

@@ -17,7 +17,7 @@ from icml_ai_ac.scoring.usage import sum_usage
 from icml_ai_ac.storage import read_json, read_paper_records, write_json, write_jsonl
 
 
-PASS1_BATCH_PROMPT_VERSION = "pass1_cheap_forced_batch_rank_v1"
+PASS1_BATCH_PROMPT_VERSION = "pass1_cheap_forced_batch_rank_v2"
 
 
 @dataclass(slots=True)
@@ -528,6 +528,7 @@ def build_pass1_batch_messages(candidates: list[BatchCandidate], *, config: Pass
     system = """You are a first-pass triage judge for a machine learning conference paper study.
 
 Use only the provided paper text. Do not use web search, retrieval, citation memory, author identity, venue prestige, institution, or outside knowledge.
+No reviews, reviewer scores, area-chair comments, decisions, presentation tiers, or awards are provided. Do not infer paper quality from possible venue or outcome cues in the document.
 
 Your job is recall-oriented comparative triage: rank papers so the best broad-impact candidates move to a stronger OpenAI model. Your ranking is not final; missing a plausible high-impact candidate is worse than advancing a few extra papers. Do not give every paper the same score. Return only valid JSON."""
     user = f"""Rank these {n} papers by evidence-grounded priority for strong-model review.
