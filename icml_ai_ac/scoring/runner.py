@@ -58,7 +58,6 @@ def score_record(
         "paper_id": record.paper_id,
         "title": record.title,
         "source": record.source,
-        "decision_label": record.decision_label,
         "provider": config.provider,
         "model": config.model,
         "prompt_version": config.prompt_version,

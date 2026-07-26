@@ -16,6 +16,9 @@ acknowledgement, and PDF-metadata cues and fail closed on validation; canonical
 PDFs remain unchanged. This reduces direct prestige cues but cannot prevent
 identification from titles, self-citations, project names, or model memory.
 Human outcomes remain separate until the AI ranking is frozen.
+The model-facing manifest itself also removes authors, canonical URLs, source
+labels, and all nonessential metadata. Human outcomes remain in the separate
+canonical manifest for post hoc joins.
 
 ## Production Stages
 

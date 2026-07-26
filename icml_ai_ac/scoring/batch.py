@@ -914,7 +914,6 @@ def build_score_row(
         "paper_id": candidate.record.paper_id,
         "title": candidate.record.title,
         "source": candidate.record.source,
-        "decision_label": candidate.record.decision_label,
         "provider": config.provider,
         "model": config.model,
         "prompt_version": config.prompt_version,

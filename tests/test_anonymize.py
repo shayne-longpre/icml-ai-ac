@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -187,13 +188,21 @@ Ada Lovelace thanks Example University.
             record = PaperRecord(
                 paper_id="paper-1",
                 source="accepted",
+                decision_label="SENTINEL_HUMAN_DECISION",
                 title="A Useful Paper",
                 authors=["Ada Lovelace"],
+                forum_url="https://openreview.net/forum?id=paper-1",
+                pdf_url="https://openreview.net/pdf?id=paper-1",
                 pdf_path=str(source_pdf),
                 text_compact=paths["compact_repr"],
                 text_full=paths["full_repr"],
                 text_scoring=paths["scoring_repr"],
                 parse_status="ok",
+                extra={
+                    "openreview_scores": {"overall_mean": 5.0},
+                    "presentation_type": "oral",
+                    "is_award_paper": True,
+                },
             )
             config = AnonymizationConfig(
                 pdf_dir=root / "pdfs",
@@ -209,7 +218,7 @@ Ada Lovelace thanks Example University.
             self.assertEqual(first["output_records"], 1)
             self.assertEqual(second["resumed_records"], 1)
             anonymized_record = PaperRecord.from_dict(
-                __import__("json").loads(out.read_text(encoding="utf-8"))
+                json.loads(out.read_text(encoding="utf-8"))
             )
             text_path, text_source = resolve_record_text_path(anonymized_record, "scoring")
             pdf_path, pdf_source = resolve_record_pdf_path(anonymized_record)
@@ -217,7 +226,23 @@ Ada Lovelace thanks Example University.
             self.assertEqual(pdf_source, "anonymized_pdf")
             self.assertNotIn("Ada Lovelace", Path(text_path).read_text(encoding="utf-8"))
             self.assertTrue(pdf_path.exists())
-            self.assertEqual(anonymized_record.pdf_path, str(source_pdf))
+            self.assertEqual(anonymized_record.pdf_path, str(pdf_path))
+            self.assertEqual(anonymized_record.source, "blinded_scoring")
+            self.assertIsNone(anonymized_record.decision_label)
+            self.assertEqual(anonymized_record.authors, [])
+            self.assertIsNone(anonymized_record.forum_url)
+            self.assertIsNone(anonymized_record.pdf_url)
+            self.assertEqual(
+                set(anonymized_record.extra),
+                {"anonymization", "scoring_artifacts", "blind_manifest"},
+            )
+            self.assertNotIn(
+                "author_hits",
+                anonymized_record.extra["anonymization"],
+            )
+            serialized = json.dumps(anonymized_record.to_dict())
+            self.assertNotIn("Ada Lovelace", serialized)
+            self.assertNotIn("accepted", serialized)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, write_jsonl
 
 
-ANONYMIZATION_VERSION = "direct_identity_redaction_v12"
+ANONYMIZATION_VERSION = "direct_identity_redaction_v13"
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
     r"(?i)(?:"
@@ -216,21 +216,60 @@ def anonymize_record(
                 "residual_text_authors": residual_text_authors,
             }
         )
-        record.extra["anonymization"] = audit
         if status == "ok":
-            record.extra["scoring_artifacts"] = {
-                "artifact_kind": "anonymized_derivative",
-                "anonymization_version": ANONYMIZATION_VERSION,
-                "pdf": str(out_pdf),
-                **{name: str(path) for name, path in out_text_paths.items()},
-            }
-        else:
-            record.extra.pop("scoring_artifacts", None)
+            record = build_blinded_record(
+                source=record,
+                out_pdf=out_pdf,
+                out_text_paths=out_text_paths,
+                audit=audit,
+            )
     except Exception as exc:  # noqa: BLE001 - preserve row-local failures for review.
         audit["error"] = repr(exc)
-        record.extra["anonymization"] = audit
-        record.extra.pop("scoring_artifacts", None)
     return record, audit
+
+
+def build_blinded_record(
+    *,
+    source: PaperRecord,
+    out_pdf: Path,
+    out_text_paths: dict[str, Path],
+    audit: dict[str, Any],
+) -> PaperRecord:
+    scoring_artifacts = {
+        "artifact_kind": "anonymized_derivative",
+        "anonymization_version": ANONYMIZATION_VERSION,
+        "pdf": str(out_pdf),
+        **{name: str(path) for name, path in out_text_paths.items()},
+    }
+    safe_anonymization = {
+        key: audit[key]
+        for key in (
+            "paper_id",
+            "status",
+            "anonymization_version",
+            "fingerprint",
+            "source_pdf_sha256",
+            "anonymized_pdf_sha256",
+        )
+    }
+    return PaperRecord(
+        paper_id=source.paper_id,
+        source="blinded_scoring",
+        title=source.title,
+        pdf_path=str(out_pdf),
+        text_full=str(out_text_paths["full_repr"]),
+        text_compact=str(out_text_paths["compact_repr"]),
+        text_scoring=str(out_text_paths["scoring_repr"]),
+        parse_status=source.parse_status,
+        extra={
+            "anonymization": safe_anonymization,
+            "scoring_artifacts": scoring_artifacts,
+            "blind_manifest": {
+                "human_outcomes_available_to_models": False,
+                "identity_metadata_available_to_models": False,
+            },
+        },
+    )
 
 
 def anonymize_pdf(
