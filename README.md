@@ -37,6 +37,11 @@ As of **2026-07-15**:
   All 6,614 official files were downloaded and validated; parsing produced
   6,611 `ok`, three `needs_review`, and zero failures. The remaining 14 records
   have no OpenReview forum ID rather than failed PDF requests.
+- The frozen scoring manifest contains **6,617/6,628 papers (99.83%)**:
+  6,614 official PDFs plus three validated high-confidence arXiv fallbacks.
+  The three parser-review cases were inspected and included because their
+  abstracts and main bodies are intact. Eleven records have no usable PDF and
+  are listed explicitly in the manifest report.
 - The current metadata snapshot includes published reviewer ratings for
   **6,341** accepted papers: overall assessment, soundness, and confidence.
 - Official awards are linked for two Outstanding Papers, five Honorable
@@ -234,7 +239,7 @@ equally strong four-model subset was cheaper or faster.
 - **PDF parsing:** local and fast. A 200-PDF parse took about 54 seconds;
   full-corpus parsing should be on the order of tens of minutes once PDFs are
   present.
-- **Cheap first pass:** measured probes imply roughly **$100-$215** for 6,628
+- **Cheap first pass:** measured probes imply roughly **$100-$215** for 6,617
   papers. On the 48-paper preflight, the four streams cost $1.53 and 18.6
   summed model-minutes; four-stream concurrency projects to about 14-15 hours
   at the slowest observed rate.

@@ -12,7 +12,12 @@ before the full-corpus run:
 
 The production inventory contains 6,628 accepted records. OpenReview exposed
 6,614 official PDFs; 6,611 parsed `ok`, three require review, and 14 records have
-no official PDF.
+no official PDF. The frozen scoring manifest contains 6,617 papers: all 6,614
+official PDFs plus three validated high-confidence arXiv fallbacks. The three
+parser warnings were inspected and retained because their abstract and main
+body text are intact. Eleven papers without any usable PDF are explicitly
+reported as excluded. A full-corpus dry run selected all 6,617 papers into 414
+classification batches.
 
 ## Medium-Run Results
 
@@ -83,7 +88,7 @@ The preflight found and fixed:
 4. incomplete JSON/content-block provider responses and explicit card fallback;
 5. incorrect ranking-file detection by filename extension;
 6. finalist reason leakage and floating-point usage undercounting;
-7. seed-correlated tournament A/B position and pair-batch order; and
+7. seed-correlated tournament A/B position and pair-batch order;
 8. missing connectivity validation for repeated listwise semifinal batches;
    and
 9. repeated batch requests after authentication, permission, or rate-limit

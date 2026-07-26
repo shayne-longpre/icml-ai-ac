@@ -98,7 +98,7 @@ monotonically improve recall.
 
 The selected panel cost $0.784 for 50 papers and completed in 8.2 minutes of
 summed model runtime. The longer 48-paper, two-partition production preflight
-cost $1.53. Together these imply roughly $100-$215 for 6,628 papers, depending
+cost $1.53. Together these imply roughly $100-$215 for 6,617 papers, depending
 mainly on representation length and partition count. After the bounded
 concurrency preflight, use four concurrent model streams; observed throughput
 projects to about 14-15 hours at the slowest model's rate.
@@ -109,7 +109,7 @@ First classify contribution routes in small resumable batches:
 
 ```bash
 python3 -m icml_ai_ac.cli classify-contributions \
-  --manifest data/metadata/icml_2026_openreview_official_parsed6628.jsonl \
+  --manifest data/metadata/icml_2026_scoring_manifest.jsonl \
   --model google/gemini-3.1-flash-lite \
   --batch-size 16 \
   --out data/metadata/icml_2026_contribution_classes.jsonl \
@@ -121,7 +121,7 @@ configured cheap-model preset and can immediately write the aggregate signal:
 
 ```bash
 python3 -m icml_ai_ac.cli score-pass1-ensemble \
-  --manifest data/metadata/icml_2026_openreview_official_parsed6628.jsonl \
+  --manifest data/metadata/icml_2026_scoring_manifest.jsonl \
   --out-dir data/model_runs/icml_2026_pass1_cheap_ensemble \
   --model-preset production_2026_v2 \
   --model-workers 4 \

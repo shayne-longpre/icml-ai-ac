@@ -25,13 +25,21 @@ extracted into multiple representations. The main scoring representation uses
 the ICML page-limit prior, then removes references and detected
 appendix/supplement material. For ICML 2026 camera-ready papers this is the
 first 9 PDF pages; for originally submitted versions it should be set to 8
-pages. This reduces accidental inclusion of non-main-paper content while preserving
-experiments, tables, baselines, ablations, and method details that were missing
-from earlier compact representations.
+pages. This reduces accidental inclusion of non-main-paper content while
+preserving experiments, tables, baselines, ablations, and method details that
+were missing from earlier compact representations.
 
-For PDF-aware stages, the pipeline creates matching first-page PDF excerpts. Oversized
-excerpts can be compressed before upload so that image-heavy papers do not
-cause provider failures. Text remains included alongside the PDF excerpt.
+For PDF-aware stages, the pipeline creates matching first-page PDF excerpts.
+Oversized excerpts can be compressed before upload so that image-heavy papers
+do not cause provider failures. Text remains included alongside the PDF
+excerpt.
+
+The frozen ICML 2026 scoring population contains 6,617 of 6,628 indexed papers:
+6,614 official OpenReview PDFs and three validated high-confidence arXiv
+fallbacks. Three official-PDF parser warnings were reviewed and retained
+because their abstract and main body text are intact. The remaining eleven
+papers have no usable PDF and are excluded with identifiers and reasons stored
+in `data/metadata/icml_2026_scoring_manifest.report.json`.
 
 ## Stage 1: Contribution Routing
 
@@ -305,7 +313,7 @@ that matched its recall and category coverage was cheaper or faster. Grok 4.5
 low, Claude Sonnet 5 low, and Qwen3.7 Max were specifically tested and did not
 improve first-pass recall enough to justify replacing a selected model. At the
 observed context budget, the panel's accepted-50 cost projects to roughly $104
-for 6,628 papers.
+for 6,617 papers.
 
 ## Tournament Cost Evaluation
 
