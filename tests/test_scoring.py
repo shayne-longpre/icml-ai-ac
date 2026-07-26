@@ -9,16 +9,26 @@ from icml_ai_ac.model_presets import PRODUCTION_FRONTIER_JUDGES
 from icml_ai_ac.scoring.batch import Pass1BatchSuiteConfig, run_pass1_batch_suite
 from icml_ai_ac.scoring.prompts import build_pass1_prompt
 from icml_ai_ac.scoring.runner import ScoreRunConfig, score_record
-from icml_ai_ac.scoring.schema import CORE_SCORE_FIELDS, IMPACT_AXIS_FIELDS, validate_scoring_output
+from icml_ai_ac.scoring.schema import (
+    CORE_SCORE_FIELDS,
+    IMPACT_AXIS_FIELDS,
+    parse_json_response,
+    validate_scoring_output,
+)
 
 
 class ScoringTests(unittest.TestCase):
+    def test_parse_json_repairs_unescaped_latex_commands(self) -> None:
+        parsed = parse_json_response('{"title":"Fast Min-$\\epsilon$ Regression"}')
+
+        self.assertEqual(parsed["title"], "Fast Min-$\\epsilon$ Regression")
+
     def test_production_cheap_preset_is_the_validated_four_model_panel(self) -> None:
         self.assertEqual(
             CHEAP_MODEL_PRESETS["production_2026_v2"].models,
             (
                 "nvidia/nemotron-3-ultra-550b-a55b",
-                "google/gemini-3.1-flash-lite",
+                "google/gemini-3.5-flash-lite",
                 "openai/gpt-5.6-luna",
                 "x-ai/grok-4.3",
             ),

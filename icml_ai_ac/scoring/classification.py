@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from icml_ai_ac.models import PaperRecord
-from icml_ai_ac.scoring.providers import ChatCompletionClient, is_batch_blocking_provider_error
+from icml_ai_ac.scoring.providers import (
+    ChatCompletionClient,
+    effective_openrouter_reasoning_effort,
+    extract_content,
+    is_batch_blocking_provider_error,
+    response_model,
+)
 from icml_ai_ac.scoring.runner import estimate_tokens, read_text_path, resolve_record_text_path
 from icml_ai_ac.scoring.schema import CONTRIBUTION_CLASSES, parse_json_response
 from icml_ai_ac.scoring.usage import sum_usage
@@ -58,6 +64,14 @@ def run_contribution_classification(
         candidates[index : index + config.batch_size]
         for index in range(0, len(candidates), config.batch_size)
     ]
+    effective_reasoning_effort = (
+        effective_openrouter_reasoning_effort(
+            model=config.model,
+            requested_effort=None,
+        )
+        if config.provider == "openrouter"
+        else None
+    )
     base_result = {
         "status": "dry_run" if config.dry_run else "pending",
         "provider": config.provider,
@@ -69,6 +83,7 @@ def run_contribution_classification(
         "candidate_count": len(candidates),
         "batch_size": config.batch_size,
         "batch_count": len(batches),
+        "effective_reasoning_effort": effective_reasoning_effort,
     }
     if not config.dry_run and client is None:
         raise ValueError("client is required unless dry_run=True")
@@ -93,6 +108,7 @@ def run_contribution_classification(
             "text_source": config.text_source,
             "temperature": config.temperature,
             "max_output_tokens": config.max_output_tokens,
+            "effective_reasoning_effort": effective_reasoning_effort,
             "seed": config.seed,
             "messages": messages,
             "prompt_tokens_estimate": sum(estimate_tokens(message["content"]) for message in messages),
@@ -138,6 +154,21 @@ def run_contribution_classification(
             batch_results.append(batch_result)
             resumed_batch_count += 1
             continue
+        recovered = recover_saved_classification_batch(
+            batch_dir=batch_dir,
+            fingerprint=fingerprint,
+            candidates=batch_candidates,
+            config=config,
+            prompt_path=prompt_path,
+            batch_index=batch_index,
+            effective_reasoning_effort=effective_reasoning_effort,
+        )
+        if recovered is not None:
+            batch_rows, batch_result = recovered
+            rows.extend(batch_rows)
+            batch_results.append(batch_result)
+            resumed_batch_count += 1
+            continue
 
         chat = None
         try:
@@ -179,6 +210,7 @@ def run_contribution_classification(
                 "raw_response_path": str(raw_response_path),
                 "parsed_response_path": str(parsed_response_path),
                 "served_model": chat.served_model,
+                "effective_reasoning": getattr(chat, "request", {}).get("reasoning"),
                 "usage": chat.usage,
                 "provider_elapsed_seconds": round(chat.elapsed_seconds, 3),
                 "resumed": False,
@@ -294,6 +326,72 @@ def load_cached_classification_batch(
     return rows, resumed_state
 
 
+def recover_saved_classification_batch(
+    *,
+    batch_dir: Path,
+    fingerprint: str,
+    candidates: list[dict[str, Any]],
+    config: ContributionClassificationConfig,
+    prompt_path: Path,
+    batch_index: int,
+    effective_reasoning_effort: str | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    state_path = batch_dir / "batch.json"
+    raw_response_path = batch_dir / "response.json"
+    parsed_response_path = batch_dir / "parsed.json"
+    if not state_path.exists() or not raw_response_path.exists():
+        return None
+    try:
+        state = read_json(state_path)
+        if not isinstance(state, dict) or state.get("fingerprint") != fingerprint:
+            return None
+        response = read_json(raw_response_path)
+        if not isinstance(response, dict):
+            return None
+        parsed = parse_json_response(extract_content(response))
+        write_json(parsed_response_path, parsed)
+        usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+        rows = classification_response_to_rows(
+            parsed,
+            candidates=candidates,
+            config=config,
+            prompt_path=prompt_path,
+            raw_response_path=raw_response_path,
+            parsed_response_path=parsed_response_path,
+            usage=usage,
+        )
+        served_model = response_model(response)
+        annotate_classification_rows(
+            rows,
+            batch_index=batch_index,
+            batch_size=len(candidates),
+            served_model=served_model,
+        )
+        recovered_state = {
+            "status": "ok",
+            "batch_index": batch_index,
+            "candidate_count": len(candidates),
+            "fingerprint": fingerprint,
+            "prompt_path": str(prompt_path),
+            "raw_response_path": str(raw_response_path),
+            "parsed_response_path": str(parsed_response_path),
+            "served_model": served_model,
+            "effective_reasoning": (
+                {"effort": effective_reasoning_effort, "exclude": True}
+                if effective_reasoning_effort
+                else None
+            ),
+            "usage": usage,
+            "provider_elapsed_seconds": state.get("provider_elapsed_seconds"),
+            "resumed": True,
+            "recovered_from_raw_response": True,
+        }
+        write_json(state_path, recovered_state)
+        return rows, recovered_state
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def annotate_classification_rows(
     rows: list[dict[str, Any]],
     *,
@@ -407,6 +505,8 @@ def classification_response_to_rows(
     classifications = parsed.get("classifications")
     if not isinstance(classifications, list):
         raise ValueError("classification response missing classifications array")
+    classification_objects = [item for item in classifications if isinstance(item, dict)]
+    canonicalize_classification_ids(classification_objects, expected_ids=set(expected))
     rows: list[dict[str, Any]] = []
     output_ids: list[str] = []
     for item in classifications:
@@ -451,3 +551,43 @@ def classification_response_to_rows(
             f"duplicates={duplicate_ids}, missing={missing_ids}, extra={extra_ids}"
         )
     return rows
+
+
+def canonicalize_classification_ids(
+    classifications: list[dict[str, Any]],
+    *,
+    expected_ids: set[str],
+) -> None:
+    canonical_by_lower = {paper_id.lower(): paper_id for paper_id in expected_ids}
+    for item in classifications:
+        raw_paper_id = str(item.get("paper_id") or "")
+        canonical = canonical_by_lower.get(raw_paper_id.lower())
+        if canonical and canonical != raw_paper_id:
+            item["paper_id_original_model_output"] = raw_paper_id
+            item["paper_id"] = canonical
+    output_ids = {str(item.get("paper_id") or "") for item in classifications}
+    missing = sorted(expected_ids - output_ids)
+    extra = sorted(output_ids - expected_ids)
+    if len(missing) != 1 or len(extra) != 1 or edit_distance(missing[0], extra[0]) > 2:
+        return
+    for item in classifications:
+        if item.get("paper_id") == extra[0]:
+            item["paper_id_original_model_output"] = extra[0]
+            item["paper_id"] = missing[0]
+            return
+
+
+def edit_distance(left: str, right: str) -> int:
+    previous = list(range(len(right) + 1))
+    for left_index, left_character in enumerate(left, start=1):
+        current = [left_index]
+        for right_index, right_character in enumerate(right, start=1):
+            current.append(
+                min(
+                    previous[right_index] + 1,
+                    current[right_index - 1] + 1,
+                    previous[right_index - 1] + (left_character != right_character),
+                )
+            )
+        previous = current
+    return previous[-1]

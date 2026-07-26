@@ -15,7 +15,12 @@ from typing import Any
 from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.pdf_utils import write_pdf_page_excerpt
 from icml_ai_ac.scoring.providers import ChatCompletionClient, is_batch_blocking_provider_error
-from icml_ai_ac.scoring.runner import estimate_tokens, read_text_path, resolve_record_text_path
+from icml_ai_ac.scoring.runner import (
+    estimate_tokens,
+    read_text_path,
+    resolve_record_pdf_path,
+    resolve_record_text_path,
+)
 from icml_ai_ac.scoring.schema import CONTRIBUTION_CLASSES, parse_json_response
 from icml_ai_ac.scoring.usage import sum_usage
 from icml_ai_ac.storage import read_paper_records, write_json, write_jsonl
@@ -350,7 +355,12 @@ def frontier_card_request_fingerprint(
     *,
     config: FrontierCardConfig,
 ) -> str:
-    pdf_sha256 = candidate.record.extra.get("pdf_sha256")
+    anonymization = candidate.record.extra.get("anonymization")
+    pdf_sha256 = (
+        anonymization.get("anonymized_pdf_sha256")
+        if isinstance(anonymization, dict)
+        else candidate.record.extra.get("pdf_sha256")
+    )
     if not isinstance(pdf_sha256, str) or not pdf_sha256:
         stat = candidate.pdf_path.stat()
         pdf_sha256 = f"stat:{stat.st_size}:{stat.st_mtime_ns}"
@@ -383,10 +393,13 @@ def select_frontier_card_candidates(*, manifest: Path, config: FrontierCardConfi
     for record in read_paper_records(manifest):
         if config.paper_ids and record.paper_id not in config.paper_ids:
             continue
-        if record.parse_status != "ok" or not record.pdf_path:
+        if record.parse_status != "ok":
             continue
-        text_path, resolved_text_source = resolve_record_text_path(record, config.text_source)
-        pdf_path = Path(record.pdf_path)
+        try:
+            text_path, resolved_text_source = resolve_record_text_path(record, config.text_source)
+            pdf_path, _ = resolve_record_pdf_path(record)
+        except ValueError:
+            continue
         if not pdf_path.exists():
             continue
         paper_text = truncate_text(read_text_path(text_path), config.per_paper_char_budget)

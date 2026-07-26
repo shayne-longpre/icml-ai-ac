@@ -387,6 +387,20 @@ def build_parser() -> argparse.ArgumentParser:
     parse.add_argument("--keep-references", action="store_true")
     parse.set_defaults(func=cmd_parse_pdfs)
 
+    anonymize = subparsers.add_parser(
+        "anonymize-papers",
+        help="Create validated, identity-redacted PDF and text derivatives for model scoring.",
+    )
+    anonymize.add_argument("--manifest", type=Path, required=True)
+    anonymize.add_argument("--out", type=Path, required=True)
+    anonymize.add_argument("--pdf-dir", type=Path, required=True)
+    anonymize.add_argument("--text-dir", type=Path, required=True)
+    anonymize.add_argument("--report", type=Path, default=None)
+    anonymize.add_argument("--max-pages", type=int, default=9)
+    anonymize.add_argument("--limit", type=int, default=None)
+    anonymize.add_argument("--overwrite", action="store_true")
+    anonymize.set_defaults(func=cmd_anonymize_papers)
+
     score = subparsers.add_parser("score-pass1", help="Run or dry-run first-pass executive AC scoring.")
     add_http_args(score, default_timeout=180.0)
     score.add_argument("--manifest", type=Path, required=True)
@@ -2238,6 +2252,54 @@ def cmd_parse_pdfs(args: argparse.Namespace) -> int:
     )
     print(f"Parsed {count} PDFs: ok={ok}, needs_review={needs_review}, failed={failed}")
     return 0 if failed == 0 else 2
+
+
+def cmd_anonymize_papers(args: argparse.Namespace) -> int:
+    from icml_ai_ac.anonymize import AnonymizationConfig, anonymize_manifest
+
+    started = time.monotonic()
+    report_path = args.report or args.out.with_suffix(args.out.suffix + ".report.json")
+    report = anonymize_manifest(
+        records=list(read_paper_records(args.manifest)),
+        out=args.out,
+        report_path=report_path,
+        config=AnonymizationConfig(
+            pdf_dir=args.pdf_dir,
+            text_dir=args.text_dir,
+            max_pages=args.max_pages,
+            limit=args.limit,
+            overwrite=args.overwrite,
+        ),
+    )
+    report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    write_json(report_path, report)
+    write_json(
+        args.out.with_suffix(args.out.suffix + ".run.json"),
+        {
+            "command": "anonymize-papers",
+            "manifest": str(args.manifest),
+            "out": str(args.out),
+            "report": str(report_path),
+            **{
+                key: report[key]
+                for key in (
+                    "anonymization_version",
+                    "input_records",
+                    "output_records",
+                    "excluded_records",
+                    "resumed_records",
+                    "max_pages",
+                    "elapsed_seconds",
+                    "status_counts",
+                )
+            },
+        },
+    )
+    print(
+        f"Anonymized {report['output_records']}/{report['input_records']} papers; "
+        f"excluded={report['excluded_records']} resumed={report['resumed_records']}"
+    )
+    return 0 if report["excluded_records"] == 0 else 2
 
 
 def cmd_score_pass1(args: argparse.Namespace) -> int:

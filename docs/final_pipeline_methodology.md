@@ -13,10 +13,8 @@ contribution routes: algorithms, theory, benchmarks/datasets, infrastructure,
 scientific tools, safety/evaluation, applications, and analysis papers.
 
 All model stages are paper-grounded. Retrieval, web search, citation memory,
-and external tools are excluded from scoring. Models are instructed to ignore
-author identity, institution, and venue prestige, although ordinary
-camera-ready paper text and PDFs can still contain names and proceedings
-markings. Reviews, reviewer scores, area-chair comments, decisions,
+and external tools are excluded from scoring. Reviews, reviewer scores,
+area-chair comments, decisions,
 presentation tiers, and awards are structurally excluded. The only allowed
 evidence is the paper identifier and title, extracted paper text, PDF-derived
 visual/table evidence where explicitly supplied, and previous AI pipeline
@@ -33,10 +31,21 @@ pages. This reduces accidental inclusion of non-main-paper content while
 preserving experiments, tables, baselines, ablations, and method details that
 were missing from earlier compact representations.
 
-For PDF-aware stages, the pipeline creates matching first-page PDF excerpts.
+Before scoring, a separate resumable stage creates identity-redacted derivatives
+of the first nine PDF pages and all text representations. It removes the
+first-page author band, author-name occurrences, affiliation and correspondence
+lines, emails, acknowledgements, mail links, and PDF author/XML metadata.
+Canonical PDFs and parsed text remain immutable. Each derivative is
+fingerprinted against its source, checked for residual known identities and
+email addresses, and excluded from scoring unless validation passes. Source
+repair diagnostics and metadata-to-byline name drift remain auditable.
+
+For PDF-aware stages, the pipeline uses the identity-redacted PDF derivative.
 Oversized excerpts can be compressed before upload so that image-heavy papers
 do not cause provider failures. Text remains included alongside the PDF
-excerpt.
+excerpt. This removes direct identity cues, not all possible identification:
+titles, self-citations, project names, writing style, and model memory may still
+identify a paper.
 
 The frozen ICML 2026 scoring population contains 6,617 of 6,628 indexed papers:
 6,614 official OpenReview PDFs and three validated high-confidence arXiv
@@ -57,7 +66,7 @@ valid batches while retrying only missing or invalid ones.
 
 All parsed papers are evaluated by the `production_2026_v2` OpenRouter
 ensemble: `nvidia/nemotron-3-ultra-550b-a55b`,
-`google/gemini-3.1-flash-lite`, `openai/gpt-5.6-luna`, and
+`google/gemini-3.5-flash-lite`, `openai/gpt-5.6-luna`, and
 `x-ai/grok-4.3`. The design uses listwise forced-ranking batches rather than
 independent absolute 1-10 scores, because early Qwen runs produced compressed
 score distributions. The cheap ensemble's goal is high recall into the
@@ -313,7 +322,7 @@ gave the best practical recall/reliability/runtime tradeoff:
 | Cheap panel | Gold top-10 in top 20 | Gold top-20 in top 30 | Gold top-30 in top 30 | Accepted-50 cost |
 | --- | ---: | ---: | ---: | ---: |
 | Previous three-model preset | 10/10 | 17/20 | 23/30 | $0.31 |
-| Selected four-model preset | 10/10 | 18/20 | 24/30 | $0.78 |
+| Initially selected four-model preset (Gemini 3.1) | 10/10 | 18/20 | 24/30 | $0.78 |
 | All 11 usable models | 10/10 | 18/20 | 23/30 | $3.05 |
 
 The production panel is therefore limited to four. No other four-model subset
@@ -322,6 +331,19 @@ low, Claude Sonnet 5 low, and Qwen3.7 Max were specifically tested and did not
 improve first-pass recall enough to justify replacing a selected model. At the
 observed context budget, the panel's accepted-50 cost projects to roughly $104
 for 6,617 papers.
+
+A later matched Flash Lite bakeoff held the other three production streams
+fixed. Replacing Gemini 3.1 Flash Lite with Gemini 3.5 Flash Lite increased
+ensemble Spearman from 0.646 to 0.662 and improved same-budget gold top-10 and
+top-20 recall at rank 10 and rank 20, while both variants retained all gold
+top-10 papers by rank 20 and 18/20 gold top-20 papers by rank 30. In this
+matched aggregate-ordering comparison, gold top-30 same-k recall decreased from
+23/30 to 22/30, which is secondary to the stage's top-tail recall objective.
+Gemini 3.5 uses `minimal` reasoning because its
+OpenRouter endpoint rejects reasoning-off requests; returned reasoning is
+excluded. Gemini 3.1 remains the routing classifier after outperforming 3.5 on
+primary contribution class accuracy (0.80 versus 0.72) and macro-F1 (0.764
+versus 0.602).
 
 ## Tournament Cost Evaluation
 

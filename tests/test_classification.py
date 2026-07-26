@@ -37,7 +37,12 @@ class FakeClient:
             }
         )
         return SimpleNamespace(
-            response={"model": "served"},
+            response={
+                "model": "served",
+                "choices": [{"message": {"content": content}}],
+                "usage": {"prompt_tokens": 10, "cost": 0.01},
+            },
+            request={"reasoning": {"effort": "none", "exclude": True}},
             content=content,
             usage={"prompt_tokens": 10, "cost": 0.01},
             served_model="served",
@@ -190,6 +195,30 @@ class ContributionClassificationTests(unittest.TestCase):
                 parsed_response_path=Path("parsed"),
                 usage={},
             )
+
+    def test_repairs_one_near_match_paper_id(self) -> None:
+        candidates = [
+            {"paper_id": "aqZKgwf7Cc", "title": "One", "resolved_text_source": "compact", "text_path": "one"},
+            {"paper_id": "p2", "title": "Two", "resolved_text_source": "compact", "text_path": "two"},
+        ]
+        parsed = {
+            "classifications": [
+                {"paper_id": "aqZKgwf7Sp", "primary_contribution_class": "theory"},
+                {"paper_id": "p2", "primary_contribution_class": "theory"},
+            ]
+        }
+
+        rows = classification_response_to_rows(
+            parsed,
+            candidates=candidates,
+            config=classification_config(),
+            prompt_path=Path("prompt"),
+            raw_response_path=Path("response"),
+            parsed_response_path=Path("parsed"),
+            usage={},
+        )
+
+        self.assertEqual({row["paper_id"] for row in rows}, {"aqZKgwf7Cc", "p2"})
 
 
 if __name__ == "__main__":

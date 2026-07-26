@@ -6,20 +6,22 @@ The production population is the frozen 6,617-paper scoring manifest: 6,614
 official OpenReview PDFs and three validated arXiv fallbacks. Eleven of 6,628
 indexed papers lack a usable PDF and remain explicitly excluded.
 
-Model-facing inputs contain only paper identifiers, titles, extracted paper
-text, PDF excerpts where configured, and judgments from earlier AI stages.
+Model-facing inputs contain only opaque paper identifiers, titles, identity-
+redacted extracted text, identity-redacted PDF excerpts where configured, and
+judgments from earlier AI stages.
 They do not contain reviews, reviewer ratings, area-chair comments, decisions,
 presentation tiers, or awards. Retrieval, web search, and external tools are
-disabled. Models are instructed to ignore author identity and venue prestige;
-normal camera-ready documents may still visibly contain author names and
-proceedings markings. Human outcomes remain in separate metadata and are joined
-only after the AI ranking is frozen.
+disabled. Derived artifacts remove direct byline, affiliation, email,
+acknowledgement, and PDF-metadata cues and fail closed on validation; canonical
+PDFs remain unchanged. This reduces direct prestige cues but cannot prevent
+identification from titles, self-citations, project names, or model memory.
+Human outcomes remain separate until the AI ranking is frozen.
 
 ## Production Stages
 
 1. **Route contributions (6,617 papers).** Gemini 3.1 Flash Lite assigns
    contribution classes in fingerprinted 16-paper batches.
-2. **Cheap recall ensemble (6,617 papers).** Nemotron 3 Ultra, Gemini 3.1 Flash
+2. **Cheap recall ensemble (6,617 papers).** Nemotron 3 Ultra, Gemini 3.5 Flash
    Lite, GPT-5.6 Luna, and Grok 4.3 each rank two deterministic
    class-stratified partitions. Preserve the full aggregate signal and advance
    the top 20%, approximately 1,323 papers.

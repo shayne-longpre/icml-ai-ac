@@ -18,6 +18,11 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 OPENAI_FILES_URL = "https://api.openai.com/v1/files"
+OPENROUTER_MODELS_REQUIRING_MINIMAL_REASONING = frozenset(
+    {
+        "google/gemini-3.5-flash-lite",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -40,6 +45,20 @@ class ChatResponseContentError(ValueError):
         self.response = response
         self.usage = response.get("usage", {}) if isinstance(response.get("usage"), dict) else {}
         self.served_model = response_model(response)
+
+
+def effective_openrouter_reasoning_effort(
+    *,
+    model: str,
+    requested_effort: str | None,
+) -> str | None:
+    effort = requested_effort
+    if effort is None:
+        effort = os.environ.get("OPENROUTER_REASONING_EFFORT", "none")
+    effort = effort.strip().lower() or "none"
+    if effort == "none" and model in OPENROUTER_MODELS_REQUIRING_MINIMAL_REASONING:
+        return "minimal"
+    return effort or None
 
 
 class ChatCompletionClient:
@@ -95,10 +114,10 @@ class ChatCompletionClient:
         if response_format is not None:
             request_body["response_format"] = response_format
         if self.provider == "openrouter":
-            reasoning_effort = self.reasoning_effort
-            if reasoning_effort is None:
-                reasoning_effort = os.environ.get("OPENROUTER_REASONING_EFFORT", "none")
-            reasoning_effort = reasoning_effort.strip().lower()
+            reasoning_effort = effective_openrouter_reasoning_effort(
+                model=self.model,
+                requested_effort=self.reasoning_effort,
+            )
             if reasoning_effort:
                 request_body["reasoning"] = {"effort": reasoning_effort, "exclude": True}
             if self.openrouter_pdf_engine:

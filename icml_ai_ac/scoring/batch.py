@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from icml_ai_ac.models import PaperRecord
-from icml_ai_ac.scoring.providers import ChatCompletionClient, is_batch_blocking_provider_error
+from icml_ai_ac.scoring.providers import (
+    ChatCompletionClient,
+    effective_openrouter_reasoning_effort,
+    extract_content,
+    is_batch_blocking_provider_error,
+    response_model,
+)
 from icml_ai_ac.scoring.runner import estimate_tokens, read_text_path, resolve_record_text_path
 from icml_ai_ac.scoring.schema import CONTRIBUTION_CLASSES, parse_json_response
 from icml_ai_ac.scoring.usage import sum_usage
@@ -178,6 +184,14 @@ def run_pass1_batch_suite(
     )
     class_by_id = read_class_map(config.class_path)
     partitions = make_batch_partitions(candidates, config=config, class_by_id=class_by_id)
+    effective_reasoning_effort = (
+        effective_openrouter_reasoning_effort(
+            model=config.model,
+            requested_effort=config.reasoning_effort,
+        )
+        if config.provider == "openrouter"
+        else config.reasoning_effort
+    )
     base_result: dict[str, Any] = {
         "status": "dry_run" if config.dry_run else "pending",
         "provider": config.provider,
@@ -190,6 +204,7 @@ def run_pass1_batch_suite(
         "candidate_ids": [candidate.record.paper_id for candidate in candidates],
         "batch_size": config.batch_size,
         "reasoning_effort": config.reasoning_effort,
+        "effective_reasoning_effort": effective_reasoning_effort,
         "partitions": config.partitions,
         "strategy": config.strategy,
         "class_path": str(config.class_path) if config.class_path else None,
@@ -233,6 +248,7 @@ def run_pass1_batch_suite(
                 "candidate_ids": [candidate.record.paper_id for candidate in batch_candidates],
                 "text_source": config.text_source,
                 "reasoning_effort": config.reasoning_effort,
+                "effective_reasoning_effort": effective_reasoning_effort,
                 "temperature": config.temperature,
                 "max_output_tokens": config.max_output_tokens,
                 "seed": config.seed,
@@ -270,6 +286,21 @@ def run_pass1_batch_suite(
             )
             if cached is not None:
                 batch_rows, batch_result = cached
+                rows.extend(batch_rows)
+                batch_results.append(batch_result)
+                continue
+            recovered = recover_saved_pass1_batch(
+                batch_dir=batch_dir,
+                fingerprint=fingerprint,
+                candidates=batch_candidates,
+                config=batch_config,
+                prompt_path=prompt_path,
+                partition_index=partition_index,
+                batch_index=batch_index,
+                effective_reasoning_effort=effective_reasoning_effort,
+            )
+            if recovered is not None:
+                batch_rows, batch_result = recovered
                 rows.extend(batch_rows)
                 batch_results.append(batch_result)
                 continue
@@ -312,6 +343,7 @@ def run_pass1_batch_suite(
                         "parsed_response_path": str(parsed_response_path),
                         "usage": chat.usage,
                         "served_model": chat.served_model,
+                        "effective_reasoning": getattr(chat, "request", {}).get("reasoning"),
                         "provider_elapsed_seconds": round(chat.elapsed_seconds, 3),
                         "resumed": False,
                     }
@@ -419,6 +451,71 @@ def load_cached_pass1_batch(
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
     return rows, {**state, "resumed": True}
+
+
+def recover_saved_pass1_batch(
+    *,
+    batch_dir: Path,
+    fingerprint: str,
+    candidates: list[BatchCandidate],
+    config: Pass1BatchConfig,
+    prompt_path: Path,
+    partition_index: int,
+    batch_index: int,
+    effective_reasoning_effort: str | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    state_path = batch_dir / "batch.json"
+    raw_response_path = batch_dir / "response.json"
+    parsed_response_path = batch_dir / "parsed.json"
+    if not state_path.exists() or not raw_response_path.exists():
+        return None
+    try:
+        state = read_json(state_path)
+        if not isinstance(state, dict) or state.get("fingerprint") != fingerprint:
+            return None
+        response = read_json(raw_response_path)
+        if not isinstance(response, dict):
+            return None
+        parsed = parse_json_response(extract_content(response))
+        write_json(parsed_response_path, parsed)
+        usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+        rows = batch_response_to_rows(
+            parsed,
+            candidates=candidates,
+            config=config,
+            prompt_path=prompt_path,
+            raw_response_path=raw_response_path,
+            parsed_response_path=parsed_response_path,
+            usage=usage,
+        )
+        annotate_suite_rows(rows, partition_index=partition_index, batch_index=batch_index)
+        served_model = response_model(response)
+        for row in rows:
+            row["served_model"] = served_model
+        recovered_state = {
+            "status": "ok",
+            "partition_index": partition_index,
+            "batch_index": batch_index,
+            "candidate_count": len(candidates),
+            "fingerprint": fingerprint,
+            "prompt_path": str(prompt_path),
+            "raw_response_path": str(raw_response_path),
+            "parsed_response_path": str(parsed_response_path),
+            "usage": usage,
+            "served_model": served_model,
+            "effective_reasoning": (
+                {"effort": effective_reasoning_effort, "exclude": True}
+                if effective_reasoning_effort
+                else None
+            ),
+            "provider_elapsed_seconds": state.get("provider_elapsed_seconds"),
+            "resumed": True,
+            "recovered_from_raw_response": True,
+        }
+        write_json(state_path, recovered_state)
+        return rows, recovered_state
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def select_batch_candidates(

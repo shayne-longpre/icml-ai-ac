@@ -62,9 +62,9 @@ As of **2026-07-15**:
 All ranking stages are paper-only: reviews, reviewer ratings, area-chair
 comments, decisions, presentation tiers, and awards are excluded from model
 inputs and joined only after the AI ranking is frozen. Retrieval and web search
-are disabled. Models are instructed to ignore author identity and venue
-prestige, although normal camera-ready papers may still show author names and
-proceedings markings.
+are disabled. Before scoring, validated derivatives remove the author byline,
+affiliations, emails, acknowledgements, and PDF author metadata. The canonical
+PDFs remain unchanged.
 
 ### 1. Corpus and PDF Processing
 
@@ -76,14 +76,15 @@ PDFs are parsed with Poppler. For ICML 2026 camera-ready papers, we use the
 first **9 PDF pages** as the main-paper prior, then strip references and detected
 appendix/supplement material; original submissions use 8 pages. The pipeline
 writes compact, scoring, and full paper representations. Substantive scoring
-uses the main-paper `scoring_repr`.
+uses the main-paper `scoring_repr`. Identity-redacted PDF and text derivatives
+are fingerprinted, validated, and fail closed before entering scoring.
 
 ### 2. Cheap High-Recall Triage
 
 Every parsed paper is scored by a low-cost OpenRouter ensemble:
 
 - `nvidia/nemotron-3-ultra-550b-a55b`
-- `google/gemini-3.1-flash-lite`
+- `google/gemini-3.5-flash-lite`
 - `openai/gpt-5.6-luna`
 - `x-ai/grok-4.3`
 
@@ -229,12 +230,15 @@ sample was deliberately stratified by human outcomes.
 
 A July 2026 refresh screened 14 current OpenRouter models on the same 50-paper
 set and produced 11 usable rankings. All 330 four-model subsets were evaluated.
-Against the corrected gold, the selected four-model panel retained 10/10 gold
-top-10 papers by shortlist rank 20, 18/20 gold top-20 papers by rank 30, and
-24/30 gold top-30 papers. The previous three-model and full 11-model aggregates
-retained 17/20 and 18/20 top-20 papers, respectively, but each recovered only
-23/30 top-30 papers. The 11-model panel cost roughly four times as much. No
-equally strong four-model subset was cheaper or faster.
+The initially selected Gemini 3.1 panel retained 10/10 gold top-10 papers by
+shortlist rank 20, 18/20 gold top-20 papers by rank 30, and 24/30 gold top-30
+papers. A subsequent matched Flash Lite comparison replaced
+Gemini 3.1 with Gemini 3.5 for ranking: ensemble Spearman rose from 0.646 to
+0.662, gold top-10 recall at rank 10 rose from 6/10 to 7/10, and gold top-20
+recall at rank 20 rose from 15/20 to 16/20; both variants retained 10/10 by rank
+20 and 18/20 by rank 30, while top-30 same-k recall moved from 23/30 to 22/30.
+Gemini 3.1 remains the contribution classifier because it achieved 0.80
+accuracy and 0.764 macro-F1 versus 0.72 and 0.602 for 3.5.
 
 ## Cost and Runtime
 
@@ -278,6 +282,10 @@ with each stage resumable and provider throughput the main uncertainty.
   This can be mitigated, but not eliminated, by disabling retrieval, using
   paper-grounded prompts, comparing model families, and testing pre-decision or
   open-weight snapshots when feasible.
+- **Anonymization is not perfect blinding.** Direct author, affiliation, email,
+  acknowledgement, and PDF-metadata cues are removed from validated derivatives,
+  but titles, self-citations, project names, writing style, or model memory may
+  still reveal a paper's identity.
 - **AI is not reproducing the real review process.** This is intentional: the
   study measures a paper-only executive AI judgment, not an AI simulation of
   reviewer discussion.

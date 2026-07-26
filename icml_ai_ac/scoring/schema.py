@@ -44,6 +44,7 @@ CONTRIBUTION_CLASSES = [
     "analysis_position",
     "other",
 ]
+INVALID_JSON_ESCAPE_PATTERN = re.compile(r'\\(?!["\\/bfnrtu])')
 
 TOP_LEVEL_REQUIRED = [
     "paper_id",
@@ -168,15 +169,25 @@ def parse_json_response(text: str) -> dict[str, Any]:
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
     try:
-        parsed = json.loads(text)
+        parsed = load_json_with_invalid_escape_repair(text)
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, flags=re.DOTALL)
         if not match:
             raise
-        parsed = json.loads(match.group(0))
+        parsed = load_json_with_invalid_escape_repair(match.group(0))
     if not isinstance(parsed, dict):
         raise ValueError("model response JSON must be an object")
     return parsed
+
+
+def load_json_with_invalid_escape_repair(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        repaired = INVALID_JSON_ESCAPE_PATTERN.sub(r"\\\\", text)
+        if repaired == text:
+            raise
+        return json.loads(repaired)
 
 
 def validate_scoring_output(payload: dict[str, Any]) -> list[str]:

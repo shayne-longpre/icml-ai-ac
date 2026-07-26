@@ -1,9 +1,10 @@
 # Scoring Pipeline
 
-The first scoring pass evaluates `scoring_repr.txt` artifacts with a cheap model
-and writes fully auditable model-run artifacts. `scoring_repr.txt` is the main
-paper body extracted from the PDF with references removed and appendix or
-supplement stripped when detected. For ICML 2026 camera-ready PDFs, the default
+The first scoring pass evaluates identity-redacted `scoring_repr.txt`
+derivatives with cheap models and writes fully auditable model-run artifacts.
+`scoring_repr.txt` is the main paper body extracted from the PDF with references
+removed and appendix or supplement stripped when detected. For ICML 2026
+camera-ready PDFs, the default
 uses the first 9 PDF pages as the main-paper prior before reference/appendix
 cleanup, matching the camera-ready main-body limit. For originally submitted
 versions, use `parse-pdfs --main-paper-max-pages 8`. `compact_repr.txt` remains
@@ -25,7 +26,7 @@ bakeoff:
 ```text
 production_2026_v2:
 - nvidia/nemotron-3-ultra-550b-a55b
-- google/gemini-3.1-flash-lite
+- google/gemini-3.5-flash-lite
 - openai/gpt-5.6-luna
 - x-ai/grok-4.3
 ```
@@ -41,6 +42,7 @@ broad_2026_probe:
 - qwen/qwen3.7-plus
 - nvidia/nemotron-3-ultra-550b-a55b
 - google/gemini-3.1-flash-lite
+- google/gemini-3.5-flash-lite
 - stepfun/step-3.7-flash
 - inclusionai/ring-2.6-1t
 ```
@@ -51,18 +53,24 @@ recall. The historical `qwen/qwen3-32b`, `qwen/qwen3.6-35b-a3b`, and
 reproducibility.
 
 Do not use web search or retrieval during scoring. The prompt explicitly asks
-for paper-only judgment and tells the model to ignore author identity. Author
-names and proceedings markings can still occur in normal camera-ready text or
-PDF pages; they are not used as explicit ranking features. Reviews, reviewer
-ratings, area-chair comments, decisions, presentation tiers, and awards are not
-serialized into any model-facing prompt. They remain separate until the post
-hoc human-comparison stage.
+for paper-only judgment and tells the model to ignore author identity. Scoring
+manifests route to validated derivatives with bylines, affiliations, emails,
+acknowledgements, and PDF author metadata removed; canonical files remain
+unchanged. The stage fails closed when a derivative does not validate. This
+does not prevent identification from titles, self-citations, project names, or
+model memory. Reviews, reviewer ratings, area-chair comments, decisions,
+presentation tiers, and awards are never serialized into model-facing prompts.
 
 OpenRouter structured calls default to `reasoning: {"effort": "none",
 "exclude": true}`. This avoids paying for returned reasoning tokens and reduces
 the risk that reasoning output consumes the JSON budget. To intentionally test a
 reasoning cheap pass, set `OPENROUTER_REASONING_EFFORT` to `minimal`, `low`,
 `medium`, `high`, or another OpenRouter-supported value.
+
+Gemini 3.5 Flash Lite is the narrow exception: OpenRouter requires at least
+`minimal` reasoning for that model. The client upgrades only this model from
+`none` to `minimal`, keeps `exclude: true`, and stores the effective request in
+the batch audit.
 
 ## Historical Accepted-50 Cheap-Model Probe
 
@@ -108,13 +116,26 @@ mainly on representation length and partition count. After the bounded
 concurrency preflight, use four concurrent model streams; observed throughput
 projects to about 14-15 hours at the slowest model's rate.
 
+An additional matched test compared Flash Lite versions on the same 50 papers
+and prompt. Gemini 3.5 completed 50/50 for $0.101 including one locally
+recoverable malformed-escape response; Gemini 3.1 completed 50/50 for $0.069.
+With Nemotron, Luna, and Grok held fixed, 3.5 increased ensemble Spearman from
+0.646 to 0.662, top-10 recall at rank 10 from 6/10 to 7/10, and top-20 recall at
+rank 20 from 15/20 to 16/20. Both variants retained 10/10 gold top-10 papers by
+rank 20 and 18/20 gold top-20 papers by rank 30. The expected full-run cost
+increase is under $10 for two partitions.
+
+The same matched contribution-routing test favored Gemini 3.1: primary-class
+accuracy was 0.80 versus 0.72, and macro-F1 was 0.764 versus 0.602. Production
+therefore uses 3.1 for routing and 3.5 for ranking.
+
 ## Ensemble First Pass and Conservative Finalists
 
 First classify contribution routes in small resumable batches:
 
 ```bash
 python3 -m icml_ai_ac.cli classify-contributions \
-  --manifest data/metadata/icml_2026_scoring_manifest.jsonl \
+  --manifest data/metadata/icml_2026_scoring_anonymized.jsonl \
   --model google/gemini-3.1-flash-lite \
   --batch-size 16 \
   --out data/metadata/icml_2026_contribution_classes.jsonl \
@@ -126,7 +147,7 @@ configured cheap-model preset and can immediately write the aggregate signal:
 
 ```bash
 python3 -m icml_ai_ac.cli score-pass1-ensemble \
-  --manifest data/metadata/icml_2026_scoring_manifest.jsonl \
+  --manifest data/metadata/icml_2026_scoring_anonymized.jsonl \
   --out-dir data/model_runs/icml_2026_pass1_cheap_ensemble \
   --model-preset production_2026_v2 \
   --model-workers 4 \

@@ -45,7 +45,12 @@ class FakeClient:
             }
         )
         return SimpleNamespace(
-            response={"model": "served"},
+            response={
+                "model": "served",
+                "choices": [{"message": {"content": content}}],
+                "usage": {"prompt_tokens": 20, "cost": 0.02},
+            },
+            request={"reasoning": {"effort": "none", "exclude": True}},
             content=content,
             usage={"prompt_tokens": 20, "cost": 0.02},
             served_model="served",
@@ -131,6 +136,11 @@ class Pass1BatchResumeTests(unittest.TestCase):
                 config=config,
                 client=client,
             )
+            failed_batch = run_dir / "batches" / "partition_00_batch_00" / "batch.json"
+            failed_state = json.loads(failed_batch.read_text(encoding="utf-8"))
+            failed_state["status"] = "failed"
+            failed_batch.write_text(json.dumps(failed_state), encoding="utf-8")
+            (failed_batch.parent / "parsed.json").unlink()
             second = run_pass1_batch_suite(
                 manifest=manifest,
                 out=out,
@@ -144,6 +154,8 @@ class Pass1BatchResumeTests(unittest.TestCase):
             self.assertEqual(first["usage"]["cost"], 0.08)
             self.assertEqual(client.calls, 4)
             self.assertEqual(second["resumed_batch_count"], 4)
+            recovered = json.loads(failed_batch.read_text(encoding="utf-8"))
+            self.assertTrue(recovered["recovered_from_raw_response"])
             self.assertEqual(len(out.read_text(encoding="utf-8").splitlines()), 8)
 
 

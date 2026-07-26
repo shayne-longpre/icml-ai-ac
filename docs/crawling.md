@@ -167,6 +167,39 @@ main-body cap, 6,611 parsed `ok`, three usable extractions were marked
 `needs_review`, and none
 failed.
 
+## Identity-Redacted Scoring Artifacts
+
+Keep canonical PDFs and parsed text immutable. Before any model call, create a
+separate fingerprinted scoring manifest whose PDF and text paths resolve to
+identity-redacted derivatives:
+
+```bash
+python3 -m icml_ai_ac.cli anonymize-papers \
+  --manifest data/metadata/icml_2026_scoring_manifest.jsonl \
+  --out data/metadata/icml_2026_scoring_anonymized.jsonl \
+  --pdf-dir data/pdfs/icml_2026_anonymized \
+  --text-dir data/extracted_text/icml_2026_anonymized \
+  --report data/metadata/icml_2026_scoring_anonymized.report.json \
+  --max-pages 9
+```
+
+The command removes the first-page author band, known author-name occurrences,
+affiliation and correspondence lines, emails, acknowledgements, mail links,
+and PDF author/XML metadata. It validates every derivative and omits
+non-passing rows from the output manifest. Its append-only journal supports
+exact resume; rerunning the unchanged 103-paper production-layout probe reused
+103/103 rows in under half a second.
+
+That probe passed 103/103 PDFs in about two minutes. It included the first 100
+scoring records plus three unusual layouts without an `Abstract` heading. Twelve
+metadata author strings differed from the camera-ready byline; the complete
+author bands were still detected and removed, and the drift remains in the
+audit. Two malformed source PDFs emitted six repair diagnostics, but their
+saved derivatives passed page-count, identity, email, and metadata validation.
+A separate 50-paper ICML 2025 run also passed 50/50. This is direct identity
+redaction, not guaranteed anonymity: titles, self-citations, project names, and
+model memory can still identify papers.
+
 If a manifest already contains explicit PDF URLs, download them directly:
 
 ```bash

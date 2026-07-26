@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Infrastructure for a public-paper ICML AI executive AC study."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "pymupdf>=1.26,<2",
+]
 
 [project.scripts]
 icml-ai-ac = "icml_ai_ac.cli:main"
