@@ -30,14 +30,27 @@ region were retained, while 568 metadata/PDF title differences are recorded as
 provenance drift. Canonical PDFs are unchanged. No paid ranking request was
 made during anonymization or its audit.
 
+## Stage 1 Gate
+
+Contribution routing is complete for 6,617/6,617 papers using Gemini 3.1 Flash
+Lite and the frozen hash-randomized manifest. All 414 batches have exact
+prompt, raw/composite response, parsed, and state artifacts; requested and
+served model IDs match, and the final blindness scan found no human-outcome
+fields or live URLs. Corrected-pass cost was $2.7262 including archived failed
+attempts. A controlled reversal probe found a small position effect, so these
+classes are provisional batching labels. The cheap ranking ensemble stores a
+separate multi-model category consensus for analysis.
+
 ## Production Stages
 
-1. **Route contributions (6,617 papers).** Gemini 3.1 Flash Lite assigns
-   contribution classes in fingerprinted 16-paper batches.
+1. **Route contributions (complete: 6,617 papers).** Gemini 3.1 Flash Lite assigns
+   provisional routing classes in fingerprinted 16-paper batches after a fixed
+   hash randomization makes prompt slot independent of corpus order.
 2. **Cheap recall ensemble (6,617 papers).** Nemotron 3 Ultra, Gemini 3.5 Flash
    Lite, GPT-5.6 Luna, and Grok 4.3 each rank two deterministic
    class-stratified partitions. Preserve the full aggregate signal and advance
-   the top 20%, approximately 1,323 papers.
+   the top 20%, approximately 1,323 papers. Store every model's contribution
+   class vote and a resolved ensemble class separately from the routing label.
 3. **Strong semifinal (approximately 1,323 papers).** GPT-5.6 Terra high and
    Claude Sonnet 5 high independently rank the same shortlist in size-8,
    two-partition batches. Preserve both source rankings, normalized consensus,
@@ -71,6 +84,7 @@ Every multi-call stage stores:
 - requested and served model identifiers;
 - token and cost usage when reported;
 - per-batch or per-paper coverage and resume state; and
+- archived failed attempts before any retry; and
 - source judgments, normalized ranks, selector reasons, disagreements, pair
   schedules, A/B randomization, pair decisions, and aggregation outputs.
 

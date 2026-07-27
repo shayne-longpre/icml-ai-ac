@@ -93,9 +93,10 @@ scores, which were too compressed in early tests. Models judge technical
 soundness, novelty, clarity, empirical credibility, ML-field impact, broader
 scientific importance, contribution type, and whether the paper should advance.
 
-Gemini 3.1 Flash Lite first groups papers by contribution route: algorithm,
-theory, benchmark/data, infrastructure, scientific tool, safety/evaluation,
-application, or analysis.
+Gemini 3.1 Flash Lite first assigns provisional contribution routes in a fixed
+hash-randomized order, preventing source order from being confounded with prompt
+position. The four-model ranking pass also stores its class votes and agreement,
+which define the downstream ensemble category signal.
 
 We aggregate by source model and select a top **15-20%** class-balanced
 shortlist, preserving per-class leaders, strong rejected candidates, and

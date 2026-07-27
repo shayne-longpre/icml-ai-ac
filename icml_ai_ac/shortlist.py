@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -121,6 +122,16 @@ def aggregate_rows(rows: list[dict[str, Any]], *, class_by_id: dict[str, str]) -
 def aggregate_to_row(aggregate: PaperAggregate) -> dict[str, Any]:
     rows = aggregate.rows
     appearances = len(rows)
+    routing_class = aggregate.primary_contribution_class or "other"
+    class_votes = Counter(contribution_class(row) for row in rows)
+    max_class_votes = max(class_votes.values(), default=0)
+    class_vote_leaders = sorted(
+        contribution_class
+        for contribution_class, count in class_votes.items()
+        if count == max_class_votes
+    )
+    ensemble_class = class_vote_leaders[0] if len(class_vote_leaders) == 1 else None
+    resolved_class = ensemble_class or routing_class
     local_priorities = [row_priority(row) for row in rows]
     executive_scores = [score_value(row, "executive_ac_priority") for row in rows]
     broader_scores = [score_value(row, "broader_science_impact_forecast") for row in rows]
@@ -135,6 +146,10 @@ def aggregate_to_row(aggregate: PaperAggregate) -> dict[str, Any]:
         for row in rows
     ]
     source_groups = rows_by_source_model(rows)
+    source_model_class_votes = {
+        source: dict(sorted(Counter(contribution_class(row) for row in source_rows).items()))
+        for source, source_rows in sorted(source_groups.items())
+    }
     source_priorities = [
         aggregate_priority(
             local_priorities=[row_priority(row) for row in source_rows],
@@ -158,10 +173,12 @@ def aggregate_to_row(aggregate: PaperAggregate) -> dict[str, Any]:
         "status": "ok",
         "paper_id": aggregate.paper_id,
         "title": aggregate.title,
-        "primary_contribution_class": aggregate.primary_contribution_class or "other",
+        "primary_contribution_class": resolved_class,
+        "routing_contribution_class": routing_class,
+        "ensemble_contribution_class": ensemble_class,
         "scores": {
             "contribution_profile": {
-                "primary_contribution_class": aggregate.primary_contribution_class or "other",
+                "primary_contribution_class": resolved_class,
                 "secondary_contribution_classes": [],
             },
             "scores": {
@@ -200,10 +217,25 @@ def aggregate_to_row(aggregate: PaperAggregate) -> dict[str, Any]:
                     "batch_rank": row.get("batch_rank"),
                     "forced_bucket": row.get("forced_bucket"),
                     "batch_local_priority": row.get("batch_local_priority"),
+                    "primary_contribution_class": contribution_class(row),
                     "prompt_path": row.get("prompt_path"),
                 }
                 for row in rows
             ],
+            "contribution_class_consensus": {
+                "routing_class": routing_class,
+                "ensemble_class": ensemble_class,
+                "resolved_class": resolved_class,
+                "resolution": "unique_ensemble_plurality" if ensemble_class else "routing_tiebreak",
+                "vote_counts": dict(sorted(class_votes.items())),
+                "vote_leaders": class_vote_leaders,
+                "agreement_rate": (
+                    round(max_class_votes / sum(class_votes.values()), 4)
+                    if class_votes
+                    else 0.0
+                ),
+                "source_model_vote_counts": source_model_class_votes,
+            },
             "aggregate_priority": round(priority, 4),
             "source_model_count": len(source_groups),
             "source_models": sorted(source_groups),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -170,6 +171,12 @@ def run_contribution_classification(
             resumed_batch_count += 1
             continue
 
+        archived_attempt_count = archive_failed_classification_attempt(
+            batch_dir=batch_dir,
+            fingerprint=fingerprint,
+        )
+        clear_classification_attempt_artifacts(batch_dir)
+        attempt_index = archived_attempt_count + 1
         chat = None
         try:
             if client is None:
@@ -214,6 +221,7 @@ def run_contribution_classification(
                 "usage": chat.usage,
                 "provider_elapsed_seconds": round(chat.elapsed_seconds, 3),
                 "resumed": False,
+                "attempt_index": attempt_index,
             }
             write_json(batch_dir / "batch.json", batch_result)
             rows.extend(batch_rows)
@@ -236,6 +244,7 @@ def run_contribution_classification(
                 "prompt_path": str(prompt_path),
                 "error_path": str(error_path),
                 "error": repr(exc),
+                "attempt_index": attempt_index,
             }
             if raw_response_path.exists():
                 batch_result["raw_response_path"] = str(raw_response_path)
@@ -274,6 +283,63 @@ def run_contribution_classification(
     }
     write_json(run_dir / "run.json", result)
     return result
+
+
+def archive_failed_classification_attempt(*, batch_dir: Path, fingerprint: str) -> int:
+    attempts_dir = batch_dir / "attempts"
+    existing_indices = [
+        int(path.name.removeprefix("attempt_"))
+        for path in attempts_dir.glob("attempt_[0-9][0-9][0-9][0-9]")
+        if path.is_dir()
+    ]
+    archived_count = max(existing_indices, default=0)
+    state_path = batch_dir / "batch.json"
+    if not state_path.exists():
+        return archived_count
+    try:
+        state = read_json(state_path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return archived_count
+    if (
+        not isinstance(state, dict)
+        or state.get("status") != "failed"
+        or state.get("fingerprint") != fingerprint
+    ):
+        return archived_count
+
+    archived_count += 1
+    archive_dir = attempts_dir / f"attempt_{archived_count:04d}"
+    archive_dir.mkdir(parents=True, exist_ok=False)
+    for name in ("prompt.json", "response.json", "parsed.json", "error.json", "batch.json"):
+        source = batch_dir / name
+        if source.exists():
+            shutil.copy2(source, archive_dir / name)
+            if name in {"response.json", "parsed.json", "error.json"}:
+                source.unlink()
+    write_json(
+        archive_dir / "archive.json",
+        {
+            "attempt_index": state.get("attempt_index") or archived_count,
+            "fingerprint": fingerprint,
+            "status": "failed",
+        },
+    )
+    write_json(
+        state_path,
+        {
+            **state,
+            "status": "retry_pending",
+            "archived_attempt_index": archived_count,
+        },
+    )
+    return archived_count
+
+
+def clear_classification_attempt_artifacts(batch_dir: Path) -> None:
+    for name in ("response.json", "parsed.json", "error.json"):
+        path = batch_dir / name
+        if path.exists():
+            path.unlink()
 
 
 def prompt_fingerprint(payload: dict[str, Any]) -> str:
@@ -348,8 +414,16 @@ def recover_saved_classification_batch(
         response = read_json(raw_response_path)
         if not isinstance(response, dict):
             return None
-        parsed = parse_json_response(extract_content(response))
-        write_json(parsed_response_path, parsed)
+        content = extract_content(response)
+        try:
+            parsed = parse_json_response(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = recover_complete_classification_prefix(
+                content,
+                expected_count=len(candidates),
+            )
+            if parsed is None:
+                raise
         usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
         rows = classification_response_to_rows(
             parsed,
@@ -367,6 +441,13 @@ def recover_saved_classification_batch(
             batch_size=len(candidates),
             served_model=served_model,
         )
+        archived_attempt_count = archive_failed_classification_attempt(
+            batch_dir=batch_dir,
+            fingerprint=fingerprint,
+        )
+        if archived_attempt_count:
+            write_json(raw_response_path, response)
+        write_json(parsed_response_path, parsed)
         recovered_state = {
             "status": "ok",
             "batch_index": batch_index,
@@ -385,11 +466,49 @@ def recover_saved_classification_batch(
             "provider_elapsed_seconds": state.get("provider_elapsed_seconds"),
             "resumed": True,
             "recovered_from_raw_response": True,
+            "archived_failed_attempt_count": archived_attempt_count,
+            "response_recovery": parsed.get("_response_recovery"),
         }
         write_json(state_path, recovered_state)
         return rows, recovered_state
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
+
+
+def recover_complete_classification_prefix(
+    content: str,
+    *,
+    expected_count: int,
+) -> dict[str, Any] | None:
+    marker_index = content.find('"classifications"')
+    if marker_index < 0:
+        return None
+    array_start = content.find("[", marker_index)
+    if array_start < 0:
+        return None
+
+    decoder = json.JSONDecoder()
+    items: list[dict[str, Any]] = []
+    cursor = array_start + 1
+    while len(items) < expected_count:
+        while cursor < len(content) and (content[cursor].isspace() or content[cursor] == ","):
+            cursor += 1
+        try:
+            item, cursor = decoder.raw_decode(content, cursor)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(item, dict):
+            return None
+        items.append(item)
+
+    return {
+        "classifications": items,
+        "_response_recovery": {
+            "kind": "complete_expected_classification_prefix",
+            "expected_count": expected_count,
+            "ignored_trailing_character_count": len(content) - cursor,
+        },
+    }
 
 
 def annotate_classification_rows(
@@ -506,7 +625,13 @@ def classification_response_to_rows(
     if not isinstance(classifications, list):
         raise ValueError("classification response missing classifications array")
     classification_objects = [item for item in classifications if isinstance(item, dict)]
-    canonicalize_classification_ids(classification_objects, expected_ids=set(expected))
+    canonicalize_classification_ids(
+        classification_objects,
+        expected_titles={
+            paper_id: str(candidate.get("title") or "")
+            for paper_id, candidate in expected.items()
+        },
+    )
     rows: list[dict[str, Any]] = []
     output_ids: list[str] = []
     for item in classifications:
@@ -556,8 +681,9 @@ def classification_response_to_rows(
 def canonicalize_classification_ids(
     classifications: list[dict[str, Any]],
     *,
-    expected_ids: set[str],
+    expected_titles: dict[str, str],
 ) -> None:
+    expected_ids = set(expected_titles)
     canonical_by_lower = {paper_id.lower(): paper_id for paper_id in expected_ids}
     for item in classifications:
         raw_paper_id = str(item.get("paper_id") or "")
@@ -565,6 +691,33 @@ def canonicalize_classification_ids(
         if canonical and canonical != raw_paper_id:
             item["paper_id_original_model_output"] = raw_paper_id
             item["paper_id"] = canonical
+
+    output_ids = [str(item.get("paper_id") or "") for item in classifications]
+    duplicate_ids = {
+        paper_id
+        for paper_id in output_ids
+        if output_ids.count(paper_id) > 1
+    }
+    missing_ids = expected_ids - set(output_ids)
+    expected_by_title: dict[str, list[str]] = {}
+    for paper_id in missing_ids:
+        title_key = normalized_title_key(expected_titles[paper_id])
+        if title_key:
+            expected_by_title.setdefault(title_key, []).append(paper_id)
+    for item in classifications:
+        paper_id = str(item.get("paper_id") or "")
+        if paper_id not in duplicate_ids:
+            continue
+        title_key = normalized_title_key(str(item.get("title") or ""))
+        matches = expected_by_title.get(title_key, [])
+        if len(matches) != 1:
+            continue
+        repaired_id = matches[0]
+        item["paper_id_original_model_output"] = paper_id
+        item["paper_id_repair_reason"] = "unique_expected_title_match"
+        item["paper_id"] = repaired_id
+        expected_by_title.pop(title_key)
+
     output_ids = {str(item.get("paper_id") or "") for item in classifications}
     missing = sorted(expected_ids - output_ids)
     extra = sorted(output_ids - expected_ids)
@@ -575,6 +728,10 @@ def canonicalize_classification_ids(
             item["paper_id_original_model_output"] = extra[0]
             item["paper_id"] = missing[0]
             return
+
+
+def normalized_title_key(value: str) -> str:
+    return " ".join(value.split()).casefold()
 
 
 def edit_distance(left: str, right: str) -> int:

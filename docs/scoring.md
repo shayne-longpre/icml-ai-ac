@@ -131,16 +131,23 @@ therefore uses 3.1 for routing and 3.5 for ranking.
 
 ## Ensemble First Pass and Conservative Finalists
 
-First classify contribution routes in small resumable batches:
+First classify provisional contribution routes in small resumable batches. The
+production input is deterministically hash-randomized so prompt position is
+independent of the source manifest order:
 
 ```bash
 python3 -m icml_ai_ac.cli classify-contributions \
-  --manifest data/metadata/icml_2026_scoring_anonymized.jsonl \
+  --manifest data/model_runs/icml_2026_full_launch/stage01_randomized_routing_manifest.jsonl \
   --model google/gemini-3.1-flash-lite \
   --batch-size 16 \
-  --out data/metadata/icml_2026_contribution_classes.jsonl \
-  --run-dir data/model_runs/icml_2026_contribution_classes
+  --out data/metadata/icml_2026_contribution_classes_randomized.jsonl \
+  --run-dir data/model_runs/icml_2026_contribution_classes_randomized
 ```
+
+These labels route ranking batches; they are not treated as final scientific
+categories. The four-model cheap ranking aggregate stores each model's class
+votes, agreement rate, the provisional routing class, and a resolved ensemble
+class for downstream category analysis.
 
 The easiest production entrypoint is `score-pass1-ensemble`, which runs a
 configured cheap-model preset and can immediately write the aggregate signal:
@@ -151,7 +158,7 @@ python3 -m icml_ai_ac.cli score-pass1-ensemble \
   --out-dir data/model_runs/icml_2026_pass1_cheap_ensemble \
   --model-preset production_2026_v2 \
   --model-workers 4 \
-  --class-path data/metadata/icml_2026_contribution_classes.jsonl \
+  --class-path data/metadata/icml_2026_contribution_classes_randomized.jsonl \
   --strategy class_round_robin \
   --batch-size 8 \
   --partitions 2 \
