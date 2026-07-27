@@ -24,6 +24,7 @@ class AnonymizationTests(unittest.TestCase):
         self.assertTrue(contains_author_identity("Christoph Schnörr", "Christoph Schnoerr"))
         self.assertTrue(contains_author_identity("Mark N. Müller", "Mark Niklas Mueller"))
         self.assertTrue(contains_author_identity("O˘guz Kaan Y¨uksel 1", "Oğuz Yüksel"))
+        self.assertTrue(contains_author_identity("Correspondence to: Man-\nasi Sharma", "Manasi Sharma"))
         self.assertTrue(
             contains_author_identity(
                 "Cristina Gˆarbacea 1",
@@ -44,6 +45,45 @@ class AnonymizationTests(unittest.TestCase):
             )
         )
         self.assertEqual(normalize_identity_text("To Enable"), "toenable")
+
+    def test_text_redaction_removes_hyphen_wrapped_author_name(self) -> None:
+        sanitized, audit = anonymize_representation(
+            "Abstract\nUseful result.\nScale AI. Correspondence to: Man-\nasi Sharma <name@example.org>.\n1. Introduction",
+            authors=["Manasi Sharma"],
+            strip_front_matter=False,
+        )
+
+        self.assertNotIn("Man-", sanitized)
+        self.assertNotIn("asi Sharma", sanitized)
+        self.assertGreaterEqual(sanitized.count("[IDENTITY REDACTED]"), 2)
+        self.assertEqual(audit["author_replacement_count"], 2)
+        self.assertEqual(audit["residual_authors"], [])
+
+    def test_text_redaction_removes_embedded_correspondence_line(self) -> None:
+        sanitized, audit = anonymize_representation(
+            "Abstract\n1Example University. Correspondence to: Matan Schliser-\n[IDENTITY REDACTED]\n1. Introduction",
+            authors=["Matan Schliserman"],
+            strip_front_matter=False,
+        )
+
+        self.assertNotIn("Correspondence", sanitized)
+        self.assertNotIn("Schliser", sanitized)
+        self.assertGreaterEqual(audit["identity_line_replacement_count"], 1)
+
+    def test_text_redaction_removes_wrapped_correspondence_cue(self) -> None:
+        sanitized, audit = anonymize_representation(
+            "Abstract\nExample University. Correspondence\nto: Ke Wang <name@example.org>.\n1. Introduction",
+            authors=["Ke Wang"],
+            strip_front_matter=False,
+        )
+
+        self.assertNotIn("Correspondence", sanitized)
+        self.assertNotIn("Ke Wang", sanitized)
+        self.assertGreaterEqual(
+            audit["author_replacement_count"]
+            + audit["identity_line_replacement_count"],
+            2,
+        )
 
     def test_pdf_redaction_removes_identity_but_preserves_paper_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -120,6 +160,38 @@ class AnonymizationTests(unittest.TestCase):
             self.assertNotIn("Ada Lovelace", text)
             self.assertNotIn("New Camera Ready Author", text)
             self.assertIn("useful scientific result", text)
+
+    def test_pdf_redaction_removes_hyphen_wrapped_name_on_later_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            output = root / "anonymized.pdf"
+            document = pymupdf.open()
+            first_page = document.new_page()
+            first_page.insert_text((72, 72), "A Useful Machine Learning Paper", fontsize=16)
+            first_page.insert_text((72, 108), "Viraaji Mothukuri", fontsize=11)
+            first_page.insert_text((72, 145), "Abstract", fontsize=12)
+            first_page.insert_text((72, 165), "This paper presents a useful result.", fontsize=10)
+            second_page = document.new_page()
+            second_page.insert_text((72, 72), "The implementation is available in (Vi-", fontsize=10)
+            second_page.insert_text((72, 88), "raaji Mothukuri, 2026).", fontsize=10)
+            document.save(source)
+            document.close()
+
+            audit = anonymize_pdf(
+                source_pdf=source,
+                out_pdf=output,
+                title="A Useful Machine Learning Paper",
+                authors=["Viraaji Mothukuri"],
+                max_pages=2,
+            )
+
+            anonymized = pymupdf.open(output)
+            text = "\n".join(page.get_text() for page in anonymized)
+            anonymized.close()
+            self.assertEqual(audit["status"], "ok")
+            self.assertFalse(contains_author_identity(text, "Viraaji Mothukuri"))
+            self.assertNotIn("Mothukuri", text)
 
     def test_pdf_redaction_fails_closed_without_a_detected_author_band(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

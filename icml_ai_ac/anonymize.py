@@ -13,7 +13,7 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, write_jsonl
 
 
-ANONYMIZATION_VERSION = "direct_identity_redaction_v25"
+ANONYMIZATION_VERSION = "direct_identity_redaction_v26"
 TEXT_DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
@@ -42,6 +42,7 @@ TEXT_IDENTITY_LINE_PATTERN = re.compile(
     r"^\s*[*†‡]?\s*(?:equal\s+contribution|correspondence\s+to|department\b|"
     r"school\s+of\b|faculty\s+of\b|laboratory\s+of\b|institute\b|"
     r"international\s+conference\s+on\s+machine\b)|"
+    r"\bcorrespondence\s+to\s*:|"
     r"^\s*of\b.{0,120}\buniversity\b|"
     r"\bproceedings\s+of\s+the\b|\bpmlr\s+\d+\b|"
     r"\bcopyright\s+\d{4}\b|\bby\s+the\s+author(?:s)?\b|"
@@ -383,13 +384,22 @@ def anonymize_pdf(
             )
             abstract_hits = list(page.search_for("Abstract")) if page_index == 0 else []
             abstract_top = min((rect.y0 for rect in abstract_hits), default=None)
+            wrapped_author_lines = wrapped_author_line_indexes(
+                [line_text for line_text, _ in page_lines],
+                authors,
+            )
 
-            for line_text, line_rect in page_lines:
+            for line_index, (line_text, line_rect) in enumerate(page_lines):
                 has_author_identity = any(
                     contains_author_identity(line_text, author)
                     for author in authors
                 )
-                if page_index == 0 and REVIEWER_FOOTER_PATTERN.search(line_text):
+                if line_index in wrapped_author_lines:
+                    page_rects.append(
+                        expand_rect(line_rect, page=page, x_padding=2.0, y_padding=2.0)
+                    )
+                    identity_line_count += 1
+                elif page_index == 0 and REVIEWER_FOOTER_PATTERN.search(line_text):
                     page_rects.append(
                         pymupdf.Rect(
                             0.0,
@@ -600,14 +610,18 @@ def anonymize_representation(
     replacement_count = 0
     identity_line_replacement_count = 0
     lines = sanitized.splitlines()
-    author_flags = [
-        any(contains_author_identity(line, author) for author in authors)
-        for line in lines
-    ]
+    author_line_indexes = {
+        index
+        for author in authors
+        for index in author_identity_line_indexes(sanitized, author)
+    }
+    author_flags = [index in author_line_indexes for index in range(len(lines))]
     identity_flags = [
         is_text_identity_line(line)
         for line in lines
     ]
+    for index in correspondence_identity_line_indexes(lines):
+        identity_flags[index] = True
     identity_block_lines = find_identity_block_lines(
         lines,
         direct_flags=[
@@ -771,10 +785,15 @@ def find_name_rects(words: list[tuple[Any, ...]], name: str) -> list[pymupdf.Rec
                 break
             word_index += 1
         if accumulated == target:
-            rect = pymupdf.Rect(words[matched_indices[0]][:4])
-            for index in matched_indices[1:]:
-                rect.include_rect(pymupdf.Rect(words[index][:4]))
-            results.append(rect)
+            line_groups: dict[tuple[Any, Any], list[int]] = {}
+            for index in matched_indices:
+                word = words[index]
+                line_groups.setdefault((word[5], word[6]), []).append(index)
+            for indices in line_groups.values():
+                rect = pymupdf.Rect(words[indices[0]][:4])
+                for index in indices[1:]:
+                    rect.include_rect(pymupdf.Rect(words[index][:4]))
+                results.append(rect)
     return dedupe_rects(results)
 
 
@@ -1224,11 +1243,45 @@ def author_identity_keys(author: str) -> list[str]:
 
 
 def contains_author_identity(text: str, author: str) -> bool:
-    return any(
-        line_contains_name_variant(line, variant)
-        for line in text.splitlines()
-        for variant in author_name_variants(author)
-    )
+    return bool(author_identity_line_indexes(text, author))
+
+
+def author_identity_line_indexes(text: str, author: str) -> set[int]:
+    lines = text.splitlines()
+    matches = {
+        index
+        for index, line in enumerate(lines)
+        if any(
+            line_contains_name_variant(line, variant)
+            for variant in author_name_variants(author)
+        )
+    }
+    matches.update(wrapped_author_line_indexes(lines, [author]))
+    return matches
+
+
+def wrapped_author_line_indexes(lines: list[str], authors: list[str]) -> set[int]:
+    matches: set[int] = set()
+    for index, line in enumerate(lines[:-1]):
+        if not re.search(r"[-‐‑‒–]\s*$", line):
+            continue
+        joined = re.sub(r"[-‐‑‒–]\s*$", "", line) + lines[index + 1].lstrip()
+        if any(
+            line_contains_name_variant(joined, variant)
+            for author in authors
+            for variant in author_name_variants(author)
+        ):
+            matches.update((index, index + 1))
+    return matches
+
+
+def correspondence_identity_line_indexes(lines: list[str]) -> set[int]:
+    matches: set[int] = set()
+    for index, line in enumerate(lines[:-1]):
+        joined = line.rstrip() + " " + lines[index + 1].lstrip()
+        if re.search(r"(?i)\bcorrespondence\s+to\s*:", joined):
+            matches.update((index, index + 1))
+    return matches
 
 
 def line_contains_name_variant(line: str, variant: str) -> bool:

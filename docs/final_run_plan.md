@@ -22,13 +22,16 @@ canonical manifest for post hoc joins.
 
 ## Stage 0 Gate
 
-Identity redaction is complete under `direct_identity_redaction_v25`.
+Identity redaction is complete under `direct_identity_redaction_v25` plus a
+selective `direct_identity_redaction_v26` correction.
 The model-facing manifest contains 6,617/6,617 successful rows, 6,617 validated
-PDF derivatives, and 19,851 validated text artifacts. The final independent
-audit reports zero errors; all 6,049 metadata titles present in the source title
-region were retained, while 568 metadata/PDF title differences are recorded as
-provenance drift. Canonical PDFs are unchanged. No paid ranking request was
-made during anonymization or its audit.
+PDF derivatives, and 19,851 validated text artifacts. Version 26 rebuilt 341
+records to remove names split across extracted lines and residual
+correspondence contact lines; the other 6,276 validated v25 records were left
+unchanged. The final audit reports zero errors. All 6,049 metadata titles
+present in the source title region were retained, while 568 metadata/PDF title
+differences are recorded as provenance drift. Canonical PDFs are unchanged.
+No paid ranking request was made before this gate passed.
 
 ## Stage 1 Gate
 
