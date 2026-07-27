@@ -241,6 +241,49 @@ class AnonymizationTests(unittest.TestCase):
             self.assertNotIn("example.edu", text)
             self.assertIn("Scientific content.", text)
 
+    def test_pdf_redaction_removes_url_split_across_font_spans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            output = root / "anonymized.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text((72, 72), "A Useful Machine Learning Paper", fontsize=16)
+            page.insert_text((72, 108), "Ada Lovelace", fontsize=11)
+            page.insert_text((72, 145), "Abstract", fontsize=12)
+            page.insert_text((72, 165), "Scientific content.", fontsize=10)
+            page.insert_text((72, 700), "1", fontsize=7)
+            prefix = "https://example.edu/"
+            prefix_x = 80
+            page.insert_text((prefix_x, 700), prefix, fontsize=8)
+            marker_x = prefix_x + pymupdf.get_text_length(prefix, fontsize=8)
+            page.insert_text((marker_x, 700), "~", fontname="cour", fontsize=8)
+            suffix_x = marker_x + pymupdf.get_text_length(
+                "~",
+                fontname="cour",
+                fontsize=8,
+            )
+            page.insert_text((suffix_x, 700), "dataset", fontsize=8)
+            document.save(source)
+            document.close()
+
+            audit = anonymize_pdf(
+                source_pdf=source,
+                out_pdf=output,
+                title="A Useful Machine Learning Paper",
+                authors=["Ada Lovelace"],
+                max_pages=9,
+            )
+
+            anonymized = pymupdf.open(output)
+            text = "\n".join(page.get_text() for page in anonymized)
+            anonymized.close()
+            self.assertEqual(audit["status"], "ok")
+            self.assertNotIn("https://", text)
+            self.assertNotIn("example.edu", text)
+            self.assertNotIn("dataset", text)
+            self.assertIn("Scientific content.", text)
+
     def test_pdf_redaction_removes_multiline_link_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -283,6 +326,42 @@ class AnonymizationTests(unittest.TestCase):
             self.assertEqual(audit["status"], "ok")
             self.assertNotIn(first_fragment, text)
             self.assertNotIn(second_fragment, text)
+            self.assertIn("Scientific content.", text)
+
+    def test_pdf_redaction_removes_wrapped_url_path_without_a_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            output = root / "anonymized.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text((72, 72), "A Useful Machine Learning Paper", fontsize=16)
+            page.insert_text((72, 108), "Ada Lovelace", fontsize=11)
+            page.insert_text((72, 145), "Abstract", fontsize=12)
+            page.insert_text((72, 165), "Scientific content.", fontsize=10)
+            page.insert_text(
+                (72, 690),
+                "5https://example.edu/long-path-",
+                fontsize=8,
+            )
+            page.insert_text((60, 700), "private-dataset", fontsize=8)
+            document.save(source)
+            document.close()
+
+            audit = anonymize_pdf(
+                source_pdf=source,
+                out_pdf=output,
+                title="A Useful Machine Learning Paper",
+                authors=["Ada Lovelace"],
+                max_pages=9,
+            )
+
+            anonymized = pymupdf.open(output)
+            text = "\n".join(page.get_text() for page in anonymized)
+            anonymized.close()
+            self.assertEqual(audit["status"], "ok")
+            self.assertNotIn("https://", text)
+            self.assertNotIn("private-dataset", text)
             self.assertIn("Scientific content.", text)
 
     def test_pdf_redaction_removes_lower_margin_identity_block_by_column(self) -> None:

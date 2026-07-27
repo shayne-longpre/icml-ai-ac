@@ -13,7 +13,7 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, write_jsonl
 
 
-ANONYMIZATION_VERSION = "direct_identity_redaction_v16"
+ANONYMIZATION_VERSION = "direct_identity_redaction_v17"
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
     r"(?i)(?:"
@@ -23,6 +23,8 @@ URL_PATTERN = re.compile(
     r"(?:/[^\s<>()\[\]{}]*)?"
     r")"
 )
+URL_ONLY_LINE_PATTERN = re.compile(r"(?i)^\s*\d*\s*https?://")
+URL_CONTINUATION_PATTERN = re.compile(r"^[A-Za-z0-9._~/?#=&%+\-]+$")
 ACKNOWLEDGEMENTS_PATTERN = re.compile(
     r"(?im)^[ \t]*(?:(?:\d+(?:\.\d+)*\.?|[A-Z])\s+)?"
     r"(?:acknowledg(?:e)?ments?|acknowledgement)[ \t]*$"
@@ -459,9 +461,18 @@ def anonymize_pdf(
                     )
                     url_redaction_count += 1
 
+            url_line_rects = find_url_only_line_rects(
+                page=page,
+                lines=page_lines,
+            )
+            page_rects.extend(url_line_rects)
+            url_redaction_count += len(url_line_rects)
+
             for url_match in URL_PATTERN.finditer(page.get_text()):
                 url = url_match.group(0).rstrip(".,;:!?)]}")
                 url_rects = list(page.search_for(url))
+                if not url_rects:
+                    url_rects = find_layout_fragment_rects(page, url)
                 page_rects.extend(url_rects)
                 url_redaction_count += len(url_rects)
 
@@ -723,6 +734,111 @@ def iter_page_lines(page: pymupdf.Page) -> list[tuple[str, pymupdf.Rect]]:
             if text:
                 lines.append((text, pymupdf.Rect(line["bbox"])))
     return lines
+
+
+def find_layout_fragment_rects(
+    page: pymupdf.Page,
+    fragment: str,
+) -> list[pymupdf.Rect]:
+    results: list[pymupdf.Rect] = []
+    page_dict = page.get_text("dict", sort=True)
+    for block in page_dict.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            line_text = "".join(str(span.get("text", "")) for span in spans)
+            search_start = 0
+            while True:
+                match_start = line_text.find(fragment, search_start)
+                if match_start < 0:
+                    break
+                match_end = match_start + len(fragment)
+                span_offset = 0
+                match_rect: pymupdf.Rect | None = None
+                for span in spans:
+                    span_text = str(span.get("text", ""))
+                    span_end = span_offset + len(span_text)
+                    overlap_start = max(match_start, span_offset)
+                    overlap_end = min(match_end, span_end)
+                    if overlap_start < overlap_end:
+                        span_rect = pymupdf.Rect(span["bbox"])
+                        local_start = overlap_start - span_offset
+                        local_end = overlap_end - span_offset
+                        visible_fragment = span_text[local_start:local_end]
+                        visible_rects = list(
+                            page.search_for(
+                                visible_fragment,
+                                clip=expand_rect(
+                                    span_rect,
+                                    page=page,
+                                    x_padding=1.0,
+                                    y_padding=1.0,
+                                ),
+                            )
+                        )
+                        if not visible_rects:
+                            visible_rects = [span_rect]
+                        for visible_rect in visible_rects:
+                            if match_rect is None:
+                                match_rect = pymupdf.Rect(visible_rect)
+                            else:
+                                match_rect.include_rect(visible_rect)
+                    span_offset = span_end
+                if match_rect is not None:
+                    results.append(match_rect)
+                search_start = match_end
+    return dedupe_rects(results)
+
+
+def find_url_only_line_rects(
+    *,
+    page: pymupdf.Page,
+    lines: list[tuple[str, pymupdf.Rect]],
+) -> list[pymupdf.Rect]:
+    ordered = sorted(lines, key=lambda item: (item[1].y0, item[1].x0))
+    results: list[pymupdf.Rect] = []
+    for line_text, line_rect in ordered:
+        if not URL_ONLY_LINE_PATTERN.search(line_text):
+            continue
+        results.append(
+            expand_rect(
+                line_rect,
+                page=page,
+                x_padding=2.0,
+                y_padding=1.5,
+            )
+        )
+        previous_rect = line_rect
+        while True:
+            candidates = [
+                (text, rect)
+                for text, rect in ordered
+                if 0.0 <= rect.y0 - previous_rect.y1 <= 2.5
+                and rect.x0 <= previous_rect.x1 + 3.0
+                and rect.x1 >= previous_rect.x0 - 18.0
+            ]
+            if not candidates:
+                break
+            continuation_text, continuation_rect = min(
+                candidates,
+                key=lambda item: (item[1].y0, item[1].x0),
+            )
+            stripped = continuation_text.strip()
+            if URL_ONLY_LINE_PATTERN.search(stripped):
+                break
+            if not URL_CONTINUATION_PATTERN.fullmatch(stripped):
+                break
+            results.append(
+                expand_rect(
+                    continuation_rect,
+                    page=page,
+                    x_padding=2.0,
+                    y_padding=1.5,
+                )
+            )
+            previous_rect = continuation_rect
+    return dedupe_rects(results)
 
 
 def find_first_page_identity_band(
