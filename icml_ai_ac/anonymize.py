@@ -13,7 +13,7 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, write_jsonl
 
 
-ANONYMIZATION_VERSION = "direct_identity_redaction_v23"
+ANONYMIZATION_VERSION = "direct_identity_redaction_v24"
 TEXT_DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
@@ -40,7 +40,7 @@ TEXT_IDENTITY_LINE_PATTERN = re.compile(
     r"(?i)(?:"
     r"^\s*(?:anonymous|anonymized)\s+author(?:s)?(?:\s*\([^)]*\))?\s*$|"
     r"^\s*[*†‡]?\s*(?:equal\s+contribution|correspondence\s+to|department\b|"
-    r"school\s+of\b|faculty\s+of\b|laboratory\b|institute\b|"
+    r"school\s+of\b|faculty\s+of\b|laboratory\s+of\b|institute\b|"
     r"international\s+conference\s+on\s+machine\b)|"
     r"^\s*of\b.{0,120}\buniversity\b|"
     r"\bproceedings\s+of\s+the\b|\bpmlr\s+\d+\b|"
@@ -650,6 +650,30 @@ def is_text_identity_line(line: str) -> bool:
     return bool(stripped and len(stripped) <= 220 and TEXT_IDENTITY_LINE_PATTERN.search(stripped))
 
 
+def is_text_affiliation_cue_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or len(stripped) > 220:
+        return False
+    if is_text_identity_line(stripped):
+        return True
+    body = re.sub(r"^\s*(?:\d+|[*†‡]+)\s*", "", stripped)
+    if re.match(
+        r"(?i)^(?:university|laboratory|institute)\s+of\b",
+        body,
+    ):
+        return True
+    return bool(
+        re.fullmatch(
+            r"(?:[A-Z][\w&.'’()/-]*\s+){1,10}"
+            r"(?:University|Laborator(?:y|ies)|Institute)"
+            r"(?:\s*[,;]?\s*(?:\d+|USA|U\.S\.A\.|UK|U\.K\.|Canada|"
+            r"China|France|Germany|Switzerland|Belgium|Australia|Japan|"
+            r"Korea|Singapore))*",
+            body,
+        )
+    )
+
+
 def find_identity_block_lines(
     lines: list[str],
     *,
@@ -662,14 +686,21 @@ def find_identity_block_lines(
         lookahead_end = min(len(lines), start + 13)
         if not any(direct_flags[start + 1 : lookahead_end]):
             continue
-        window_end = min(len(lines), start + 51)
-        direct_indices = [
-            index
-            for index in range(start + 1, window_end)
-            if direct_flags[index]
-        ]
-        if direct_indices:
-            block_lines.update(range(start, direct_indices[-1] + 1))
+        block_end = start
+        seen_identity = False
+        for index in range(start + 1, lookahead_end):
+            if not lines[index].strip():
+                if seen_identity:
+                    break
+                continue
+            if direct_flags[index] or is_text_affiliation_cue_line(lines[index]):
+                block_end = index
+                seen_identity = True
+                continue
+            if seen_identity or index - start > 3:
+                break
+        if seen_identity:
+            block_lines.update(range(start, block_end + 1))
     early_limit = min(len(lines), 120)
     for direct_index in range(early_limit):
         if not direct_flags[direct_index]:
@@ -679,7 +710,7 @@ def find_identity_block_lines(
         cue_indices = [
             index
             for index in range(window_start, window_end)
-            if AFFILIATION_FRAGMENT_PATTERN.search(lines[index])
+            if is_text_affiliation_cue_line(lines[index])
         ]
         if not cue_indices:
             continue

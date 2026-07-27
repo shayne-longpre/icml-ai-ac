@@ -514,6 +514,41 @@ Ada Lovelace thanks Example University.
         self.assertGreaterEqual(audit["identity_line_replacement_count"], 1)
         self.assertEqual(audit["url_replacement_count"], 1)
 
+    def test_text_anonymization_preserves_scientific_laboratory_context(self) -> None:
+        text = """Title: LabBuilder
+
+Abstract:
+The system verifies laboratory layouts from concise specifications.
+Laboratory environments must satisfy scientific safety constraints.
+
+Introduction:
+The proposed method generates laboratory layouts.
+*
+Equal contribution 1
+Shanghai Artificial Intelligence Laboratory 2
+Wuhan University 3
+Beihang University 4
+
+Conclusion:
+The laboratory design remains suitable for future work.
+"""
+
+        sanitized, audit = anonymize_representation(
+            text,
+            authors=["Ada Lovelace"],
+            strip_front_matter=False,
+        )
+
+        self.assertNotIn("Equal contribution", sanitized)
+        self.assertNotIn("Shanghai Artificial Intelligence Laboratory", sanitized)
+        self.assertNotIn("Wuhan University", sanitized)
+        self.assertNotIn("Beihang University", sanitized)
+        self.assertIn("verifies laboratory layouts", sanitized)
+        self.assertIn("Laboratory environments", sanitized)
+        self.assertIn("generates laboratory layouts", sanitized)
+        self.assertIn("laboratory design remains", sanitized)
+        self.assertEqual(audit["identity_line_replacement_count"], 5)
+
     def test_manifest_is_resumable_and_scoring_prefers_anonymized_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
