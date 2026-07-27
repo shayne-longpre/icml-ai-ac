@@ -12,6 +12,7 @@ from icml_ai_ac.anonymize import (
     anonymize_representation,
     contains_author_identity,
     filter_author_identities,
+    normalize_identity_text,
 )
 from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.scoring.runner import resolve_record_pdf_path, resolve_record_text_path
@@ -42,6 +43,7 @@ class AnonymizationTests(unittest.TestCase):
                 "Min Li",
             )
         )
+        self.assertEqual(normalize_identity_text("To Enable"), "toenable")
 
     def test_pdf_redaction_removes_identity_but_preserves_paper_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -150,19 +152,20 @@ class AnonymizationTests(unittest.TestCase):
             output = root / "anonymized.pdf"
             document = pymupdf.open()
             page = document.new_page()
-            page.insert_text((72, 72), "A Useful Machine Learning Paper", fontsize=16)
-            page.insert_text((72, 108), "Laura Lutzow1,2", fontsize=11)
-            page.insert_text((350, 108), "laura@example.edu", fontsize=9)
-            page.insert_text((72, 122), "1 Example University", fontsize=9)
-            page.insert_text((72, 145), "Abstract", fontsize=12)
-            page.insert_text((72, 165), "Scientific content.", fontsize=10)
+            page.insert_text((72, 60), "A Useful Machine Learning Paper To", fontsize=16)
+            page.insert_text((72, 78), "Enable Strong Results Under Stress", fontsize=16)
+            page.insert_text((72, 112), "Laura Lutzow1,2", fontsize=11)
+            page.insert_text((350, 112), "laura@example.edu", fontsize=9)
+            page.insert_text((72, 126), "1 Example University", fontsize=9)
+            page.insert_text((72, 149), "Abstract", fontsize=12)
+            page.insert_text((72, 169), "Scientific content.", fontsize=10)
             document.save(source)
             document.close()
 
             audit = anonymize_pdf(
                 source_pdf=source,
                 out_pdf=output,
-                title="A Useful Machine Learning Paper",
+                title="A Useful Machine Learning Paper To Enable Strong Results",
                 authors=["Laura Lützow"],
                 max_pages=9,
             )
@@ -175,6 +178,43 @@ class AnonymizationTests(unittest.TestCase):
             self.assertIn("email", audit["first_page_identity_band_reason"])
             self.assertNotIn("Laura", text)
             self.assertNotIn("Example University", text)
+            self.assertIn("Enable Strong Results Under Stress", text)
+            self.assertIn("Scientific content.", text)
+
+    def test_pdf_redaction_preserves_a_short_final_title_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            output = root / "anonymized.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text(
+                (72, 60),
+                "Composite Likelihood for Censored Time-to-Event",
+                fontsize=16,
+            )
+            page.insert_text((72, 78), "Data", fontsize=16)
+            page.insert_text((72, 112), "Laura Lutzow1", fontsize=11)
+            page.insert_text((72, 149), "Abstract", fontsize=12)
+            page.insert_text((72, 169), "Scientific content.", fontsize=10)
+            document.save(source)
+            document.close()
+
+            audit = anonymize_pdf(
+                source_pdf=source,
+                out_pdf=output,
+                title="Composite Likelihood for Censored Time-to-Event Data",
+                authors=["Laura Lützow"],
+                max_pages=9,
+            )
+
+            anonymized = pymupdf.open(output)
+            text = "\n".join(page.get_text() for page in anonymized)
+            anonymized.close()
+            self.assertEqual(audit["status"], "ok")
+            self.assertNotIn("Laura", text)
+            self.assertIn("Time-to-Event", text)
+            self.assertIn("Data", text)
             self.assertIn("Scientific content.", text)
 
     def test_pdf_redaction_accepts_an_already_anonymous_byline(self) -> None:

@@ -13,7 +13,7 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, write_jsonl
 
 
-ANONYMIZATION_VERSION = "direct_identity_redaction_v20"
+ANONYMIZATION_VERSION = "direct_identity_redaction_v22"
 TEXT_DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
@@ -884,19 +884,43 @@ def find_first_page_identity_band(
     if not abstract_rects:
         return None, []
     abstract_top = min(rect.y0 for rect in abstract_rects)
-    title_rects = []
+    title_rects: list[pymupdf.Rect] = []
+    title_candidates: list[tuple[str, pymupdf.Rect]] = []
     for text, rect in lines:
         if rect.y1 >= abstract_top:
             continue
-        normalized_line = normalize_identity_text(text)
-        if (
-            len(normalized_line) >= 8
-            and (
-                normalized_line in normalized_title
-                or normalized_title in normalized_line
-            )
+        normalized_text = normalize_identity_text(text)
+        if normalized_text:
+            title_candidates.append((normalized_text, rect))
+    title_candidates.sort(key=lambda item: (item[1].y0, item[1].x0))
+    for start, (normalized_line, rect) in enumerate(title_candidates):
+        if len(normalized_line) < 8:
+            continue
+        if not (
+            normalized_title.startswith(normalized_line)
+            or normalized_line.startswith(normalized_title)
         ):
-            title_rects.append(rect)
+            continue
+        candidate_rects = [rect]
+        accumulated = normalized_line
+        previous_rect = rect
+        for next_line, next_rect in title_candidates[start + 1 :]:
+            if next_rect.y0 - previous_rect.y1 > 8.0:
+                break
+            proposed = accumulated + next_line
+            if not (
+                normalized_title.startswith(proposed)
+                or (
+                    len(next_line) >= 8
+                    and proposed.startswith(normalized_title)
+                )
+            ):
+                break
+            candidate_rects.append(next_rect)
+            accumulated = proposed
+            previous_rect = next_rect
+        title_rects = candidate_rects
+        break
     if not title_rects:
         return None, []
     title_bottom = max(rect.y1 for rect in title_rects)
@@ -1061,23 +1085,25 @@ def anonymization_fingerprint(record: PaperRecord, *, max_pages: int) -> str:
 
 
 def normalize_identity_token(value: str) -> str:
-    decomposed = unicodedata.normalize("NFKD", value)
-    normalized = "".join(
-        character
-        for character in decomposed.casefold()
-        if character.isalnum() and not is_spacing_diacritic(character)
-    )
-    return normalize_transliteration(normalized)
+    return normalize_identity_text(value)
 
 
 def normalize_identity_text(value: str) -> str:
     decomposed = unicodedata.normalize("NFKD", value)
-    normalized = "".join(
-        character
-        for character in decomposed.casefold()
-        if character.isalnum() and not is_spacing_diacritic(character)
-    )
-    return normalize_transliteration(normalized)
+    normalized_parts: list[str] = []
+    current_part: list[str] = []
+    for character in decomposed.casefold():
+        if is_spacing_diacritic(character):
+            continue
+        if character.isalnum():
+            current_part.append(character)
+            continue
+        if current_part:
+            normalized_parts.append(normalize_transliteration("".join(current_part)))
+            current_part = []
+    if current_part:
+        normalized_parts.append(normalize_transliteration("".join(current_part)))
+    return "".join(normalized_parts)
 
 
 def is_spacing_diacritic(character: str) -> bool:
