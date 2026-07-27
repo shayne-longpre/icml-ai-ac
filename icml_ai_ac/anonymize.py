@@ -13,7 +13,7 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, write_jsonl
 
 
-ANONYMIZATION_VERSION = "direct_identity_redaction_v15"
+ANONYMIZATION_VERSION = "direct_identity_redaction_v16"
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
     r"(?i)(?:"
@@ -66,6 +66,12 @@ SOURCE_CUE_PATTERN = re.compile(
 )
 REVIEWER_FOOTER_PATTERN = re.compile(
     r"(?i)^\s*for\s+icml\s+\d{4}\s+reviewers:"
+)
+FOOTER_IDENTITY_ANCHOR_PATTERN = re.compile(
+    r"(?i)(?:"
+    r"\bcorrespondence\b|\bproceedings\s+of\s+the\b|\bpmlr\s+\d+\b|"
+    r"\bcopyright\s+\d{4}\b|\bby\s+the\s+author(?:s)?\b"
+    r")"
 )
 
 
@@ -337,6 +343,12 @@ def anonymize_pdf(
                     page_rects.append(identity_band)
                     first_page_author_band_redacted = True
                     first_page_identity_band_reason = identity_reasons
+                footer_blocks = find_first_page_footer_identity_blocks(
+                    page=page,
+                    lines=page_lines,
+                )
+                page_rects.extend(footer_blocks)
+                identity_line_count += len(footer_blocks)
             for author in authors:
                 rects: list[pymupdf.Rect] = []
                 for variant in author_name_variants(author):
@@ -408,14 +420,44 @@ def anonymize_pdf(
                     )
                     identity_line_count += 1
 
+            uri_link_groups: dict[str, list[tuple[pymupdf.Rect, str]]] = {}
             for link in page.get_links():
                 uri = str(link.get("uri") or "")
+                link_rect = pymupdf.Rect(link.get("from") or pymupdf.Rect())
+                visible_text = page.get_textbox(link_rect) if link_rect.is_valid else ""
                 if uri.lower().startswith("mailto:"):
                     page.delete_link(link)
                     mail_link_count += 1
+                    if link_rect.is_valid:
+                        page_rects.append(
+                            expand_rect(
+                                link_rect,
+                                page=page,
+                                x_padding=2.0,
+                                y_padding=2.0,
+                            )
+                        )
                 elif uri:
                     page.delete_link(link)
                     external_link_count += 1
+                    if link_rect.is_valid:
+                        uri_link_groups.setdefault(uri, []).append(
+                            (link_rect, visible_text)
+                        )
+
+            for link_fragments in uri_link_groups.values():
+                if not any(URL_PATTERN.search(text) for _, text in link_fragments):
+                    continue
+                for link_rect, _ in link_fragments:
+                    page_rects.append(
+                        expand_rect(
+                            link_rect,
+                            page=page,
+                            x_padding=2.0,
+                            y_padding=2.0,
+                        )
+                    )
+                    url_redaction_count += 1
 
             for url_match in URL_PATTERN.finditer(page.get_text()):
                 url = url_match.group(0).rstrip(".,;:!?)]}")
@@ -748,6 +790,65 @@ def find_first_page_identity_band(
     return pymupdf.Rect(0.0, y0, page.rect.width, y1), reasons
 
 
+def find_first_page_footer_identity_blocks(
+    *,
+    page: pymupdf.Page,
+    lines: list[tuple[str, pymupdf.Rect]],
+) -> list[pymupdf.Rect]:
+    lower_lines = [
+        (text, rect)
+        for text, rect in lines
+        if rect.y0 > page.rect.height * 0.70
+    ]
+    blocks: list[pymupdf.Rect] = []
+    midpoint = page.rect.width / 2.0
+    for column_index, (column_left, column_right) in enumerate(
+        ((0.0, midpoint), (midpoint, page.rect.width))
+    ):
+        column_lines = [
+            (text, rect)
+            for text, rect in lower_lines
+            if int((rect.x0 + rect.x1) / 2.0 >= midpoint) == column_index
+        ]
+        anchors = [
+            (text, rect)
+            for text, rect in column_lines
+            if EMAIL_PATTERN.search(text)
+            or FOOTER_IDENTITY_ANCHOR_PATTERN.search(text)
+        ]
+        if not anchors:
+            continue
+        identity_lines = [
+            (text, rect)
+            for text, rect in column_lines
+            if EMAIL_PATTERN.search(text)
+            or IDENTITY_LINE_PATTERN.search(text)
+            or AFFILIATION_FRAGMENT_PATTERN.search(text)
+        ]
+        if not identity_lines:
+            continue
+        y0 = min(rect.y0 for _, rect in identity_lines)
+        y1 = max(rect.y1 for _, rect in identity_lines)
+        block_lines = [
+            rect
+            for _, rect in column_lines
+            if rect.y1 >= y0 and rect.y0 <= y1
+        ]
+        if not block_lines:
+            continue
+        x0 = max(column_left, min(rect.x0 for rect in block_lines) - 3.0)
+        x1 = min(column_right, max(rect.x1 for rect in block_lines) + 3.0)
+        blocks.append(
+            pymupdf.Rect(
+                x0,
+                max(0.0, y0 - 3.0),
+                x1,
+                min(page.rect.height, y1 + 3.0),
+            )
+        )
+    return blocks
+
+
 def dedupe_rects(rects: list[pymupdf.Rect]) -> list[pymupdf.Rect]:
     unique: list[pymupdf.Rect] = []
     seen: set[tuple[int, int, int, int]] = set()
@@ -901,14 +1002,32 @@ def line_contains_name_variant(line: str, variant: str) -> bool:
     name_tokens = [token for token in name_tokens if token]
     if len(name_tokens) >= 2:
         normalized_line = "".join(token for token in tokens if token)
+        token_boundaries = {0}
+        offset = 0
+        for token in tokens:
+            if token:
+                offset += len(token)
+                token_boundaries.add(offset)
         first_name = name_tokens[0]
         last_name = name_tokens[-1]
-        first_at = normalized_line.find(first_name)
-        if first_at >= 0:
+        for first_at in sorted(token_boundaries):
             first_end = first_at + len(first_name)
-            last_at = normalized_line.find(last_name, first_end)
-            if 0 <= last_at - first_end <= 40:
-                return True
+            if (
+                first_end not in token_boundaries
+                or not normalized_line.startswith(first_name, first_at)
+            ):
+                continue
+            for last_at in sorted(
+                boundary for boundary in token_boundaries if boundary >= first_end
+            ):
+                last_end = last_at + len(last_name)
+                if last_at - first_end > 40:
+                    break
+                if (
+                    last_end in token_boundaries
+                    and normalized_line.startswith(last_name, last_at)
+                ):
+                    return True
     return False
 
 

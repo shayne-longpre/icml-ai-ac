@@ -24,6 +24,12 @@ class AnonymizationTests(unittest.TestCase):
         self.assertTrue(contains_author_identity("Mark N. Müller", "Mark Niklas Mueller"))
         self.assertTrue(contains_author_identity("O˘guz Kaan Y¨uksel 1", "Oğuz Yüksel"))
         self.assertFalse(contains_author_identity("Mueller et al. provide a baseline.", "Mark Niklas Mueller"))
+        self.assertFalse(
+            contains_author_identity(
+                r"\min \limits_{\lVert S_l \rVert_0 \le k}",
+                "Min Li",
+            )
+        )
 
     def test_pdf_redaction_removes_identity_but_preserves_paper_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -234,6 +240,87 @@ class AnonymizationTests(unittest.TestCase):
             self.assertNotIn("https://", text)
             self.assertNotIn("example.edu", text)
             self.assertIn("Scientific content.", text)
+
+    def test_pdf_redaction_removes_multiline_link_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            output = root / "anonymized.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text((72, 72), "A Useful Machine Learning Paper", fontsize=16)
+            page.insert_text((72, 108), "Ada Lovelace", fontsize=11)
+            page.insert_text((72, 145), "Abstract", fontsize=12)
+            page.insert_text((72, 165), "Scientific content.", fontsize=10)
+            first_fragment = "https://example.edu/"
+            second_fragment = "project/private-name"
+            page.insert_text((72, 700), first_fragment, fontsize=8)
+            page.insert_text((72, 714), second_fragment, fontsize=8)
+            uri = f"{first_fragment}{second_fragment}"
+            for fragment in (first_fragment, second_fragment):
+                rect = page.search_for(fragment)[0]
+                page.insert_link(
+                    {
+                        "kind": pymupdf.LINK_URI,
+                        "from": rect,
+                        "uri": uri,
+                    }
+                )
+            document.save(source)
+            document.close()
+
+            audit = anonymize_pdf(
+                source_pdf=source,
+                out_pdf=output,
+                title="A Useful Machine Learning Paper",
+                authors=["Ada Lovelace"],
+                max_pages=9,
+            )
+
+            anonymized = pymupdf.open(output)
+            text = "\n".join(page.get_text() for page in anonymized)
+            anonymized.close()
+            self.assertEqual(audit["status"], "ok")
+            self.assertNotIn(first_fragment, text)
+            self.assertNotIn(second_fragment, text)
+            self.assertIn("Scientific content.", text)
+
+    def test_pdf_redaction_removes_lower_margin_identity_block_by_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            output = root / "anonymized.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text((72, 72), "A Useful Machine Learning Paper", fontsize=16)
+            page.insert_text((72, 108), "Ada Lovelace", fontsize=11)
+            page.insert_text((72, 145), "Abstract", fontsize=12)
+            page.insert_text((72, 165), "Scientific content.", fontsize=10)
+            page.insert_text((72, 650), "1 School of Computing, Example University", fontsize=8)
+            page.insert_text((72, 664), "Shenzhen, China", fontsize=8)
+            page.insert_text((72, 678), "Correspondence to: ada@example.edu", fontsize=8)
+            page.insert_text((72, 692), "Proceedings of the 43rd ICML", fontsize=8)
+            page.insert_text((330, 650), "Right-column scientific content.", fontsize=8)
+            document.save(source)
+            document.close()
+
+            audit = anonymize_pdf(
+                source_pdf=source,
+                out_pdf=output,
+                title="A Useful Machine Learning Paper",
+                authors=["Ada Lovelace"],
+                max_pages=9,
+            )
+
+            anonymized = pymupdf.open(output)
+            text = "\n".join(page.get_text() for page in anonymized)
+            anonymized.close()
+            self.assertEqual(audit["status"], "ok")
+            self.assertNotIn("School of Computing", text)
+            self.assertNotIn("Shenzhen, China", text)
+            self.assertNotIn("Correspondence", text)
+            self.assertNotIn("Proceedings", text)
+            self.assertIn("Right-column scientific content.", text)
 
     def test_short_uppercase_metadata_identity_is_ignored(self) -> None:
         active, ignored = filter_author_identities(
