@@ -179,9 +179,16 @@ class AnonymizationTests(unittest.TestCase):
             document = pymupdf.open()
             page = document.new_page()
             page.insert_text((72, 72), "A Useful Machine Learning Paper", fontsize=16)
-            page.insert_text((220, 108), "Anonymous Author(s)", fontsize=11)
+            page.insert_text((24, 88), "003", fontsize=10)
+            page.insert_text((220, 108), "Anonymous Author(s)1 2", fontsize=11)
             page.insert_text((72, 145), "Abstract", fontsize=12)
             page.insert_text((72, 165), "Scientific content.", fontsize=10)
+            page.insert_text(
+                (72, 680),
+                "Preliminary work. Under review by ICML.",
+                fontsize=8,
+            )
+            page.insert_text((72, 692), "Do not distribute.", fontsize=8)
             page.insert_text(
                 (72, 700),
                 "For ICML 2026 reviewers: follow the Reviewer Console policy.",
@@ -214,6 +221,9 @@ class AnonymizationTests(unittest.TestCase):
             self.assertNotIn("Anonymous Author", text)
             self.assertNotIn("Reviewer Console", text)
             self.assertNotIn("assigned LLM policy", text)
+            self.assertNotIn("Under review", text)
+            self.assertNotIn("Do not distribute", text)
+            self.assertIn("A Useful Machine Learning Paper", text)
             self.assertIn("Scientific content.", text)
 
     def test_pdf_redaction_removes_urls_after_superscript_markers(self) -> None:

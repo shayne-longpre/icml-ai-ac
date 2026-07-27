@@ -13,7 +13,7 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, write_jsonl
 
 
-ANONYMIZATION_VERSION = "direct_identity_redaction_v18"
+ANONYMIZATION_VERSION = "direct_identity_redaction_v19"
 TEXT_DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
@@ -58,7 +58,8 @@ AFFILIATION_FRAGMENT_PATTERN = re.compile(
     r")"
 )
 ANONYMOUS_AUTHOR_PATTERN = re.compile(
-    r"(?i)^\s*(?:anonymous|anonymized)\s+author(?:s)?(?:\s*\([^)]*\))?\s*$"
+    r"(?i)^\s*(?:anonymous|anonymized)\s+author(?:s)?(?:\s*\([^)]*\))?"
+    r"(?:\s*[*†‡]?\d+)*\s*$"
 )
 SOURCE_CUE_PATTERN = re.compile(
     r"(?i)^\s*(?:"
@@ -69,6 +70,9 @@ SOURCE_CUE_PATTERN = re.compile(
 )
 REVIEWER_FOOTER_PATTERN = re.compile(
     r"(?i)^\s*for\s+icml\s+\d{4}\s+reviewers:"
+)
+REVIEW_STATUS_FOOTER_PATTERN = re.compile(
+    r"(?i)^\s*(?:preliminary\s+work\.\s*)?under\s+review\s+by\b"
 )
 FOOTER_IDENTITY_ANCHOR_PATTERN = re.compile(
     r"(?i)(?:"
@@ -391,6 +395,26 @@ def anonymize_pdf(
                             0.0,
                             max(0.0, line_rect.y0 - 2.0),
                             page.rect.width,
+                            page.rect.height,
+                        )
+                    )
+                    identity_line_count += 1
+                elif (
+                    page_index == 0
+                    and line_rect.y0 > page.rect.height * 0.70
+                    and REVIEW_STATUS_FOOTER_PATTERN.search(line_text)
+                ):
+                    midpoint = page.rect.width / 2.0
+                    x0, x1 = (
+                        (0.0, midpoint)
+                        if (line_rect.x0 + line_rect.x1) / 2.0 < midpoint
+                        else (midpoint, page.rect.width)
+                    )
+                    page_rects.append(
+                        pymupdf.Rect(
+                            x0,
+                            max(0.0, line_rect.y0 - 2.0),
+                            x1,
                             page.rect.height,
                         )
                     )
@@ -900,7 +924,10 @@ def find_first_page_identity_band(
     if not reasons:
         return None, []
 
-    y0 = max(0.0, min(rect.y0 for _, rect in header_lines) - 3.0)
+    y0 = max(
+        title_bottom + 1.0,
+        min(rect.y0 for _, rect in header_lines) - 3.0,
+    )
     y1 = min(page.rect.height, abstract_top - 2.0)
     if y1 <= y0:
         return None, []
