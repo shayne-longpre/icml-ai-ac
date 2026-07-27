@@ -14,6 +14,7 @@ from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, w
 
 
 ANONYMIZATION_VERSION = "direct_identity_redaction_v18"
+TEXT_DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
     r"(?i)(?:"
@@ -724,7 +725,7 @@ def find_name_rects(words: list[tuple[Any, ...]], name: str) -> list[pymupdf.Rec
 
 def iter_page_lines(page: pymupdf.Page) -> list[tuple[str, pymupdf.Rect]]:
     lines: list[tuple[str, pymupdf.Rect]] = []
-    page_dict = page.get_text("dict", sort=True)
+    page_dict = page.get_text("dict", sort=True, flags=TEXT_DICT_FLAGS)
     for block in page_dict.get("blocks", []):
         if block.get("type") != 0:
             continue
@@ -741,7 +742,7 @@ def find_layout_fragment_rects(
     fragment: str,
 ) -> list[pymupdf.Rect]:
     results: list[pymupdf.Rect] = []
-    page_dict = page.get_text("dict", sort=True)
+    page_dict = page.get_text("dict", sort=True, flags=TEXT_DICT_FLAGS)
     for block in page_dict.get("blocks", []):
         if block.get("type") != 0:
             continue
