@@ -13,7 +13,7 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, write_jsonl
 
 
-ANONYMIZATION_VERSION = "direct_identity_redaction_v19"
+ANONYMIZATION_VERSION = "direct_identity_redaction_v20"
 TEXT_DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
@@ -1062,14 +1062,32 @@ def anonymization_fingerprint(record: PaperRecord, *, max_pages: int) -> str:
 
 def normalize_identity_token(value: str) -> str:
     decomposed = unicodedata.normalize("NFKD", value)
-    normalized = "".join(character for character in decomposed.casefold() if character.isalnum())
+    normalized = "".join(
+        character
+        for character in decomposed.casefold()
+        if character.isalnum() and not is_spacing_diacritic(character)
+    )
     return normalize_transliteration(normalized)
 
 
 def normalize_identity_text(value: str) -> str:
     decomposed = unicodedata.normalize("NFKD", value)
-    normalized = "".join(character for character in decomposed.casefold() if character.isalnum())
+    normalized = "".join(
+        character
+        for character in decomposed.casefold()
+        if character.isalnum() and not is_spacing_diacritic(character)
+    )
     return normalize_transliteration(normalized)
+
+
+def is_spacing_diacritic(character: str) -> bool:
+    if unicodedata.category(character) != "Lm":
+        return False
+    name = unicodedata.name(character, "")
+    return any(
+        term in name
+        for term in ("ACCENT", "CARON", "MACRON", "BREVE", "TILDE", "RING")
+    )
 
 
 def normalize_transliteration(value: str) -> str:

@@ -25,6 +25,12 @@ class AnonymizationTests(unittest.TestCase):
         self.assertTrue(contains_author_identity("O˘guz Kaan Y¨uksel 1", "Oğuz Yüksel"))
         self.assertTrue(
             contains_author_identity(
+                "Cristina Gˆarbacea 1",
+                "Cristina Garbacea",
+            )
+        )
+        self.assertTrue(
+            contains_author_identity(
                 "Mikael Møller Høgsgaard 1 2",
                 "Mikael Moller Hogsgaard",
             )
