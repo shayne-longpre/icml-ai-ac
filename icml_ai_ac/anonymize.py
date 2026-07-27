@@ -13,7 +13,7 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, write_jsonl
 
 
-ANONYMIZATION_VERSION = "direct_identity_redaction_v24"
+ANONYMIZATION_VERSION = "direct_identity_redaction_v25"
 TEXT_DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
@@ -955,7 +955,30 @@ def find_first_page_identity_band(
         title_rects = candidate_rects
         break
     if not title_rects:
-        return None, []
+        fallback_lines: list[pymupdf.Rect] = []
+        fallback_reasons: list[str] = []
+        for text, rect in lines:
+            if rect.y1 >= abstract_top:
+                continue
+            if any(contains_author_identity(text, author) for author in authors):
+                fallback_lines.append(rect)
+                if "known_author_line" not in fallback_reasons:
+                    fallback_reasons.append("known_author_line")
+            if EMAIL_PATTERN.search(text):
+                fallback_lines.append(rect)
+                if "email" not in fallback_reasons:
+                    fallback_reasons.append("email")
+            if ANONYMOUS_AUTHOR_PATTERN.search(text):
+                fallback_lines.append(rect)
+                if "anonymous_author" not in fallback_reasons:
+                    fallback_reasons.append("anonymous_author")
+        if not fallback_lines:
+            return None, []
+        y0 = max(0.0, min(rect.y0 for rect in fallback_lines) - 3.0)
+        y1 = min(page.rect.height, abstract_top - 2.0)
+        if y1 <= y0:
+            return None, []
+        return pymupdf.Rect(0.0, y0, page.rect.width, y1), fallback_reasons
     title_bottom = max(rect.y1 for rect in title_rects)
     header_lines = [
         (text, rect)

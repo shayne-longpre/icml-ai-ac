@@ -217,6 +217,48 @@ class AnonymizationTests(unittest.TestCase):
             self.assertIn("Data", text)
             self.assertIn("Scientific content.", text)
 
+    def test_pdf_redaction_falls_back_to_a_pre_abstract_author_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            output = root / "anonymized.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text(
+                (72, 60),
+                "Position: The Text-Centric Bias in Foundation Models",
+                fontsize=16,
+            )
+            page.insert_text((72, 96), "Deepak Babu Piskala 1", fontsize=11)
+            page.insert_text((72, 133), "Abstract", fontsize=12)
+            page.insert_text((72, 153), "Scientific content.", fontsize=10)
+            document.save(source)
+            document.close()
+
+            audit = anonymize_pdf(
+                source_pdf=source,
+                out_pdf=output,
+                title=(
+                    "Position: Beyond Text The Text-Centric Bias "
+                    "in Foundation Models"
+                ),
+                authors=["Deepak Piskala"],
+                max_pages=9,
+            )
+
+            anonymized = pymupdf.open(output)
+            text = "\n".join(page.get_text() for page in anonymized)
+            anonymized.close()
+            self.assertEqual(audit["status"], "ok")
+            self.assertEqual(
+                audit["first_page_identity_band_reason"],
+                ["known_author_line"],
+            )
+            self.assertNotIn("Deepak", text)
+            self.assertNotIn("Piskala", text)
+            self.assertIn("Text-Centric Bias", text)
+            self.assertIn("Scientific content.", text)
+
     def test_pdf_redaction_accepts_an_already_anonymous_byline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
