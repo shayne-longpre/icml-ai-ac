@@ -13,7 +13,7 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, write_jsonl
 
 
-ANONYMIZATION_VERSION = "direct_identity_redaction_v17"
+ANONYMIZATION_VERSION = "direct_identity_redaction_v18"
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
     r"(?i)(?:"
@@ -1045,6 +1045,20 @@ def normalize_identity_text(value: str) -> str:
 
 
 def normalize_transliteration(value: str) -> str:
+    value = value.translate(
+        str.maketrans(
+            {
+                "æ": "a",
+                "đ": "d",
+                "ð": "d",
+                "ı": "i",
+                "ł": "l",
+                "œ": "o",
+                "ø": "o",
+                "þ": "th",
+            }
+        )
+    )
     return value.replace("ae", "a").replace("oe", "o").replace("ue", "u")
 
 
