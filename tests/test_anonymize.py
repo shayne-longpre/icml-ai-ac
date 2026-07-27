@@ -193,10 +193,10 @@ class AnonymizationTests(unittest.TestCase):
                 "Composite Likelihood for Censored Time-to-Event",
                 fontsize=16,
             )
-            page.insert_text((72, 78), "Data", fontsize=16)
-            page.insert_text((72, 112), "Laura Lutzow1", fontsize=11)
-            page.insert_text((72, 149), "Abstract", fontsize=12)
-            page.insert_text((72, 169), "Scientific content.", fontsize=10)
+            page.insert_text((72, 96), "Data", fontsize=16)
+            page.insert_text((72, 130), "Laura Lutzow1", fontsize=11)
+            page.insert_text((72, 167), "Abstract", fontsize=12)
+            page.insert_text((72, 187), "Scientific content.", fontsize=10)
             document.save(source)
             document.close()
 

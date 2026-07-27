@@ -13,7 +13,7 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, write_jsonl
 
 
-ANONYMIZATION_VERSION = "direct_identity_redaction_v22"
+ANONYMIZATION_VERSION = "direct_identity_redaction_v23"
 TEXT_DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
@@ -905,13 +905,15 @@ def find_first_page_identity_band(
         accumulated = normalized_line
         previous_rect = rect
         for next_line, next_rect in title_candidates[start + 1 :]:
-            if next_rect.y0 - previous_rect.y1 > 8.0:
+            max_line_gap = max(8.0, previous_rect.height * 1.25)
+            if next_rect.y0 - previous_rect.y1 > max_line_gap:
                 break
             proposed = accumulated + next_line
             if not (
                 normalized_title.startswith(proposed)
                 or (
                     len(next_line) >= 8
+                    and next_rect.height >= previous_rect.height * 0.8
                     and proposed.startswith(normalized_title)
                 )
             ):
