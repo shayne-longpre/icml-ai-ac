@@ -22,16 +22,21 @@ canonical manifest for post hoc joins.
 
 ## Stage 0 Gate
 
-Identity redaction is complete under `direct_identity_redaction_v25` plus a
-selective `direct_identity_redaction_v26` correction.
+Identity redaction is complete under the validated v25 base plus selective
+v26-v33 corrections.
 The model-facing manifest contains 6,617/6,617 successful rows, 6,617 validated
-PDF derivatives, and 19,851 validated text artifacts. Version 26 rebuilt 341
-records to remove names split across extracted lines and residual
-correspondence contact lines; the other 6,276 validated v25 records were left
+PDF derivatives, and 19,851 validated text artifacts. The final manifest has
+4,236 v25, 153 v26, 1,265 v27, 492 v28, 362 v29, 27 v30, 14 v31, 60 v32,
+and eight v33 records. The selective corrections remove wrapped names,
+contact lines, affiliation blocks displaced by two-column extraction, accented
+or acronym-only institutions, and wrapped employment/contribution notes. Every
+corrected row reuses the checksum-identical passed PDF; unaffected rows remain
 unchanged. The final audit reports zero errors. All 6,049 metadata titles
 present in the source title region were retained, while 568 metadata/PDF title
 differences are recorded as provenance drift. Canonical PDFs are unchanged.
-No paid ranking request was made before this gate passed.
+The 48 Stage 2 batches issued before the affiliation diagnostic cost $1.1134;
+their prompts and responses are preserved in a clearly labeled pre-v27 archive
+and excluded from every production aggregate.
 
 ## Stage 1 Gate
 

@@ -663,6 +663,317 @@ The laboratory design remains suitable for future work.
         self.assertIn("laboratory design remains", sanitized)
         self.assertEqual(audit["identity_line_replacement_count"], 5)
 
+    def test_text_anonymization_removes_wrapped_affiliation_block(self) -> None:
+        text = """Title: A Useful Paper
+
+Abstract
+The method improves segmentation under difficult conditions.
+1
+Engineering Research Center of Learning-Based Intelligent
+System, Ministry of Education, Tianjin University of Technol-
+ogy, Tianjin 300384, China 2
+Key Laboratory of Computer Vision
+and System, Ministry of Education, Tianjin, China
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+1 Introduction
+The scientific discussion remains.
+"""
+
+        sanitized, audit = anonymize_representation(
+            text,
+            authors=[],
+            strip_front_matter=True,
+        )
+
+        self.assertNotIn("Engineering Research Center", sanitized)
+        self.assertNotIn("Tianjin University", sanitized)
+        self.assertNotIn("Key Laboratory", sanitized)
+        self.assertIn("improves segmentation", sanitized)
+        self.assertIn("scientific discussion remains", sanitized)
+        self.assertGreaterEqual(audit["identity_line_replacement_count"], 7)
+        second_pass, _ = anonymize_representation(
+            sanitized,
+            authors=[],
+            strip_front_matter=False,
+        )
+        self.assertEqual(second_pass, sanitized)
+
+    def test_text_anonymization_converges_across_identity_block_gaps(self) -> None:
+        text = """Title: A Useful Paper
+
+Abstract
+The method is useful.
+*
+Work done during an internship at Example Corp. †
+Project Leader.
+‡
+Corresponding Author. 1
+The Hong Kong University of Science and Technology 2
+Example Corp. 3
+National University of Singapore.
+Correspondence to: Ada Lovelace <ada@example.edu>.
+Proceedings of the Conference.
+Introduction
+The scientific discussion remains.
+"""
+
+        sanitized, audit = anonymize_representation(
+            text,
+            authors=["Ada Lovelace"],
+            strip_front_matter=False,
+        )
+        second_pass, _ = anonymize_representation(
+            sanitized,
+            authors=[],
+            strip_front_matter=False,
+        )
+
+        self.assertNotIn("Project Leader", sanitized)
+        self.assertNotIn("Hong Kong University", sanitized)
+        self.assertNotIn("Correspondence to", sanitized)
+        self.assertIn("scientific discussion remains", sanitized)
+        self.assertGreaterEqual(audit["identity_line_replacement_count"], 9)
+        self.assertEqual(second_pass, sanitized)
+
+    def test_text_anonymization_redacts_affiliation_exposed_by_url_removal(self) -> None:
+        text = """Title: A Useful Paper
+
+Abstract
+The method is useful.
+[IDENTITY REDACTED]
+https://example.edu/project Department of Computer Science
+[IDENTITY REDACTED]
+Introduction
+The scientific discussion remains.
+"""
+
+        sanitized, _ = anonymize_representation(
+            text,
+            authors=[],
+            strip_front_matter=False,
+        )
+        second_pass, _ = anonymize_representation(
+            sanitized,
+            authors=[],
+            strip_front_matter=False,
+        )
+
+        self.assertNotIn("Department of Computer Science", sanitized)
+        self.assertIn("scientific discussion remains", sanitized)
+        self.assertEqual(second_pass, sanitized)
+
+    def test_text_anonymization_removes_accented_affiliation_footnote_block(
+        self,
+    ) -> None:
+        text = """Title: A Useful Paper
+
+Abstract
+The method improves optimization.
+1
+Sorbonne Universite and Université Paris Cité, CNRS,
+Laboratoire de Probabilités, Paris, France 2
+Mila, Montréal, Canada 3
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+Introduction
+The scientific discussion remains.
+"""
+
+        sanitized, _ = anonymize_representation(
+            text,
+            authors=[],
+            strip_front_matter=False,
+        )
+
+        self.assertNotIn("Sorbonne", sanitized)
+        self.assertNotIn("Laboratoire", sanitized)
+        self.assertNotIn("Mila", sanitized)
+        self.assertIn("method improves optimization", sanitized)
+        self.assertIn("scientific discussion remains", sanitized)
+
+    def test_text_anonymization_removes_employment_identity_notes(self) -> None:
+        text = """Title: A Useful Paper
+
+Abstract
+The method is useful.
+*
+Part of this work was done while at Google Research.
+1
+AWS Agentic AI 2
+Microsoft 3
+Google Research. Correspondence to:
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+Introduction
+The scientific discussion remains.
+"""
+
+        sanitized, _ = anonymize_representation(
+            text,
+            authors=[],
+            strip_front_matter=False,
+        )
+
+        self.assertNotIn("Google Research", sanitized)
+        self.assertNotIn("AWS Agentic AI", sanitized)
+        self.assertNotIn("Microsoft", sanitized)
+        self.assertIn("scientific discussion remains", sanitized)
+
+    def test_text_anonymization_removes_structural_acronym_affiliations(
+        self,
+    ) -> None:
+        text = """Title: A Useful Paper
+
+Abstract
+The method is useful.
+1
+EuroSafeAI 2
+ETH Zurich 3
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+Introduction
+The scientific discussion remains.
+"""
+
+        sanitized, _ = anonymize_representation(
+            text,
+            authors=[],
+            strip_front_matter=False,
+        )
+
+        self.assertNotIn("EuroSafeAI", sanitized)
+        self.assertNotIn("ETH Zurich", sanitized)
+        self.assertIn("scientific discussion remains", sanitized)
+
+    def test_structural_affiliation_rule_preserves_equation_context(self) -> None:
+        text = """Title: A Useful Paper
+
+Abstract
+The method minimizes
+1
+n X
+i=1
+f(i)
+(x)
+, (1)
+where only agent i has access to first-order information.
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+Introduction
+The scientific discussion remains.
+"""
+
+        sanitized, _ = anonymize_representation(
+            text,
+            authors=[],
+            strip_front_matter=False,
+        )
+
+        self.assertIn("first-order information", sanitized)
+        self.assertIn("f(i)", sanitized)
+        self.assertIn("scientific discussion remains", sanitized)
+
+    def test_structural_affiliation_rule_handles_abbreviated_school(self) -> None:
+        text = """Title: A Useful Paper
+
+Abstract
+The method is useful.
+1
+Sch. of Artificial Intelligence and Sch. of Computer Science
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+Introduction
+The scientific discussion remains.
+"""
+
+        sanitized, _ = anonymize_representation(
+            text,
+            authors=[],
+            strip_front_matter=False,
+        )
+
+        self.assertNotIn("Artificial Intelligence", sanitized)
+        self.assertIn("scientific discussion remains", sanitized)
+
+    def test_structural_affiliation_rule_handles_titlecase_fragment(self) -> None:
+        text = """Title: A Useful Paper
+
+Abstract
+The method is useful.
+1
+Computer, Electrical and Mathematical Sciences and Engi-
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+Introduction
+The scientific discussion remains.
+"""
+
+        sanitized, _ = anonymize_representation(
+            text,
+            authors=[],
+            strip_front_matter=False,
+        )
+
+        self.assertNotIn("Computer, Electrical", sanitized)
+        self.assertIn("scientific discussion remains", sanitized)
+
+    def test_text_anonymization_removes_wrapped_internship_note(self) -> None:
+        text = """Title: A Useful Paper
+
+Abstract
+The method is useful.
+Work done during Yuanjian
+Xu's internship at Microsoft Research Asia. 1
+HKUST-GZ 2
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+Introduction
+The scientific discussion remains.
+"""
+
+        sanitized, _ = anonymize_representation(
+            text,
+            authors=[],
+            strip_front_matter=False,
+        )
+
+        self.assertNotIn("Yuanjian", sanitized)
+        self.assertNotIn("internship at", sanitized)
+        self.assertNotIn("Microsoft Research Asia", sanitized)
+        self.assertIn("scientific discussion remains", sanitized)
+
+    def test_text_anonymization_removes_compact_identity_note_variants(self) -> None:
+        text = """Title: A Useful Paper
+
+Abstract
+The method is useful.
+*Equal contributions. Authors are members of Example Research.
+Core contributors. See full author list.
+1Work done while at UCLA.
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+[IDENTITY REDACTED]
+Introduction
+The scientific discussion remains.
+"""
+
+        sanitized, _ = anonymize_representation(
+            text,
+            authors=[],
+            strip_front_matter=False,
+        )
+
+        self.assertNotIn("Equal contributions", sanitized)
+        self.assertNotIn("Core contributors", sanitized)
+        self.assertNotIn("UCLA", sanitized)
+        self.assertIn("scientific discussion remains", sanitized)
+
     def test_manifest_is_resumable_and_scoring_prefers_anonymized_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -204,21 +204,26 @@ A separate 50-paper ICML 2025 run also passed 50/50. This is direct identity
 redaction, not guaranteed anonymity: titles, self-citations, project names, and
 model memory can still identify papers.
 
-The final `direct_identity_redaction_v25` production gate completed on
-2026-07-27 with 6,617/6,617 records, zero exclusions, 6,617 validated PDFs, and
-19,851 validated text artifacts. It avoided a blanket rerun: 5,895 successful
-v24 records were promoted after checksum and clean-audit validation, 654 older
-PDFs were independently revalidated and reused, and only 68 PDFs were
-regenerated. Text was regenerated for the 722 records that had not completed
-v24. The final audit is
-`data/model_runs/icml_2026_full_launch/stage00_v25_final_audit.json`; it reports
-zero errors after checking record structure, source and derivative checksums,
-fingerprints, signatures, page counts, residual identities, links, PDF
-metadata, and retention for every artifact. A full-corpus title-region scan
-retained all 6,049 metadata titles actually present above the source Abstract;
-568 metadata titles differ from the camera-ready PDF and are recorded as
-provenance drift. The original fail-closed audit and the narrow correction
-audit are preserved separately.
+The final production gate completed on 2026-07-27 with 6,617/6,617 records,
+zero exclusions, 6,617 validated PDFs, and 19,851 validated text artifacts.
+The v25 base avoided a blanket rerun by promoting checksum-verified derivatives
+and regenerating only incomplete or anomalous rows. No later text correction
+rewrote a PDF. Selective v26-v33 passes removed hyphen-wrapped names,
+correspondence lines, institution blocks displaced below the Abstract by
+two-column extraction, accented and acronym-only affiliations, and wrapped
+employment/contribution notes. The final version counts are 4,236 v25, 153
+v26, 1,265 v27, 492 v28, 362 v29, 27 v30, 14 v31, 60 v32, and eight v33.
+
+The final audit is
+`data/model_runs/icml_2026_full_launch/stage00_v33_final_audit.json`; it reports
+zero errors after checking exact coverage, blind record structure, text
+idempotence, source and derivative checksums, signatures, page counts,
+residual identities/contact cues, links, and PDF metadata. A separate broad
+layout diagnostic leaves only ten inspected equation/introduction cases and no
+affiliation-like fragment. The title-region audit retained all 6,049 metadata
+titles actually present above the source Abstract; 568 metadata titles differ
+from the camera-ready PDF and remain recorded as provenance drift. Every
+failed gate and selective checkpoint is preserved.
 
 If a manifest already contains explicit PDF URLs, download them directly:
 

@@ -13,7 +13,7 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.storage import append_jsonl, read_jsonl_if_exists, write_json, write_jsonl
 
 
-ANONYMIZATION_VERSION = "direct_identity_redaction_v26"
+ANONYMIZATION_VERSION = "direct_identity_redaction_v33"
 TEXT_DICT_FLAGS = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
 EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
 URL_PATTERN = re.compile(
@@ -26,6 +26,18 @@ URL_PATTERN = re.compile(
 )
 URL_ONLY_LINE_PATTERN = re.compile(r"(?i)^\s*\d*\s*https?://")
 URL_CONTINUATION_PATTERN = re.compile(r"^[A-Za-z0-9._~/?#=&%+\-]+$")
+TEXT_IDENTITY_NOTE_PATTERN = re.compile(
+    r"(?i)(?:"
+    r"\b(?:research\s+)?internship\s+at\b|"
+    r"\b(?:co-?)?corresponding\s+authors?\b|"
+    r"\b(?:equal\s+contributions?|core\s+contributors?)\b|"
+    r"\bauthors?\s+are\s+members\b|"
+    r"(?:\b|[1-9])work\s+(?:was\s+)?(?:done|completed)\s+"
+    r"(?:during\s+an?\s+internship|while\s+at|"
+    r"at\s+(?:their\s+)?previous\s+affiliation)\b|"
+    r"\bwork\s+done\s+during\b"
+    r")"
+)
 ACKNOWLEDGEMENTS_PATTERN = re.compile(
     r"(?im)^[ \t]*(?:(?:\d+(?:\.\d+)*\.?|[A-Z])\s+)?"
     r"(?:acknowledg(?:e)?ments?|acknowledgement)[ \t]*$"
@@ -38,8 +50,15 @@ IDENTITY_LINE_PATTERN = re.compile(
 )
 TEXT_IDENTITY_LINE_PATTERN = re.compile(
     r"(?i)(?:"
+    r"^\s*\[identity\s+redacted\]\s*$|"
     r"^\s*(?:anonymous|anonymized)\s+author(?:s)?(?:\s*\([^)]*\))?\s*$|"
-    r"^\s*[*†‡]?\s*(?:equal\s+contribution|correspondence\s+to|department\b|"
+    r"^\s*[*†‡]?\s*(?:equal\s*contribution|correspondence\s+to|"
+    r"(?:co-?)?corresponding\s+authors?|(?:co-?)?senior\s+authors?|"
+    r"lead\s+author|project\s+leader|"
+    r"(?:part\s+of\s+)?(?:this\s+)?work\s+(?:was\s+)?"
+    r"(?:done|performed|conducted)\b|now\s+at\b|"
+    r"all\s+authors?\s+have\s+significantly\s+contributed|"
+    r"the\s+order\s+does\s+not\s+indicate\b|department\b|"
     r"school\s+of\b|faculty\s+of\b|laboratory\s+of\b|institute\b|"
     r"international\s+conference\s+on\s+machine\b)|"
     r"\bcorrespondence\s+to\s*:|"
@@ -607,6 +626,8 @@ def anonymize_representation(
     if strip_front_matter:
         sanitized, front_matter_removed = remove_front_matter(sanitized)
     sanitized, acknowledgements_removed = remove_acknowledgements(sanitized)
+    sanitized, email_count = EMAIL_PATTERN.subn("[EMAIL REDACTED]", sanitized)
+    sanitized, url_count = URL_PATTERN.subn("[URL REDACTED]", sanitized)
     replacement_count = 0
     identity_line_replacement_count = 0
     lines = sanitized.splitlines()
@@ -622,13 +643,30 @@ def anonymize_representation(
     ]
     for index in correspondence_identity_line_indexes(lines):
         identity_flags[index] = True
-    identity_block_lines = find_identity_block_lines(
-        lines,
-        direct_flags=[
-            author_flag or identity_flag
-            for author_flag, identity_flag in zip(author_flags, identity_flags, strict=True)
-        ],
-    )
+    for index in identity_note_line_indexes(lines):
+        identity_flags[index] = True
+    direct_flags = [
+        author_flag or identity_flag
+        for author_flag, identity_flag in zip(
+            author_flags,
+            identity_flags,
+            strict=True,
+        )
+    ]
+    identity_block_lines: set[int] = set()
+    for _ in range(len(lines) + 1):
+        expanded = find_identity_block_lines(
+            lines,
+            direct_flags=[
+                direct or index in identity_block_lines
+                for index, direct in enumerate(direct_flags)
+            ],
+        )
+        if expanded <= identity_block_lines:
+            break
+        identity_block_lines.update(expanded)
+    else:
+        raise RuntimeError("identity block redaction did not converge")
     sanitized_lines: list[str] = []
     for index, line in enumerate(lines):
         if author_flags[index]:
@@ -640,8 +678,6 @@ def anonymize_representation(
         else:
             sanitized_lines.append(line)
     sanitized = "\n".join(sanitized_lines)
-    sanitized, email_count = EMAIL_PATTERN.subn("[EMAIL REDACTED]", sanitized)
-    sanitized, url_count = URL_PATTERN.subn("[URL REDACTED]", sanitized)
     residual_authors = [
         author
         for author in authors
@@ -668,14 +704,58 @@ def is_text_affiliation_cue_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped or len(stripped) > 220:
         return False
-    if is_text_identity_line(stripped):
-        return True
     body = re.sub(r"^\s*(?:\d+|[*†‡]+)\s*", "", stripped)
     if re.match(
-        r"(?i)^(?:university|laboratory|institute)\s+of\b",
+        r"(?i)^(?:"
+        r"universit(?:y|e|é)\s+(?:of|de)|univ\.\s+|"
+        r"department\s+of|school\s+of|faculty\s+of|"
+        r"college\s+of|laboratory\s+(?:of|for)|institute\s+(?:of|for)|"
+        r"(?:state\s+|national\s+)?key\s+laboratory|"
+        r"(?:engineering\s+)?research\s+cent(?:er|re)\s+(?:of|for)|"
+        r"ministry\s+of"
+        r")\b",
         body,
     ):
         return True
+    if re.fullmatch(
+        r"(?i)(?:Google(?:\s+(?:DeepMind|Research))?|Microsoft(?: Research)?|"
+        r"Meta(?:\s+AI)?|NVIDIA|OpenAI|Anthropic|Amazon(?:\s+Web Services)?|"
+        r"IBM Research|Adobe Research|ByteDance|Tencent|ServiceNow AI Research|"
+        r"RIKEN|Mila|CNRS|INRIA)(?:[.,]?\s+\d+)?",
+        body,
+    ):
+        return True
+    organization_term = re.search(
+        r"(?i)\b(?:university|universit(?:e|é)|univ\.|institute|"
+        r"laborator(?:y|ies)|laboratoire|department|"
+        r"school\s+of|faculty\s+of|college\s+of|research\s+cent(?:er|re)|"
+        r"cent(?:er|re)\s+for|academy\s+of\s+sciences|ministry\s+of)\b",
+        body,
+    )
+    if organization_term:
+        words = re.findall(r"[^\W\d_]+(?:[-'][^\W\d_]+)*", body, flags=re.UNICODE)
+        significant = [
+            word
+            for word in words
+            if word.casefold()
+            not in {"a", "an", "and", "at", "for", "in", "of", "on", "the", "to"}
+        ]
+        capitalized = [
+            word
+            for word in significant
+            if word[:1].isupper() or word.isupper()
+        ]
+        if significant and len(capitalized) / len(significant) >= 0.6:
+            return True
+    if re.search(
+        r"(?i)(?:,\s*)?(?:USA|U\.S\.A\.|UK|U\.K\.|Canada|China|France|"
+        r"Germany|Switzerland|Belgium|Australia|Japan|Korea|Singapore|"
+        r"Netherlands|Israel)(?:[.,]?\s*\d+)?\s*$",
+        body,
+    ):
+        words = re.findall(r"[^\W\d_]+", body, flags=re.UNICODE)
+        if 1 < len(words) <= 20:
+            return True
     return bool(
         re.fullmatch(
             r"(?:[A-Z][\w&.'’()/-]*\s+){1,10}"
@@ -685,6 +765,27 @@ def is_text_affiliation_cue_line(line: str) -> bool:
             r"Korea|Singapore))*",
             body,
         )
+    )
+
+
+def is_titlecase_affiliation_fragment(line: str) -> bool:
+    if "," not in line or len(line) > 220:
+        return False
+    words = re.findall(r"[^\W\d_]+(?:[-'][^\W\d_]+)*", line, flags=re.UNICODE)
+    significant = [
+        word
+        for word in words
+        if word.casefold()
+        not in {"a", "an", "and", "at", "for", "in", "of", "on", "the", "to"}
+    ]
+    capitalized = [
+        word
+        for word in significant
+        if word[:1].isupper() or word.isupper()
+    ]
+    return bool(
+        1 < len(significant) <= 20
+        and len(capitalized) / len(significant) >= 0.6
     )
 
 
@@ -734,10 +835,70 @@ def find_identity_block_lines(
             if direct_flags[index]
         ]
         block_start = min(related_indices)
-        if block_start > 0 and re.fullmatch(r"\s*(?:\d+|[*†‡]+)\s*", lines[block_start - 1]):
-            block_start -= 1
+        for marker_index in range(
+            block_start - 1,
+            max(-1, block_start - 7),
+            -1,
+        ):
+            if not lines[marker_index].strip():
+                break
+            if re.fullmatch(
+                r"\s*(?:\d+|[*†‡]+)\s*",
+                lines[marker_index],
+            ):
+                block_start = marker_index
+                break
         block_end = max(related_indices)
         block_lines.update(range(block_start, block_end + 1))
+    run_start = 0
+    structural_limit = min(len(lines), 75)
+    while run_start < structural_limit:
+        if not direct_flags[run_start]:
+            run_start += 1
+            continue
+        run_end = run_start
+        while run_end < len(lines) and direct_flags[run_end]:
+            run_end += 1
+        if run_end - run_start >= 3:
+            marker_candidates = [
+                index
+                for index in range(max(0, run_start - 15), run_start)
+                if re.fullmatch(r"\s*(?:[1-9]|[*†‡]+)\s*", lines[index])
+            ]
+            if marker_candidates:
+                marker_index = max(marker_candidates)
+                candidate_lines = lines[marker_index:run_start]
+                has_affiliation_evidence = any(
+                    is_text_affiliation_cue_line(line)
+                    or is_titlecase_affiliation_fragment(line)
+                    or is_text_identity_line(line)
+                    or re.search(
+                        r"(?i)(?:department|univ|institut|laborator|"
+                        r"\blab\b|school|college|research|academy|"
+                        r"correspon|internship|\bauthors?\b|"
+                        r"\bsch\.|\bfaculty\b|\bprogram\b|\bdivision\b|"
+                        r"\bprofessorship\b|\bcluster\s+of\s+excellence\b|"
+                        r"\bartificial\s+intelligence\b|\bengineering\b|"
+                        r"\btechnolog(?:y|ies)\b|\bcorporation\b|\bcompany\b|"
+                        r"\binc\.?\b|\bgroup\b|\bAI\b|\bCNRS\b|\bINRIA\b|"
+                        r"\bETH\b|\bEPFL\b|\bMIT\b|\bKAIST\b|\bTU\b|"
+                        r"\bC2\b|\bMATS\b|\bUCSD\b|\bApple\b|\bAmazon\b|"
+                        r"\bAlibaba\b|\bGoogle\b|\bMeta\b|\bHuawei\b|"
+                        r"\bToyota\b|\bUber\b|\bYandex\b|\bKRAFTON\b)",
+                        line,
+                    )
+                    or re.search(r"(?:\s|[,.;])[1-9]\s*$", line)
+                    or re.fullmatch(
+                        r"\s*[A-Z][A-Z0-9&.'/-]{1,15}"
+                        r"(?:\s+[A-Z][A-Z0-9&.'/-]{1,15})?"
+                        r"(?:\s+[1-9])?\s*",
+                        line,
+                    )
+                    for line in candidate_lines[1:]
+                )
+                if has_affiliation_evidence:
+                    block_lines.update(range(marker_index, run_end))
+        run_start = run_end
     return block_lines
 
 
@@ -1280,6 +1441,19 @@ def correspondence_identity_line_indexes(lines: list[str]) -> set[int]:
     for index, line in enumerate(lines[:-1]):
         joined = line.rstrip() + " " + lines[index + 1].lstrip()
         if re.search(r"(?i)\bcorrespondence\s+to\s*:", joined):
+            matches.update((index, index + 1))
+    return matches
+
+
+def identity_note_line_indexes(lines: list[str]) -> set[int]:
+    matches = {
+        index
+        for index, line in enumerate(lines)
+        if TEXT_IDENTITY_NOTE_PATTERN.search(line)
+    }
+    for index, line in enumerate(lines[:-1]):
+        joined = line.rstrip() + " " + lines[index + 1].lstrip()
+        if TEXT_IDENTITY_NOTE_PATTERN.search(joined):
             matches.update((index, index + 1))
     return matches
 
