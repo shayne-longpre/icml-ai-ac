@@ -10,7 +10,7 @@ readonly MAX_PASSES="${STAGE02_MAX_PASSES:-5}"
 export PYTHONDONTWRITEBYTECODE=1
 
 pass=1
-status=1
+exit_code=1
 while (( pass <= MAX_PASSES )); do
   print "[stage02] starting resumable pass ${pass}/${MAX_PASSES}"
   "${PYTHON}" -c \
@@ -30,14 +30,14 @@ while (( pass <= MAX_PASSES )); do
     --delay 0.25 \
     --aggregate-out data/scores/icml_2026_pass1_cheap_ensemble_signal.jsonl \
     --aggregate-report data/scores/icml_2026_pass1_cheap_ensemble_signal.report.json
-  status=$?
-  if (( status == 0 )); then
+  exit_code=$?
+  if (( exit_code == 0 )); then
     print "[stage02] completed successfully"
     exit 0
   fi
   if [[ ! -f "${RUN_REPORT}" ]]; then
     print -u2 "[stage02] run failed before producing a report; stopping"
-    exit "${status}"
+    exit "${exit_code}"
   fi
   blocked="$("${PYTHON}" -c '
 import json
@@ -51,7 +51,7 @@ print(any(
 ' "${RUN_REPORT}")"
   if [[ "${blocked}" == "True" ]]; then
     print -u2 "[stage02] blocking provider error recorded; stopping"
-    exit "${status}"
+    exit "${exit_code}"
   fi
   (( pass += 1 ))
   if (( pass <= MAX_PASSES )); then
@@ -61,4 +61,4 @@ print(any(
 done
 
 print -u2 "[stage02] incomplete after ${MAX_PASSES} bounded passes; stopping"
-exit "${status}"
+exit "${exit_code}"
