@@ -23,6 +23,20 @@ class ScoringTests(unittest.TestCase):
 
         self.assertEqual(parsed["title"], "Fast Min-$\\epsilon$ Regression")
 
+    def test_parse_json_quotes_unquoted_object_keys(self) -> None:
+        parsed = parse_json_response(
+            """{
+  "paper_id": "p1",
+  main_risk": "limited validation",
+  vulnerability or risk: "narrow adoption",
+  $paper_isolation_check$: "specific method"
+}"""
+        )
+
+        self.assertEqual(parsed["main_risk"], "limited validation")
+        self.assertEqual(parsed["vulnerability or risk"], "narrow adoption")
+        self.assertEqual(parsed["$paper_isolation_check$"], "specific method")
+
     def test_production_cheap_preset_is_the_validated_four_model_panel(self) -> None:
         self.assertEqual(
             CHEAP_MODEL_PRESETS["production_2026_v2"].models,

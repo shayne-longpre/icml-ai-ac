@@ -45,6 +45,9 @@ CONTRIBUTION_CLASSES = [
     "other",
 ]
 INVALID_JSON_ESCAPE_PATTERN = re.compile(r'\\(?!["\\/bfnrtu])')
+UNQUOTED_OBJECT_KEY_PATTERN = re.compile(
+    r'(?m)^([ \t]*)([A-Za-z_$][A-Za-z0-9_$ -]*?)"?[ \t]*:'
+)
 
 TOP_LEVEL_REQUIRED = [
     "paper_id",
@@ -183,11 +186,25 @@ def parse_json_response(text: str) -> dict[str, Any]:
 def load_json_with_invalid_escape_repair(text: str) -> Any:
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
-        repaired = INVALID_JSON_ESCAPE_PATTERN.sub(r"\\\\", text)
-        if repaired == text:
-            raise
-        return json.loads(repaired)
+    except json.JSONDecodeError as original_error:
+        candidates = [INVALID_JSON_ESCAPE_PATTERN.sub(r"\\\\", text)]
+        candidates.append(quote_unquoted_object_keys(text))
+        candidates.append(quote_unquoted_object_keys(candidates[0]))
+        for repaired in candidates:
+            if repaired == text:
+                continue
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                continue
+        raise original_error
+
+
+def quote_unquoted_object_keys(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        return f"{match.group(1)}{json.dumps(match.group(2).rstrip())}:"
+
+    return UNQUOTED_OBJECT_KEY_PATTERN.sub(replace, text)
 
 
 def validate_scoring_output(payload: dict[str, Any]) -> list[str]:
