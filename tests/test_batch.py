@@ -58,6 +58,15 @@ class FakeClient:
         )
 
 
+class MalformedThenValidClient(FakeClient):
+    def complete(self, **kwargs):
+        result = super().complete(**kwargs)
+        if self.calls == 1:
+            result.content = '{"ranked_papers": ['
+            result.response["choices"][0]["message"]["content"] = result.content
+        return result
+
+
 class Pass1BatchResumeTests(unittest.TestCase):
     def test_batch_prompt_excludes_human_outcome_metadata(self) -> None:
         record = PaperRecord(
@@ -157,6 +166,70 @@ class Pass1BatchResumeTests(unittest.TestCase):
             recovered = json.loads(failed_batch.read_text(encoding="utf-8"))
             self.assertTrue(recovered["recovered_from_raw_response"])
             self.assertEqual(len(out.read_text(encoding="utf-8").splitlines()), 8)
+
+    def test_suite_archives_failed_response_before_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            text_path = root / "paper.txt"
+            text_path.write_text("Paper text", encoding="utf-8")
+            manifest = root / "manifest.jsonl"
+            write_jsonl(
+                manifest,
+                [
+                    PaperRecord(
+                        paper_id="p0",
+                        source="accepted",
+                        title="Paper 0",
+                        text_scoring=str(text_path),
+                        parse_status="ok",
+                    ).to_dict()
+                ],
+            )
+            config = Pass1BatchSuiteConfig(
+                provider="openrouter",
+                model="test/model",
+                reasoning_effort="none",
+                prompt_version="test",
+                text_source="scoring",
+                limit=None,
+                paper_ids=set(),
+                per_paper_char_budget=1000,
+                batch_size=1,
+                partitions=1,
+                strategy="sequential",
+                class_path=None,
+                request_delay_seconds=0,
+                temperature=0,
+                max_output_tokens=1000,
+                seed=3,
+                dry_run=False,
+            )
+            client = MalformedThenValidClient()
+            run_dir = root / "run"
+
+            first = run_pass1_batch_suite(
+                manifest=manifest,
+                out=root / "scores.jsonl",
+                run_dir=run_dir,
+                config=config,
+                client=client,
+            )
+            second = run_pass1_batch_suite(
+                manifest=manifest,
+                out=root / "scores.jsonl",
+                run_dir=run_dir,
+                config=config,
+                client=client,
+            )
+
+            batch_dir = run_dir / "batches" / "partition_00_batch_00"
+            archived = batch_dir / "attempts" / "attempt_0001"
+            current = json.loads((batch_dir / "batch.json").read_text(encoding="utf-8"))
+            self.assertEqual(first["status"], "partial_failed")
+            self.assertEqual(second["status"], "ok")
+            self.assertEqual(client.calls, 2)
+            self.assertTrue((archived / "response.json").exists())
+            self.assertEqual(current["attempt_index"], 2)
 
 
 if __name__ == "__main__":

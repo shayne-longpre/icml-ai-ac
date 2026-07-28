@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import random
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -304,6 +305,12 @@ def run_pass1_batch_suite(
                 rows.extend(batch_rows)
                 batch_results.append(batch_result)
                 continue
+            archived_attempt_count = archive_failed_pass1_attempt(
+                batch_dir=batch_dir,
+                fingerprint=fingerprint,
+            )
+            clear_pass1_attempt_artifacts(batch_dir)
+            attempt_index = archived_attempt_count + 1
             chat = None
             try:
                 chat = client.complete(
@@ -346,6 +353,7 @@ def run_pass1_batch_suite(
                         "effective_reasoning": getattr(chat, "request", {}).get("reasoning"),
                         "provider_elapsed_seconds": round(chat.elapsed_seconds, 3),
                         "resumed": False,
+                        "attempt_index": attempt_index,
                     }
                 )
                 write_json(batch_dir / "batch.json", batch_results[-1])
@@ -369,6 +377,7 @@ def run_pass1_batch_suite(
                         "prompt_path": str(prompt_path),
                         "error_path": str(error_path),
                         "error": repr(exc),
+                        "attempt_index": attempt_index,
                     }
                 )
                 if raw_response_path.exists():
@@ -408,6 +417,63 @@ def run_pass1_batch_suite(
 def batch_prompt_fingerprint(payload: dict[str, Any]) -> str:
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def archive_failed_pass1_attempt(*, batch_dir: Path, fingerprint: str) -> int:
+    attempts_dir = batch_dir / "attempts"
+    existing_indices = [
+        int(path.name.removeprefix("attempt_"))
+        for path in attempts_dir.glob("attempt_[0-9][0-9][0-9][0-9]")
+        if path.is_dir()
+    ]
+    archived_count = max(existing_indices, default=0)
+    state_path = batch_dir / "batch.json"
+    if not state_path.exists():
+        return archived_count
+    try:
+        state = read_json(state_path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return archived_count
+    if (
+        not isinstance(state, dict)
+        or state.get("status") != "failed"
+        or state.get("fingerprint") != fingerprint
+    ):
+        return archived_count
+
+    archived_count += 1
+    archive_dir = attempts_dir / f"attempt_{archived_count:04d}"
+    archive_dir.mkdir(parents=True, exist_ok=False)
+    for name in ("prompt.json", "response.json", "parsed.json", "error.json", "batch.json"):
+        source = batch_dir / name
+        if source.exists():
+            shutil.copy2(source, archive_dir / name)
+            if name in {"response.json", "parsed.json", "error.json"}:
+                source.unlink()
+    write_json(
+        archive_dir / "archive.json",
+        {
+            "attempt_index": state.get("attempt_index") or archived_count,
+            "fingerprint": fingerprint,
+            "status": "failed",
+        },
+    )
+    write_json(
+        state_path,
+        {
+            **state,
+            "status": "retry_pending",
+            "archived_attempt_index": archived_count,
+        },
+    )
+    return archived_count
+
+
+def clear_pass1_attempt_artifacts(batch_dir: Path) -> None:
+    for name in ("response.json", "parsed.json", "error.json"):
+        path = batch_dir / name
+        if path.exists():
+            path.unlink()
 
 
 def load_cached_pass1_batch(
