@@ -384,6 +384,21 @@ def run_pass2_batched_ranking(
                 resumed_batch_count += 1
                 continue
 
+            recovered = recover_saved_pass2_batch(
+                batch_dir=batch_dir,
+                fingerprint=fingerprint,
+                candidates=batch_candidates,
+                prompt_path=prompt_path,
+                partition_index=partition_index,
+                batch_index=batch_index,
+            )
+            if recovered is not None:
+                batch_judgments, batch_result = recovered
+                judgments.extend(batch_judgments)
+                batch_results.append(batch_result)
+                resumed_batch_count += 1
+                continue
+
             archived_attempt_count = archive_failed_pass2_attempt(batch_dir)
             clear_failed_pass2_attempt(batch_dir)
             provider_attempt_index = archived_attempt_count + 1
@@ -613,6 +628,70 @@ def load_cached_pass2_batch(
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
     return judgments, {**state, "resumed": True}
+
+
+def recover_saved_pass2_batch(
+    *,
+    batch_dir: Path,
+    fingerprint: str,
+    candidates: list[RankingCandidate],
+    prompt_path: Path,
+    partition_index: int,
+    batch_index: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    state_path = batch_dir / "batch.json"
+    raw_response_path = batch_dir / "response.json"
+    if not state_path.exists() or not raw_response_path.exists():
+        return None
+    try:
+        state = read_json(state_path)
+        if (
+            not isinstance(state, dict)
+            or state.get("status") != "failed"
+            or state.get("fingerprint") != fingerprint
+        ):
+            return None
+        response = read_json(raw_response_path)
+        content = response["choices"][0]["message"]["content"]
+        if not isinstance(content, str):
+            return None
+        parsed = parse_json_response(content)
+        expected_ids = [candidate.record.paper_id for candidate in candidates]
+        canonicalize_ranked_paper_ids(parsed, expected_ids)
+        errors = validate_ranked_paper_coverage(parsed, expected_ids)
+        if errors:
+            return None
+        archived_attempt_count = archive_failed_pass2_attempt(batch_dir)
+        parsed_response_path = batch_dir / "parsed.json"
+        write_json(parsed_response_path, parsed)
+        judgments = pass2_payload_to_judgments(
+            parsed,
+            partition_index=partition_index,
+            batch_index=batch_index,
+            batch_size=len(candidates),
+            prompt_path=prompt_path,
+            raw_response_path=raw_response_path,
+            parsed_response_path=parsed_response_path,
+        )
+        recovered_state = {
+            **state,
+            "status": "ok",
+            "validation_errors": [],
+            "raw_response_path": str(raw_response_path),
+            "parsed_response_path": str(parsed_response_path),
+            "recovered_from_saved_response": True,
+            "archived_attempt_count": archived_attempt_count,
+            "resumed": True,
+        }
+        recovered_state.pop("error", None)
+        recovered_state.pop("error_path", None)
+        write_json(state_path, recovered_state)
+        error_path = batch_dir / "error.json"
+        if error_path.exists():
+            error_path.unlink()
+    except (IndexError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return judgments, recovered_state
 
 
 def pass2_payload_to_judgments(

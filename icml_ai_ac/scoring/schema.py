@@ -190,13 +190,16 @@ def load_json_with_invalid_escape_repair(text: str) -> Any:
         candidates = [INVALID_JSON_ESCAPE_PATTERN.sub(r"\\\\", text)]
         candidates.append(quote_unquoted_object_keys(text))
         candidates.append(quote_unquoted_object_keys(candidates[0]))
-        for repaired in candidates:
-            if repaired == text:
-                continue
+        for candidate in [text, *candidates]:
+            if candidate != text:
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
             try:
-                return json.loads(repaired)
+                return json.loads(candidate, strict=False)
             except json.JSONDecodeError:
-                continue
+                pass
         raise original_error
 
 

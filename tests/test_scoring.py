@@ -37,6 +37,11 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(parsed["vulnerability or risk"], "narrow adoption")
         self.assertEqual(parsed["$paper_isolation_check$"], "specific method")
 
+    def test_parse_json_accepts_unescaped_control_character_in_string(self) -> None:
+        parsed = parse_json_response('{"rationale":"first line\nsecond line"}')
+
+        self.assertEqual(parsed["rationale"], "first line\nsecond line")
+
     def test_production_cheap_preset_is_the_validated_four_model_panel(self) -> None:
         self.assertEqual(
             CHEAP_MODEL_PRESETS["production_2026_v2"].models,
