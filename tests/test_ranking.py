@@ -11,8 +11,10 @@ from icml_ai_ac.scoring.ranking import (
     Pass2BatchedRankingConfig,
     Pass2RankingConfig,
     RankingCandidate,
+    archive_failed_pass2_attempt,
     balance_pass2_batches,
     build_pass2_ranking_messages,
+    clear_failed_pass2_attempt,
     run_pass2_batched_ranking,
     validate_pass2_comparison_connectivity,
 )
@@ -56,6 +58,28 @@ class FakeRankingClient:
 
 
 class RankingTests(unittest.TestCase):
+    def test_failed_batch_is_archived_before_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            batch_dir = Path(tmp)
+            for name, payload in (
+                ("prompt.json", {"fingerprint": "abc"}),
+                ("response.json", {"model": "served"}),
+                ("error.json", {"error": "bad output"}),
+                ("batch.json", {"status": "failed", "fingerprint": "abc"}),
+            ):
+                (batch_dir / name).write_text(json.dumps(payload), encoding="utf-8")
+
+            attempt_count = archive_failed_pass2_attempt(batch_dir)
+            clear_failed_pass2_attempt(batch_dir)
+
+            self.assertEqual(attempt_count, 1)
+            archived = batch_dir / "attempts" / "attempt_0001"
+            self.assertTrue((archived / "response.json").exists())
+            self.assertTrue((archived / "error.json").exists())
+            self.assertTrue((archived / "batch.json").exists())
+            self.assertTrue((batch_dir / "prompt.json").exists())
+            self.assertFalse((batch_dir / "batch.json").exists())
+
     def test_pass2_prompt_excludes_human_outcome_metadata(self) -> None:
         record = PaperRecord(
             paper_id="p1",

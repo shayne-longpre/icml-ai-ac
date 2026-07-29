@@ -80,7 +80,11 @@ resume after interruption.
 
 The shortlist builder aggregates multiple cheap score files, normalizes by
 source model so one model cannot dominate by producing more rows, and selects a
-class-balanced semifinal pool. It stores the ensemble signal, including
+class-balanced semifinal pool. A paired fixed-effect sensitivity analysis
+estimates each model's input-slot effect from the two observations of every
+paper. Production advances the union of the raw and adjusted top 20%, retaining
+both signals rather than treating the adjustment as ground truth. It stores
+the ensemble signal, including
 aggregate priority, source-model priorities, advance votes, and source rows, so
 later ranking layers can reuse the cheap evidence. The key production knobs are:
 
@@ -89,10 +93,11 @@ score-pass1-ensemble --model-preset
 score-pass1-ensemble --model-workers 4
 score-pass1-ensemble --aggregate-out
 build-shortlist --limit
+build-position-robust-shortlist --cutoff
 ```
 
-For the full run, the initial target is a generous cheap shortlist of 15%-20%
-of parsed papers.
+For the 2026 full run, the raw and adjusted top-1,323 sets overlap on 1,204
+papers; their union sends 1,442 papers to the strong semifinal.
 
 ## Stage 3: Strong Semifinal Ranking
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -383,6 +384,9 @@ def run_pass2_batched_ranking(
                 resumed_batch_count += 1
                 continue
 
+            archived_attempt_count = archive_failed_pass2_attempt(batch_dir)
+            clear_failed_pass2_attempt(batch_dir)
+            provider_attempt_index = archived_attempt_count + 1
             chat = None
             try:
                 if client is None:
@@ -426,6 +430,7 @@ def run_pass2_batched_ranking(
                     "served_model": chat.served_model,
                     "usage": chat.usage,
                     "provider_elapsed_seconds": round(chat.elapsed_seconds, 3),
+                    "provider_attempt_index": provider_attempt_index,
                     "resumed": False,
                 }
                 write_json(batch_dir / "batch.json", batch_result)
@@ -451,6 +456,7 @@ def run_pass2_batched_ranking(
                     "prompt_path": str(prompt_path),
                     "error_path": str(error_path),
                     "error": repr(exc),
+                    "provider_attempt_index": provider_attempt_index,
                 }
                 if raw_response_path.exists():
                     batch_result["raw_response_path"] = str(raw_response_path)
@@ -513,6 +519,51 @@ def run_pass2_batched_ranking(
     write_json(out, result)
     write_json(run_dir / "run.json", result)
     return result
+
+
+def archive_failed_pass2_attempt(batch_dir: Path) -> int:
+    state_path = batch_dir / "batch.json"
+    if not state_path.exists():
+        return existing_attempt_count(batch_dir)
+    try:
+        state = read_json(state_path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        state = None
+    if not isinstance(state, dict) or state.get("status") != "failed":
+        return existing_attempt_count(batch_dir)
+    attempts_dir = batch_dir / "attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    attempt_index = existing_attempt_count(batch_dir) + 1
+    attempt_dir = attempts_dir / f"attempt_{attempt_index:04d}"
+    attempt_dir.mkdir(parents=True, exist_ok=False)
+    for name in ("prompt.json", "response.json", "parsed.json", "error.json", "batch.json"):
+        source = batch_dir / name
+        if source.exists():
+            shutil.copy2(source, attempt_dir / name)
+    return attempt_index
+
+
+def existing_attempt_count(batch_dir: Path) -> int:
+    attempts_dir = batch_dir / "attempts"
+    if not attempts_dir.exists():
+        return 0
+    return sum(1 for path in attempts_dir.glob("attempt_*") if path.is_dir())
+
+
+def clear_failed_pass2_attempt(batch_dir: Path) -> None:
+    state_path = batch_dir / "batch.json"
+    if not state_path.exists():
+        return
+    try:
+        state = read_json(state_path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        state = None
+    if not isinstance(state, dict) or state.get("status") != "failed":
+        return
+    for name in ("response.json", "parsed.json", "error.json", "batch.json"):
+        path = batch_dir / name
+        if path.exists():
+            path.unlink()
 
 
 def ranking_prompt_fingerprint(payload: dict[str, Any]) -> str:

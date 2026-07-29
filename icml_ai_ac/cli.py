@@ -32,6 +32,7 @@ from icml_ai_ac.model_presets import (
     DEFAULT_FRONTIER_MODEL,
     DEFAULT_STRONG_MODEL,
 )
+from icml_ai_ac.position_sensitivity import build_position_robust_shortlist
 from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.ranking_ensemble import ensemble_semifinal_rankings
 from icml_ai_ac.scraper.arxiv import ArxivClient, ArxivQueryBudgetExceeded, arxiv_pdf_filename, is_confident_enough
@@ -830,6 +831,19 @@ def build_parser() -> argparse.ArgumentParser:
     shortlist.add_argument("--min-per-class", type=int, default=0)
     shortlist.add_argument("--class-path", type=Path, default=None)
     shortlist.set_defaults(func=cmd_build_shortlist)
+
+    position_shortlist = subparsers.add_parser(
+        "build-position-robust-shortlist",
+        help="Union raw and within-paper position-adjusted first-pass leaders.",
+    )
+    position_shortlist.add_argument("--scores", type=Path, required=True, action="append")
+    position_shortlist.add_argument("--raw-ranking", type=Path, required=True)
+    position_shortlist.add_argument("--class-path", type=Path, default=None)
+    position_shortlist.add_argument("--cutoff", type=int, required=True)
+    position_shortlist.add_argument("--adjusted-out", type=Path, required=True)
+    position_shortlist.add_argument("--out", type=Path, required=True)
+    position_shortlist.add_argument("--report", type=Path, required=True)
+    position_shortlist.set_defaults(func=cmd_build_position_robust_shortlist)
 
     semifinal_ensemble = subparsers.add_parser(
         "ensemble-semifinal-rankings",
@@ -2989,6 +3003,24 @@ def cmd_build_shortlist(args: argparse.Namespace) -> int:
     print(
         f"Built shortlist {report['written_rows']}/{report['unique_papers']} "
         f"from {report['input_rows']} score rows"
+    )
+    return 0
+
+
+def cmd_build_position_robust_shortlist(args: argparse.Namespace) -> int:
+    report = build_position_robust_shortlist(
+        scores_paths=args.scores,
+        raw_ranking_path=args.raw_ranking,
+        class_path=args.class_path,
+        cutoff=args.cutoff,
+        adjusted_out=args.adjusted_out,
+        shortlist_out=args.out,
+        report_out=args.report,
+    )
+    print(
+        f"Built position-robust Stage 3 shortlist: {report['union_count']} papers "
+        f"from raw/adjusted top {report['cutoff']} "
+        f"(overlap={report['overlap_count']})"
     )
     return 0
 

@@ -98,11 +98,11 @@ hash-randomized order, preventing source order from being confounded with prompt
 position. The four-model ranking pass also stores its class votes and agreement,
 which define the downstream ensemble category signal.
 
-We aggregate by source model and select a top **15-20%** class-balanced
-shortlist, preserving per-class leaders, strong rejected candidates, and
-cheap/strong disagreement cases. This pass is a recall filter, not the final
-ranking. Classification and ranking batches are fingerprinted and resumable;
-reruns reuse valid responses and retry only unfinished batches.
+We aggregate by source model and advance a top **15-20%** class-balanced
+shortlist. A within-paper position sensitivity check expands the handoff when
+raw and position-adjusted cutoffs disagree. This pass is a recall filter, not
+the final ranking. Classification and ranking batches are fingerprinted and
+resumable; reruns reuse valid responses and retry only unfinished batches.
 
 After a bounded preflight, the four model streams can run concurrently with
 `--model-workers 4`; batches within each stream remain sequential.

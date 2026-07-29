@@ -57,9 +57,11 @@ separate multi-model category consensus for analysis.
 2. **Cheap recall ensemble (6,617 papers).** Nemotron 3 Ultra, Gemini 3.5 Flash
    Lite, GPT-5.6 Luna, and Grok 4.3 each rank two deterministic
    class-stratified partitions. Preserve the full aggregate signal and advance
-   the top 20%, approximately 1,323 papers. Store every model's contribution
-   class vote and a resolved ensemble class separately from the routing label.
-3. **Strong semifinal (approximately 1,323 papers).** GPT-5.6 Terra high and
+   a position-robust union of the raw and within-paper position-adjusted top
+   20%. The production union contains 1,442 papers. Store every model's
+   contribution class vote and a resolved ensemble class separately from the
+   routing label.
+3. **Strong semifinal (1,442 papers).** GPT-5.6 Terra high and
    Claude Sonnet 5 high independently rank the same shortlist in size-8,
    two-partition batches. Preserve both source rankings, normalized consensus,
    and disagreement.
