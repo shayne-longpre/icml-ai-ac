@@ -11,6 +11,8 @@ from icml_ai_ac.scoring.batch import (
     Pass1BatchConfig,
     Pass1BatchSuiteConfig,
     build_pass1_batch_messages,
+    batch_response_to_rows,
+    parse_batch_json_response,
     run_pass1_batch_suite,
 )
 from icml_ai_ac.storage import write_jsonl
@@ -68,6 +70,87 @@ class MalformedThenValidClient(FakeClient):
 
 
 class Pass1BatchResumeTests(unittest.TestCase):
+    def test_batch_parser_repairs_unescaped_quotes_in_canonical_title(self) -> None:
+        candidate = BatchCandidate(
+            PaperRecord(
+                paper_id="p1",
+                source="accepted",
+                title='How Text Becomes The "Jailbreak Key"',
+            ),
+            "paper.txt",
+            "scoring",
+            "Paper text.",
+        )
+        content = """{
+  "ranked_papers": [
+    {
+      "rank": 1,
+      "paper_id": "p1",
+      "title": "How Text Becomes The "Jailbreak Key"",
+      "forced_bucket": "top_10_percent"
+    }
+  ]
+}"""
+
+        parsed = parse_batch_json_response(content, candidates=[candidate])
+
+        self.assertEqual(
+            parsed["ranked_papers"][0]["title"],
+            'How Text Becomes The "Jailbreak Key"',
+        )
+
+    def test_batch_rows_repair_duplicate_id_using_exact_canonical_title(self) -> None:
+        candidates = [
+            BatchCandidate(
+                PaperRecord(paper_id="p1", source="accepted", title="First Paper"),
+                "p1.txt",
+                "scoring",
+                "First.",
+            ),
+            BatchCandidate(
+                PaperRecord(paper_id="p2", source="accepted", title="Second Paper"),
+                "p2.txt",
+                "scoring",
+                "Second.",
+            ),
+        ]
+        parsed = {
+            "ranked_papers": [
+                {"rank": 1, "paper_id": "p1", "title": "First Paper"},
+                {"rank": 2, "paper_id": "p1", "title": "Second Paper"},
+            ]
+        }
+        config = Pass1BatchConfig(
+            provider="openrouter",
+            model="test/model",
+            prompt_version="test",
+            text_source="scoring",
+            limit=None,
+            paper_ids=set(),
+            per_paper_char_budget=1000,
+            temperature=0,
+            max_output_tokens=1000,
+            seed=None,
+            dry_run=False,
+        )
+
+        rows = batch_response_to_rows(
+            parsed,
+            candidates=candidates,
+            config=config,
+            prompt_path=Path("prompt.json"),
+            raw_response_path=Path("response.json"),
+            parsed_response_path=Path("parsed.json"),
+            usage={},
+        )
+
+        self.assertEqual({row["paper_id"] for row in rows}, {"p1", "p2"})
+        repaired = next(row for row in rows if row["paper_id"] == "p2")
+        self.assertEqual(
+            repaired["scores"]["ranking_signals"]["paper_id_original_model_output"],
+            "p1",
+        )
+
     def test_batch_prompt_excludes_human_outcome_metadata(self) -> None:
         record = PaperRecord(
             paper_id="p1",

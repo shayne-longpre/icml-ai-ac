@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import random
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -132,7 +133,7 @@ def run_pass1_batch_rank(
         )
         raw_response_path = run_dir / "response.json"
         write_json(raw_response_path, chat.response)
-        parsed = parse_json_response(chat.content)
+        parsed = parse_batch_json_response(chat.content, candidates=candidates)
         parsed_response_path = run_dir / "parsed.json"
         write_json(parsed_response_path, parsed)
         rows = batch_response_to_rows(
@@ -322,7 +323,7 @@ def run_pass1_batch_suite(
                 )
                 raw_response_path = batch_dir / "response.json"
                 write_json(raw_response_path, chat.response)
-                parsed = parse_json_response(chat.content)
+                parsed = parse_batch_json_response(chat.content, candidates=batch_candidates)
                 parsed_response_path = batch_dir / "parsed.json"
                 write_json(parsed_response_path, parsed)
                 batch_rows = batch_response_to_rows(
@@ -542,7 +543,7 @@ def recover_saved_pass1_batch(
         response = read_json(raw_response_path)
         if not isinstance(response, dict):
             return None
-        parsed = parse_json_response(extract_content(response))
+        parsed = parse_batch_json_response(extract_content(response), candidates=candidates)
         write_json(parsed_response_path, parsed)
         usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
         rows = batch_response_to_rows(
@@ -604,6 +605,37 @@ def select_batch_candidates(
         if limit is not None and len(candidates) >= limit:
             break
     return candidates
+
+
+def parse_batch_json_response(text: str, *, candidates: list[BatchCandidate]) -> dict[str, Any]:
+    try:
+        return parse_json_response(text)
+    except json.JSONDecodeError as original_error:
+        repaired = repair_candidate_title_lines(text, candidates=candidates)
+        if repaired == text:
+            raise original_error
+        return parse_json_response(repaired)
+
+
+def repair_candidate_title_lines(text: str, *, candidates: list[BatchCandidate]) -> str:
+    repaired = text
+    for candidate in candidates:
+        paper_id = re.escape(candidate.record.paper_id)
+        title = candidate.record.title
+        if not title:
+            continue
+        pattern = re.compile(
+            rf'("paper_id"\s*:\s*"{paper_id}"\s*,[ \t]*\r?\n)'
+            r'([ \t]*)"title"\s*:[^\r\n]*(\r?\n)'
+        )
+        repaired = pattern.sub(
+            lambda match: (
+                f'{match.group(1)}{match.group(2)}"title": '
+                f"{json.dumps(title, ensure_ascii=False)},{match.group(3)}"
+            ),
+            repaired,
+        )
+    return repaired
 
 
 def read_class_map(path: Path | None) -> dict[str, str]:
@@ -816,6 +848,7 @@ def batch_response_to_rows(
         raise ValueError("batch response missing ranked_papers array")
     ranked_objects = [item for item in ranked if isinstance(item, dict) and item.get("paper_id")]
     canonicalize_ranked_ids(ranked_objects, expected_ids=set(candidates_by_id))
+    repair_duplicate_ids_from_titles(ranked_objects, candidates_by_id=candidates_by_id)
     validate_ranked_items(ranked_objects, expected_ids=set(candidates_by_id), expected_count=len(candidates))
     rows: list[dict[str, Any]] = []
     for item in ranked_objects:
@@ -827,6 +860,45 @@ def batch_response_to_rows(
                                     raw_response_path=raw_response_path, parsed_response_path=parsed_response_path,
                                     usage=usage))
     return rows
+
+
+def repair_duplicate_ids_from_titles(
+    ranked: list[dict[str, Any]],
+    *,
+    candidates_by_id: dict[str, BatchCandidate],
+) -> None:
+    output_ids = [str(item.get("paper_id") or "") for item in ranked]
+    missing_ids = set(candidates_by_id) - set(output_ids)
+    duplicate_ids = {paper_id for paper_id in output_ids if output_ids.count(paper_id) > 1}
+    if not missing_ids or not duplicate_ids:
+        return
+
+    missing_by_title: dict[str, list[str]] = {}
+    for paper_id in missing_ids:
+        title = normalize_title(candidates_by_id[paper_id].record.title)
+        if title:
+            missing_by_title.setdefault(title, []).append(paper_id)
+
+    for item in ranked:
+        paper_id = str(item.get("paper_id") or "")
+        if paper_id not in duplicate_ids:
+            continue
+        matching_missing = missing_by_title.get(normalize_title(item.get("title")), [])
+        if len(matching_missing) != 1:
+            continue
+        repaired_id = matching_missing[0]
+        item["paper_id_original_model_output"] = paper_id
+        item["paper_id"] = repaired_id
+        missing_ids.remove(repaired_id)
+        missing_by_title.pop(normalize_title(item.get("title")), None)
+        if output_ids.count(paper_id) - sum(
+            str(row.get("paper_id") or "") == paper_id for row in ranked
+        ) >= 1:
+            duplicate_ids.discard(paper_id)
+
+
+def normalize_title(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
 
 
 def canonicalize_ranked_ids(ranked: list[Any], *, expected_ids: set[str]) -> None:
@@ -975,6 +1047,10 @@ def build_score_row(
             "unsupported_inferences_to_avoid": [],
         },
     }
+    if item.get("paper_id_original_model_output"):
+        scores["ranking_signals"]["paper_id_original_model_output"] = item[
+            "paper_id_original_model_output"
+        ]
     return {
         "status": "ok",
         "paper_id": candidate.record.paper_id,
