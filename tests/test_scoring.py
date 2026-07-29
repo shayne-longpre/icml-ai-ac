@@ -42,6 +42,14 @@ class ScoringTests(unittest.TestCase):
 
         self.assertEqual(parsed["rationale"], "first line\nsecond line")
 
+    def test_parse_json_removes_trailing_comma_without_changing_string_content(self) -> None:
+        parsed = parse_json_response(
+            '{"rationale":"literal comma before brace,}", "scores":[1, 2,],}'
+        )
+
+        self.assertEqual(parsed["rationale"], "literal comma before brace,}")
+        self.assertEqual(parsed["scores"], [1, 2])
+
     def test_production_cheap_preset_is_the_validated_four_model_panel(self) -> None:
         self.assertEqual(
             CHEAP_MODEL_PRESETS["production_2026_v2"].models,

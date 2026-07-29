@@ -190,6 +190,8 @@ def load_json_with_invalid_escape_repair(text: str) -> Any:
         candidates = [INVALID_JSON_ESCAPE_PATTERN.sub(r"\\\\", text)]
         candidates.append(quote_unquoted_object_keys(text))
         candidates.append(quote_unquoted_object_keys(candidates[0]))
+        candidates.extend(remove_trailing_json_commas(candidate) for candidate in list(candidates))
+        candidates.append(remove_trailing_json_commas(text))
         for candidate in [text, *candidates]:
             if candidate != text:
                 try:
@@ -208,6 +210,34 @@ def quote_unquoted_object_keys(text: str) -> str:
         return f"{match.group(1)}{json.dumps(match.group(2).rstrip())}:"
 
     return UNQUOTED_OBJECT_KEY_PATTERN.sub(replace, text)
+
+
+def remove_trailing_json_commas(text: str) -> str:
+    output: list[str] = []
+    in_string = False
+    escaped = False
+    for index, character in enumerate(text):
+        if in_string:
+            output.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+            output.append(character)
+            continue
+        if character == ",":
+            next_index = index + 1
+            while next_index < len(text) and text[next_index].isspace():
+                next_index += 1
+            if next_index < len(text) and text[next_index] in "}]":
+                continue
+        output.append(character)
+    return "".join(output)
 
 
 def validate_scoring_output(payload: dict[str, Any]) -> list[str]:
