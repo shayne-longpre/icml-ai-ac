@@ -62,9 +62,9 @@ separate multi-model category consensus for analysis.
    contribution class vote and a resolved ensemble class separately from the
    routing label.
 3. **Strong semifinal (1,442 papers).** GPT-5.6 Terra high and
-   Claude Sonnet 5 high independently rank the same shortlist in size-8,
-   two-partition batches. Preserve both source rankings, normalized consensus,
-   and disagreement.
+   Claude Sonnet 5 high independently rank the same shortlist through
+   OpenRouter in size-8, two-partition batches. Preserve both source rankings,
+   normalized consensus, and disagreement.
 4. **Select finalists (250 papers).** Take a deterministic union of consensus
    leaders, cheap-stage leaders, contribution-class leaders, and large
    cheap/strong or Terra/Sonnet disagreements.

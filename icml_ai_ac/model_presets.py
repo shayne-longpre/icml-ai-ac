@@ -24,7 +24,7 @@ class SemifinalJudge:
 
 
 PRODUCTION_SEMIFINAL_JUDGES = (
-    SemifinalJudge("openai", "gpt-5.6-terra", "high"),
+    SemifinalJudge("openrouter", "openai/gpt-5.6-terra", "high"),
     SemifinalJudge("openrouter", "anthropic/claude-sonnet-5", "high"),
 )
 

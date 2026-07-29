@@ -81,7 +81,7 @@ class ModelPresetTests(unittest.TestCase):
         self.assertEqual(
             [(judge.provider, judge.model, judge.reasoning_effort) for judge in PRODUCTION_SEMIFINAL_JUDGES],
             [
-                ("openai", "gpt-5.6-terra", "high"),
+                ("openrouter", "openai/gpt-5.6-terra", "high"),
                 ("openrouter", "anthropic/claude-sonnet-5", "high"),
             ],
         )

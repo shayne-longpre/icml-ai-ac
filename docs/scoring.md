@@ -207,8 +207,8 @@ tournament top-10 papers.
 python3 -m icml_ai_ac.cli rank-pass2 \
   --manifest data/metadata/icml_2025_accepted_50_parsed.jsonl \
   --pass1 data/scores/icml_2025_pass1_ensemble_v2_3models_shortlist45_classbalanced3.jsonl \
-  --provider openai \
-  --model gpt-5.6-terra \
+  --provider openrouter \
+  --model openai/gpt-5.6-terra \
   --reasoning-effort high \
   --limit 45 \
   --text-source scoring \
@@ -557,8 +557,8 @@ for Sonnet as shown above; this smaller command is useful for diagnostics:
 python3 -m icml_ai_ac.cli rank-pass2 \
   --manifest data/metadata/icml_2025_accepted_50_parsed.jsonl \
   --pass1 data/scores/icml_2025_pass1_20_qwen3_32b_v3_scoring_with_retries.jsonl \
-  --provider openai \
-  --model gpt-5.6-terra \
+  --provider openrouter \
+  --model openai/gpt-5.6-terra \
   --reasoning-effort high \
   --limit 10 \
   --text-source scoring \

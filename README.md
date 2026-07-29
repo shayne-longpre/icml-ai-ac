@@ -111,7 +111,7 @@ After a bounded preflight, the four model streams can run concurrently with
 
 The complete shortlist is independently evaluated over `scoring_repr` by:
 
-- `gpt-5.6-terra` with `high` reasoning
+- `openai/gpt-5.6-terra` through OpenRouter with `high` reasoning
 - `anthropic/claude-sonnet-5` with `high` reasoning
 
 Each judge uses two deterministic, class-stratified listwise partitions instead

@@ -102,8 +102,8 @@ papers; their union sends 1,442 papers to the strong semifinal.
 ## Stage 3: Strong Semifinal Ranking
 
 Two independent text-only judges evaluate the same complete cheap shortlist
-over main-paper scoring text: GPT-5.6 Terra high through OpenAI and Claude
-Sonnet 5 high through OpenRouter. Corpus-wide single responses are infeasible,
+over main-paper scoring text: GPT-5.6 Terra high and Claude Sonnet 5 high,
+both through OpenRouter with exact served-model checks. Corpus-wide single responses are infeasible,
 so each judge uses the same repeated, class-stratified listwise batches. We
 average each paper's normalized local rank across partitions, require one valid
 judgment per partition, and then average the judges' global normalized ranks.
@@ -123,7 +123,7 @@ ordering and rationales but is not allowed to make a narrow final cut.
 The production commands are:
 
 ```text
-rank-pass2-batches --provider openai --model gpt-5.6-terra --reasoning-effort high
+rank-pass2-batches --provider openrouter --model openai/gpt-5.6-terra --reasoning-effort high
 rank-pass2-batches --provider openrouter --model anthropic/claude-sonnet-5 --reasoning-effort high
 ensemble-semifinal-rankings --ranking ... --ranking ... --label terra --label sonnet
 ```
