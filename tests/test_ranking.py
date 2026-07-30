@@ -15,6 +15,7 @@ from icml_ai_ac.scoring.ranking import (
     balance_pass2_batches,
     build_pass2_ranking_messages,
     clear_failed_pass2_attempt,
+    load_cached_pass2_batch,
     run_pass2_batched_ranking,
     validate_pass2_comparison_connectivity,
 )
@@ -196,6 +197,63 @@ class RankingTests(unittest.TestCase):
             self.assertEqual(first["usage"]["cost"], 0.08)
             self.assertEqual(client.calls, 4)
             self.assertEqual(second["resumed_batch_count"], 4)
+
+    def test_cached_recovery_uses_effective_prompt_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            batch_dir = Path(tmp)
+            original_prompt = batch_dir / "prompt.json"
+            recovery_prompt = batch_dir / "recovery" / "prompt.json"
+            recovery_prompt.parent.mkdir()
+            original_prompt.write_text("{}", encoding="utf-8")
+            recovery_prompt.write_text("{}", encoding="utf-8")
+            (batch_dir / "response.json").write_text("{}", encoding="utf-8")
+            (batch_dir / "parsed.json").write_text(
+                json.dumps(
+                    {
+                        "ranked_papers": [
+                            {
+                                "rank": 1,
+                                "paper_id": "p1",
+                                "title": "Paper",
+                                "primary_contribution_class": "theory",
+                                "overall_priority_score": 8,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (batch_dir / "batch.json").write_text(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "fingerprint": "source-fingerprint",
+                        "effective_prompt_path": str(recovery_prompt),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            candidate = RankingCandidate(
+                record=PaperRecord(paper_id="p1", source="blinded_scoring", title="Paper"),
+                pass1_row={},
+                text_path="paper.txt",
+                resolved_text_source="scoring",
+                paper_text="Paper content.",
+            )
+
+            cached = load_cached_pass2_batch(
+                batch_dir=batch_dir,
+                fingerprint="source-fingerprint",
+                candidates=[candidate],
+                prompt_path=original_prompt,
+                partition_index=1,
+                batch_index=2,
+            )
+
+            self.assertIsNotNone(cached)
+            judgments, state = cached
+            self.assertEqual(judgments[0]["prompt_path"], str(recovery_prompt))
+            self.assertTrue(state["resumed"])
 
     def test_balanced_batches_avoid_singleton_tail(self) -> None:
         self.assertEqual([len(batch) for batch in balance_pass2_batches(list(range(5)), 2)], [3, 2])

@@ -135,6 +135,35 @@ class ProviderTests(unittest.TestCase):
 
         self.assertEqual(captured["reasoning"], {"effort": "minimal", "exclude": True})
 
+    def test_openrouter_provider_preferences_are_sent(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_post_json_with_retries(url, payload, *, headers, timeout_seconds, retries, backoff_seconds):
+            captured.update(payload)
+            return {
+                "model": "anthropic/claude-sonnet-5",
+                "choices": [{"message": {"content": "{}"}}],
+                "usage": {},
+            }
+
+        preferences = {"only": ["anthropic"], "allow_fallbacks": False}
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=False):
+            with patch("icml_ai_ac.scoring.providers.post_json_with_retries", fake_post_json_with_retries):
+                client = ChatCompletionClient(
+                    provider="openrouter",
+                    model="anthropic/claude-sonnet-5",
+                    openrouter_provider_preferences=preferences,
+                )
+                result = client.complete(
+                    messages=[{"role": "user", "content": "Return JSON."}],
+                    temperature=0.0,
+                    max_output_tokens=100,
+                    response_format={"type": "json_object"},
+                )
+
+        self.assertEqual(captured["provider"], preferences)
+        self.assertEqual(result.request["provider"], preferences)
+
     def test_provider_error_detail_redacts_account_identifiers(self) -> None:
         detail = '{"error":{"message":"bad request","metadata":{"user_id":"owner-123"}}}'
 

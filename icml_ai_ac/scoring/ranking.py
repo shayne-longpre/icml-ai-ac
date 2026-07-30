@@ -77,6 +77,7 @@ class Pass2BatchedRankingConfig:
     max_output_tokens: int
     seed: int | None
     dry_run: bool
+    openrouter_provider_only: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -299,6 +300,7 @@ def run_pass2_batched_ranking(
         "partition_count": config.partitions,
         "strategy": config.strategy,
         "class_path": str(config.class_path) if config.class_path else None,
+        "openrouter_provider_only": list(config.openrouter_provider_only),
         "batch_count": planned_batch_count,
     }
     if not config.dry_run and client is None:
@@ -446,6 +448,7 @@ def run_pass2_batched_ranking(
                     "usage": chat.usage,
                     "provider_elapsed_seconds": round(chat.elapsed_seconds, 3),
                     "provider_attempt_index": provider_attempt_index,
+                    "provider_preferences": getattr(chat, "request", {}).get("provider"),
                     "resumed": False,
                 }
                 write_json(batch_dir / "batch.json", batch_result)
@@ -479,6 +482,9 @@ def run_pass2_batched_ranking(
                     batch_result["usage"] = usage
                 if served_model:
                     batch_result["served_model"] = served_model
+                provider_preferences = getattr(client, "openrouter_provider_preferences", None)
+                if provider_preferences:
+                    batch_result["provider_preferences"] = provider_preferences
                 write_json(batch_dir / "batch.json", batch_result)
                 batch_results.append(batch_result)
                 if is_batch_blocking_provider_error(exc):
@@ -616,12 +622,13 @@ def load_cached_pass2_batch(
         errors = validate_ranked_paper_coverage(parsed, expected_ids)
         if errors:
             return None
+        effective_prompt_path = Path(str(state.get("effective_prompt_path") or prompt_path))
         judgments = pass2_payload_to_judgments(
             parsed,
             partition_index=partition_index,
             batch_index=batch_index,
             batch_size=len(candidates),
-            prompt_path=prompt_path,
+            prompt_path=effective_prompt_path,
             raw_response_path=raw_response_path,
             parsed_response_path=parsed_response_path,
         )

@@ -580,6 +580,12 @@ def build_parser() -> argparse.ArgumentParser:
     rank_batches.add_argument("--run-dir", type=Path, required=True)
     rank_batches.add_argument("--provider", choices=["openai", "openrouter"], default="openai")
     rank_batches.add_argument("--model", default=DEFAULT_STRONG_MODEL)
+    rank_batches.add_argument(
+        "--openrouter-provider-only",
+        action="append",
+        default=None,
+        help="Restrict an OpenRouter retry to these provider endpoint slugs.",
+    )
     rank_batches.add_argument("--reasoning-effort", default="high")
     rank_batches.add_argument("--prompt-version", default=PASS2_BATCHED_PROMPT_VERSION)
     rank_batches.add_argument("--text-source", choices=["scoring", "full", "compact"], default="scoring")
@@ -2644,11 +2650,21 @@ def cmd_rank_pass2_batches(args: argparse.Namespace) -> int:
         max_output_tokens=args.max_output_tokens,
         seed=args.seed,
         dry_run=args.dry_run,
+        openrouter_provider_only=tuple(args.openrouter_provider_only or ()),
     )
+    provider_preferences = None
+    if args.openrouter_provider_only:
+        if args.provider != "openrouter":
+            raise ValueError("--openrouter-provider-only requires --provider openrouter")
+        provider_preferences = {
+            "only": list(args.openrouter_provider_only),
+            "allow_fallbacks": False,
+        }
     client = None if args.dry_run else ChatCompletionClient(
         provider=args.provider,
         model=args.model,
         reasoning_effort=args.reasoning_effort,
+        openrouter_provider_preferences=provider_preferences,
         timeout_seconds=args.timeout,
         retries=args.retries,
         backoff_seconds=args.backoff,

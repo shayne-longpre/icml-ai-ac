@@ -69,6 +69,7 @@ class ChatCompletionClient:
         model: str,
         reasoning_effort: str | None = None,
         openrouter_pdf_engine: str | None = None,
+        openrouter_provider_preferences: dict[str, Any] | None = None,
         timeout_seconds: float = 120.0,
         retries: int = 3,
         backoff_seconds: float = 5.0,
@@ -77,6 +78,9 @@ class ChatCompletionClient:
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.openrouter_pdf_engine = openrouter_pdf_engine
+        self.openrouter_provider_preferences = (
+            dict(openrouter_provider_preferences) if openrouter_provider_preferences else None
+        )
         self.timeout_seconds = timeout_seconds
         self.retries = retries
         self.backoff_seconds = backoff_seconds
@@ -109,6 +113,8 @@ class ChatCompletionClient:
         if self.provider == "openrouter":
             request_body.pop("max_completion_tokens")
             request_body["max_tokens"] = max_output_tokens
+            if self.openrouter_provider_preferences:
+                request_body["provider"] = dict(self.openrouter_provider_preferences)
         if seed is not None:
             request_body["seed"] = seed
         if response_format is not None:
