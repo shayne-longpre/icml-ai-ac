@@ -11,6 +11,7 @@ from icml_ai_ac.scoring.ranking import (
     Pass2BatchedRankingConfig,
     Pass2RankingConfig,
     RankingCandidate,
+    aggregate_pass2_judgments,
     archive_failed_pass2_attempt,
     balance_pass2_batches,
     build_pass2_ranking_messages,
@@ -254,6 +255,70 @@ class RankingTests(unittest.TestCase):
             judgments, state = cached
             self.assertEqual(judgments[0]["prompt_path"], str(recovery_prompt))
             self.assertTrue(state["resumed"])
+
+    def test_batched_aggregation_is_invariant_to_priority_score_scale(self) -> None:
+        candidates = [
+            RankingCandidate(
+                record=PaperRecord(
+                    paper_id=paper_id,
+                    source="blinded_scoring",
+                    title=f"Paper {paper_id}",
+                ),
+                pass1_row={},
+                text_path=f"{paper_id}.txt",
+                resolved_text_source="scoring",
+                paper_text="Paper content.",
+            )
+            for paper_id in ("p1", "p2")
+        ]
+
+        def build_judgments(second_batch_scale: float) -> list[dict]:
+            rows = []
+            for partition_index, values in enumerate(
+                (
+                    (("p1", 1, 9.0), ("p2", 2, 7.0)),
+                    (
+                        ("p1", 2, 7.0 * second_batch_scale),
+                        ("p2", 1, 9.0 * second_batch_scale),
+                    ),
+                )
+            ):
+                for paper_id, local_rank, score in values:
+                    rows.append(
+                        {
+                            "paper_id": paper_id,
+                            "partition_index": partition_index,
+                            "batch_index": 0,
+                            "batch_size": 2,
+                            "local_rank": local_rank,
+                            "normalized_local_rank": float(local_rank - 1),
+                            "judgment": {
+                                "paper_id": paper_id,
+                                "rank": local_rank,
+                                "overall_priority_score": score,
+                                "broad_scientific_impact_score": 8,
+                                "ml_field_impact_score": 8,
+                                "technical_soundness_score": 8,
+                            },
+                        }
+                    )
+            return rows
+
+        canonical = aggregate_pass2_judgments(candidates, build_judgments(1.0))
+        mixed_scale = aggregate_pass2_judgments(candidates, build_judgments(10.0))
+
+        self.assertEqual(
+            [row["paper_id"] for row in canonical["ranked_papers"]],
+            [row["paper_id"] for row in mixed_scale["ranked_papers"]],
+        )
+        self.assertEqual(
+            [row["overall_priority_score"] for row in canonical["ranked_papers"]],
+            [row["overall_priority_score"] for row in mixed_scale["ranked_papers"]],
+        )
+        self.assertEqual(
+            mixed_scale["ranked_papers"][0]["overall_priority_score_source_scales"],
+            ["0_10", "0_100"],
+        )
 
     def test_balanced_batches_avoid_singleton_tail(self) -> None:
         self.assertEqual([len(batch) for batch in balance_pass2_batches(list(range(5)), 2)], [3, 2])

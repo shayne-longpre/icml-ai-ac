@@ -19,6 +19,7 @@ from icml_ai_ac.storage import ensure_parent, read_json, read_paper_records, wri
 
 PASS2_PROMPT_VERSION = "pass2_strong_batch_rank_v4"
 PASS2_BATCHED_PROMPT_VERSION = "pass2_strong_resumable_batches_v2"
+PASS2_BATCHED_AGGREGATION_VERSION = "pass2_batch_rank_with_calibrated_priority_v2"
 PASS2_STAGE1_PROMPT_VERSION = "pass2_stage1_strong_semifinal_v2"
 PASS2_FINAL_PROMPT_VERSION = "pass2_stage2_strong_final_v2"
 REFERENCE_PROMPT_VERSION = "reference_gold_rank_v2"
@@ -814,6 +815,7 @@ def aggregate_pass2_judgments(
     by_id: dict[str, list[dict[str, Any]]] = {}
     for judgment in judgments:
         by_id.setdefault(str(judgment["paper_id"]), []).append(judgment)
+    priority_metrics = calibrate_pass2_batch_priority_scores(judgments)
     rows: list[dict[str, Any]] = []
     for candidate in candidates:
         paper_id = candidate.record.paper_id
@@ -836,16 +838,46 @@ def aggregate_pass2_judgments(
             "broad_scientific_impact_score",
             "ml_field_impact_score",
             "technical_soundness_score",
-            "overall_priority_score",
         ):
             values = [number(source["judgment"].get(field)) for source in source_judgments]
             row[field] = round(sum(values) / len(values), 4)
+        paper_priority_metrics = [
+            priority_metrics[
+                (
+                    int(source["partition_index"]),
+                    int(source["batch_index"]),
+                    paper_id,
+                )
+            ]
+            for source in source_judgments
+        ]
+        canonical_priority_scores = [
+            float(metric["canonical_score"]) for metric in paper_priority_metrics
+        ]
+        normalized_priority_scores = [
+            float(metric["within_batch_normalized_score"]) for metric in paper_priority_metrics
+        ]
         row.update(
             {
                 "paper_id": paper_id,
                 "title": candidate.record.title,
                 "input_cheap_rank": input_rank[paper_id],
                 "mean_normalized_local_rank": round(mean_normalized_rank, 6),
+                "overall_priority_score": round(
+                    sum(canonical_priority_scores) / len(canonical_priority_scores),
+                    4,
+                ),
+                "mean_batch_normalized_priority_score": round(
+                    sum(normalized_priority_scores) / len(normalized_priority_scores),
+                    6,
+                ),
+                "raw_overall_priority_scores": [
+                    number(source["judgment"].get("overall_priority_score"))
+                    for source in source_judgments
+                ],
+                "overall_priority_score_source_scales": [
+                    str(metric["source_scale"]) for metric in paper_priority_metrics
+                ],
                 "local_rank_range": round(max(normalized_ranks) - min(normalized_ranks), 6),
                 "batch_judgment_count": len(source_judgments),
                 "source_batch_judgments": source_judgments,
@@ -860,6 +892,7 @@ def aggregate_pass2_judgments(
         key=lambda row: (
             row["mean_normalized_local_rank"],
             -number(row.get("overall_priority_score")),
+            -number(row.get("mean_batch_normalized_priority_score")),
             row["input_cheap_rank"],
             row["paper_id"],
         )
@@ -868,10 +901,81 @@ def aggregate_pass2_judgments(
         row["rank"] = rank
     return {
         "evaluation_mode": "pass2_strong_resumable_batch_ranking",
-        "aggregation": "mean_normalized_local_rank",
+        "aggregation": PASS2_BATCHED_AGGREGATION_VERSION,
+        "tie_breaking": [
+            "higher_calibrated_overall_priority_score",
+            "higher_mean_batch_normalized_priority_score",
+            "better_input_cheap_rank",
+            "paper_id",
+        ],
+        "priority_score_calibration": {
+            "reported_score": "canonical 0-10 score; 0-100 batches are divided by 10",
+            "ranking_tie_break": (
+                "mean canonical score, then per-batch min-max normalized canonical score"
+            ),
+            "raw_scores_preserved": True,
+        },
         "ranked_papers": rows,
         "category_rankings": build_pass2_category_rankings(rows),
     }
+
+
+def calibrate_pass2_batch_priority_scores(
+    judgments: list[dict[str, Any]],
+) -> dict[tuple[int, int, str], dict[str, float | str]]:
+    by_batch: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for judgment in judgments:
+        batch_key = (int(judgment["partition_index"]), int(judgment["batch_index"]))
+        by_batch.setdefault(batch_key, []).append(judgment)
+
+    calibrated: dict[tuple[int, int, str], dict[str, float | str]] = {}
+    for (partition_index, batch_index), batch_judgments in by_batch.items():
+        raw_scores = [
+            number(judgment["judgment"].get("overall_priority_score"))
+            for judgment in batch_judgments
+        ]
+        minimum = min(raw_scores)
+        maximum = max(raw_scores)
+        if 0.0 <= minimum and maximum <= 10.0:
+            source_scale = "0_10"
+            canonical_scores = raw_scores
+        elif 10.0 < minimum and maximum <= 100.0:
+            source_scale = "0_100"
+            canonical_scores = [score / 10.0 for score in raw_scores]
+        else:
+            source_scale = "batch_minmax_fallback"
+            span = maximum - minimum
+            canonical_scores = [
+                5.0 if span == 0.0 else 10.0 * (score - minimum) / span
+                for score in raw_scores
+            ]
+
+        canonical_minimum = min(canonical_scores)
+        canonical_maximum = max(canonical_scores)
+        canonical_span = canonical_maximum - canonical_minimum
+        for judgment, raw_score, canonical_score in zip(
+            batch_judgments,
+            raw_scores,
+            canonical_scores,
+            strict=True,
+        ):
+            normalized_score = (
+                0.5
+                if canonical_span == 0.0
+                else (canonical_score - canonical_minimum) / canonical_span
+            )
+            key = (
+                partition_index,
+                batch_index,
+                str(judgment["paper_id"]),
+            )
+            calibrated[key] = {
+                "raw_score": raw_score,
+                "canonical_score": canonical_score,
+                "within_batch_normalized_score": normalized_score,
+                "source_scale": source_scale,
+            }
+    return calibrated
 
 
 def build_pass2_category_rankings(rows: list[dict[str, Any]]) -> dict[str, list[str]]:

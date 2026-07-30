@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -123,12 +124,23 @@ def read_ranking_source(path: Path, *, explicit_label: str | None) -> RankingSou
     metadata = {
         "label": label,
         "path": str(path),
+        "sha256": sha256_path(path),
         "status": status,
         "provider": raw_metadata.get("provider"),
         "requested_model": raw_metadata.get("model"),
         "served_model": raw_metadata.get("served_model"),
         "reasoning_effort": raw_metadata.get("reasoning_effort"),
         "prompt_version": raw_metadata.get("prompt_version"),
+        "source_aggregation": (
+            raw_metadata.get("ranking", {}).get("aggregation")
+            if isinstance(raw_metadata.get("ranking"), dict)
+            else None
+        ),
+        "source_tie_breaking": (
+            raw_metadata.get("ranking", {}).get("tie_breaking")
+            if isinstance(raw_metadata.get("ranking"), dict)
+            else None
+        ),
     }
     return RankingSource(
         path=path,
@@ -144,6 +156,14 @@ def read_top_level_metadata(path: Path) -> dict[str, Any]:
         return {}
     payload = json.loads(path.read_text(encoding="utf-8"))
     return payload if isinstance(payload, dict) else {}
+
+
+def sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def inferred_label(path: Path, metadata: dict[str, Any]) -> str:

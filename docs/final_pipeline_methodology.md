@@ -109,6 +109,9 @@ average each paper's normalized local rank across partitions, require one valid
 judgment per partition, and then average the judges' global normalized ranks.
 Every batch is fingerprinted and resumable. Exact partition coverage and a
 connected overlapping-batch comparison graph are required before aggregation.
+Model priority scores are used only to break within-judge local-rank ties.
+Complete 0-100 batches are rescaled to the intended 0-10 range before this
+tie-break; raw values and detected scales remain stored.
 
 The output retains source judgments, prompts, requested and served model IDs,
 local and global ranks, within-judge batch variation, and between-judge
@@ -119,6 +122,10 @@ mixing model-specific absolute score scales. Consensus ties prefer lower judge
 disagreement; disagreement is retained separately so the selector can preserve
 papers strongly favored by either judge. This stage improves comparative
 ordering and rationales but is not allowed to make a narrow final cut.
+
+The ICML 2026 production audit, including the scale correction, structural
+checks, position sensitivity, and judge-agreement results, is recorded in
+`docs/stage3_production_audit.md`.
 
 The production commands are:
 

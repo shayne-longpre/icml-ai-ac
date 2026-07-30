@@ -24,6 +24,7 @@ from icml_ai_ac.analysis.taxonomy import (
 )
 from icml_ai_ac.analysis.tournament_simulation import simulate_hybrid_tournament
 from icml_ai_ac.analysis.agreement import build_agreement_report, build_axis_decomposition_report
+from icml_ai_ac.analysis.semifinal_audit import audit_semifinal_rankings
 from icml_ai_ac.finalists import FinalistSelectionConfig, read_ranked_rows, select_finalists
 from icml_ai_ac.http import AccessChallengeError, HttpClient, is_pdf_file, sha256_file
 from icml_ai_ac.metadata import enrich_metadata_rows, summarize_openreview_scores
@@ -865,6 +866,18 @@ def build_parser() -> argparse.ArgumentParser:
     semifinal_ensemble.add_argument("--out", type=Path, required=True)
     semifinal_ensemble.add_argument("--report", type=Path, default=None)
     semifinal_ensemble.set_defaults(func=cmd_ensemble_semifinal_rankings)
+
+    semifinal_audit = subparsers.add_parser(
+        "audit-semifinal-rankings",
+        help="Audit complete strong-semifinal ranking streams before local aggregation.",
+    )
+    semifinal_audit.add_argument("--ranking", type=Path, required=True, action="append")
+    semifinal_audit.add_argument("--label", required=True, action="append")
+    semifinal_audit.add_argument("--expected-model", required=True, action="append")
+    semifinal_audit.add_argument("--shortlist", type=Path, required=True)
+    semifinal_audit.add_argument("--manifest", type=Path, required=True)
+    semifinal_audit.add_argument("--out", type=Path, required=True)
+    semifinal_audit.set_defaults(func=cmd_audit_semifinal_rankings)
 
     finalists = subparsers.add_parser(
         "select-finalists",
@@ -3053,6 +3066,22 @@ def cmd_ensemble_semifinal_rankings(args: argparse.Namespace) -> int:
         f"{payload['paper_count']} papers"
     )
     return 0
+
+
+def cmd_audit_semifinal_rankings(args: argparse.Namespace) -> int:
+    payload = audit_semifinal_rankings(
+        ranking_paths=args.ranking,
+        labels=args.label,
+        expected_models=args.expected_model,
+        shortlist_path=args.shortlist,
+        manifest_path=args.manifest,
+        out=args.out,
+    )
+    print(
+        f"Stage 3 audit {payload['status']}: papers={payload['paper_count']} "
+        f"blocking={len(payload['blocking_issues'])} warnings={len(payload['warnings'])}"
+    )
+    return 1 if payload["blocking_issues"] else 0
 
 
 def cmd_select_finalists(args: argparse.Namespace) -> int:

@@ -61,7 +61,7 @@ separate multi-model category consensus for analysis.
    20%. The production union contains 1,442 papers. Store every model's
    contribution class vote and a resolved ensemble class separately from the
    routing label.
-3. **Strong semifinal (1,442 papers).** GPT-5.6 Terra high and
+3. **Strong semifinal (complete: 1,442 papers).** GPT-5.6 Terra high and
    Claude Sonnet 5 high independently rank the same shortlist through
    OpenRouter in size-8, two-partition batches. Preserve both source rankings,
    normalized consensus, and disagreement.

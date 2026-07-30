@@ -73,6 +73,7 @@ class SemifinalRankingEnsembleTests(unittest.TestCase):
             self.assertEqual(rows[1]["source_rows"]["terra"]["why_ranked_here"], "Reason from rank 1")
             self.assertEqual(rows[1]["source_judges"]["sonnet"]["served_model"], "anthropic/claude-sonnet-5")
             self.assertEqual(payload["sources"][1]["requested_model"], "anthropic/claude-sonnet-5")
+            self.assertEqual(len(payload["sources"][1]["sha256"]), 64)
             self.assertEqual(json.loads(report.read_text(encoding="utf-8"))["paper_count"], 4)
 
     def test_rejects_mismatched_paper_coverage(self) -> None:
