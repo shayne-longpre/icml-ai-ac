@@ -198,6 +198,23 @@ The finalist file flows directly into card generation:
 rank-frontier-pdf-cards --paper-list finalists.jsonl
 ```
 
+The production pass completed 750/750 cards. Because Gemini's score scale was
+substantially higher and narrower than the Sol and Fable-panel scales, the
+three streams are combined by equal-weight, tie-aware within-judge rank
+percentiles. Overall gold priority is the primary within-judge key; broad
+impact, ML impact, technical soundness, evidence confidence, and novelty break
+exact score ties. Raw scores and judge disagreement remain in the artifact but
+do not determine the ensemble seed.
+
+A focused production audit found complete 250-paper coverage. Each judge had
+Spearman correlation 0.72-0.85 with the ensemble; omitting any one judge left
+Spearman correlation 0.927-0.936 with the full result. The 29 explicit
+Fable-to-Opus fallbacks were not elevated as a group. A deterministic sample
+of consensus leaders, prior-stage leaders, and the largest disagreements found
+paper-specific evidence and limitations rather than malformed or generic
+judgments. This ensemble is a transparent tournament seed and robustness
+baseline, not the final ranking.
+
 ## Stage 6: Hybrid Tournament Ranking
 
 The final ranking uses card evidence rather than raw PDFs, with GPT-5.6 Sol
@@ -210,6 +227,15 @@ cost-control design is a hybrid tournament:
 3. Run all-pairs comparisons only within that subset.
 4. Use the dense playoff as the headline ranking and Swiss standings as
    supporting evidence outside the playoff.
+
+The production Sol synthesis completed all 250 ranks in one validated request,
+using 277,774 prompt tokens and 81,189 completion tokens, including 15,611
+reasoning tokens. It cost $6.43 and took 23.4 minutes. The synthesis and
+rank-calibrated ensemble had Spearman 0.848 and shared 128/150 papers at their
+respective top-150 cuts. To avoid making this inexpensive disagreement a hard
+recall loss, the production Swiss pool is their 172-paper union. This adds 110
+Swiss comparisons relative to a 150-paper pool and does not change the
+60-paper playoff size.
 
 The synthesis seed chooses the tournament pool but is not shown as a rank.
 Pair assignment to batches, A/B presentation, and evidence-block order are
@@ -240,7 +266,7 @@ Recommended first production defaults:
 
 ```text
 PDF-aware finalists: 250
-Swiss pool: 150
+Swiss pool: union of synthesis top 150 and card-ensemble top 150 (172 observed)
 Swiss rounds: 10
 Dense playoff: 60
 ```

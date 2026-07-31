@@ -333,10 +333,27 @@ Use `openai/gpt-5.6-sol` xhigh for card synthesis and tournament adjudication.
 Run Fable with `--fallback-model anthropic/claude-opus-4.8
 --fallback-reasoning-effort high`. Store both requested and served model IDs,
 the primary failure, fallback reason, and cumulative usage.
+Use a 12,000-token output ceiling for frontier cards. The production run showed
+that 6,000 tokens can be exhausted by hidden reasoning before the structured
+card is complete.
 The refreshed panel passed a 3/3 one-paper live PDF/JSON smoke test. Sol, Fable,
 and Gemini reported their requested model IDs and cost $0.258, $0.608, and
 $0.065 respectively. In the 12-paper preflight, one Fable card required the
 explicit Opus fallback; all 36 cards completed.
+
+The 250-paper production pass completed 750/750 valid cards. Four Sol cards
+required same-model 12,000-token repairs, and 29 Fable requests used the
+explicit Opus fallback. Gemini's overall-priority scores were materially more
+compressed and lenient than Sol or Fable, so downstream aggregation must use
+within-judge ranks or calibrated percentiles rather than raw score means.
+
+The production `rank-frontier-card-ensemble` output uses equal-weight,
+tie-aware within-judge rank percentiles. Overall gold priority is primary;
+broad impact, ML impact, technical soundness, evidence confidence, and novelty
+break exact score ties. It requires complete matching paper coverage in every
+stream and retains raw scores, source ranks, served models, fallbacks, and
+judge disagreement. The focused 250-paper audit found 0.927-0.936 Spearman
+correlation between the full ensemble and each leave-one-judge-out result.
 
 Artifacts:
 

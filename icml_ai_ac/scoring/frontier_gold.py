@@ -27,7 +27,7 @@ from icml_ai_ac.storage import read_paper_records, write_json, write_jsonl
 
 
 FRONTIER_CARD_PROMPT_VERSION = "frontier_pdf_paper_card_v2"
-FRONTIER_CARD_ENSEMBLE_VERSION = "frontier_pdf_card_ensemble_v1"
+FRONTIER_CARD_ENSEMBLE_VERSION = "frontier_pdf_card_ensemble_v2"
 FRONTIER_SYNTHESIS_PROMPT_VERSION = "frontier_pdf_card_synthesis_rank_v2"
 FRONTIER_TOURNAMENT_PROMPT_VERSION = "frontier_pdf_card_pairwise_tournament_v4"
 
@@ -517,28 +517,65 @@ PAPER_TEXT
 def build_frontier_card_ensemble(
     *,
     card_paths: list[Path],
+    labels: list[str] | None = None,
     out: Path,
     paper_set_name: str,
     prompt_version: str = FRONTIER_CARD_ENSEMBLE_VERSION,
 ) -> dict[str, Any]:
-    rows = load_card_rows(card_paths)
-    by_paper: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        if row.get("status") != "ok":
-            continue
-        paper_id = str(row.get("paper_id") or "")
-        if paper_id:
-            by_paper.setdefault(paper_id, []).append(row)
-    ranked_items = [ensemble_item(paper_id, paper_rows) for paper_id, paper_rows in by_paper.items()]
-    ranked_items.sort(
-        key=lambda item: (
-            number(item.get("ensemble_gold_priority_score")),
-            number(item.get("ensemble_broad_scientific_impact_score")),
-            -number(item.get("judge_score_stddev")),
-            number(item.get("ensemble_technical_soundness_score")),
-        ),
-        reverse=True,
-    )
+    if not card_paths:
+        raise ValueError("at least one frontier card path is required")
+    stream_labels = labels or [path.stem for path in card_paths]
+    if len(stream_labels) != len(card_paths):
+        raise ValueError("supply exactly one --label per --cards path")
+    if len(set(stream_labels)) != len(stream_labels):
+        raise ValueError("frontier card stream labels must be unique")
+
+    stream_rows: dict[str, dict[str, dict[str, Any]]] = {}
+    stream_metadata: list[dict[str, Any]] = []
+    expected_ids: set[str] | None = None
+    for label, path in zip(stream_labels, card_paths, strict=True):
+        rows_by_paper = load_complete_card_stream(path=path, label=label)
+        paper_ids = set(rows_by_paper)
+        if expected_ids is None:
+            expected_ids = paper_ids
+        elif paper_ids != expected_ids:
+            missing = sorted(expected_ids - paper_ids)
+            extras = sorted(paper_ids - expected_ids)
+            raise ValueError(
+                f"frontier card coverage mismatch for {label}: missing={missing}, extras={extras}"
+            )
+        ranked_rows = rank_frontier_card_stream(rows_by_paper)
+        stream_rows[label] = ranked_rows
+        stream_metadata.append(
+            {
+                "label": label,
+                "path": str(path),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "row_count": len(ranked_rows),
+                "served_models": dict(
+                    sorted(
+                        _counts(
+                            str(row.get("served_model") or "")
+                            for row in ranked_rows.values()
+                            if row.get("served_model")
+                        ).items()
+                    )
+                ),
+                "fallback_count": sum(
+                    1 for row in ranked_rows.values() if row.get("fallback_from_model")
+                ),
+            }
+        )
+
+    paper_ids = sorted(expected_ids or set())
+    ranked_items = [
+        ensemble_item(
+            paper_id,
+            {label: stream_rows[label][paper_id] for label in stream_labels},
+        )
+        for paper_id in paper_ids
+    ]
+    ranked_items.sort(key=frontier_ensemble_sort_key)
     for rank, item in enumerate(ranked_items, start=1):
         item["rank"] = rank
     payload = {
@@ -546,13 +583,27 @@ def build_frontier_card_ensemble(
         "prompt_version": prompt_version,
         "paper_set": paper_set_name,
         "card_paths": [str(path) for path in card_paths],
+        "card_streams": stream_metadata,
         "candidate_count": len(ranked_items),
-        "judge_count_by_paper": {paper_id: len(paper_rows) for paper_id, paper_rows in sorted(by_paper.items())},
+        "judge_count": len(stream_labels),
+        "judge_count_by_paper": {paper_id: len(stream_labels) for paper_id in paper_ids},
         "ranked_papers": ranked_items,
         "category_rankings": build_category_rankings(ranked_items),
         "method_notes": {
             "modality": "Each judge card saw the configured first-page PDF excerpt plus extracted main-paper text.",
-            "ranking_method": "Mean normalized frontier-card scores with disagreement retained for later tournament adjudication.",
+            "ranking_method": (
+                "Equal-weight mean of tie-aware within-judge rank percentiles. "
+                "Overall gold priority is primary; broad impact, ML impact, technical "
+                "soundness, evidence confidence, and novelty break exact score ties."
+            ),
+            "scale_handling": (
+                "Raw scores are retained for analysis but never averaged to determine "
+                "the ensemble rank."
+            ),
+            "fallback_handling": (
+                "Each input path is one judge stream, so an explicitly recorded fallback "
+                "remains part of its requested panel stream rather than becoming an extra judge."
+            ),
             "limitation": "This is a PDF-aware ensemble prior, not the final pairwise tournament ranking.",
         },
     }
@@ -585,8 +636,15 @@ def run_frontier_card_synthesis(
         "provider": config.provider,
         "model": config.model,
         "reasoning_effort": config.reasoning_effort,
+        "temperature": config.temperature,
+        "max_output_tokens": config.max_output_tokens,
+        "seed": config.seed,
         "paper_set_name": config.paper_set_name,
         "card_paths": [str(path) for path in card_paths],
+        "card_sha256": {
+            str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in card_paths
+        },
         "candidate_count": len(paper_ids),
         "candidate_ids": paper_ids,
         "messages": messages,
@@ -599,6 +657,9 @@ def run_frontier_card_synthesis(
         "provider": config.provider,
         "model": config.model,
         "reasoning_effort": config.reasoning_effort,
+        "temperature": config.temperature,
+        "max_output_tokens": config.max_output_tokens,
+        "seed": config.seed,
         "prompt_version": config.prompt_version,
         "paper_set_name": config.paper_set_name,
         "card_paths": [str(path) for path in card_paths],
@@ -726,10 +787,21 @@ def run_frontier_card_tournament(
         "provider": config.provider,
         "model": config.model,
         "reasoning_effort": config.reasoning_effort,
+        "temperature": config.temperature,
+        "max_output_tokens": config.max_output_tokens,
+        "seed": config.seed,
+        "overwrite": config.overwrite,
         "paper_set_name": config.paper_set_name,
         "strategy": config.strategy,
         "card_paths": [str(path) for path in card_paths],
+        "card_sha256": {
+            str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in card_paths
+        },
         "seed_ranking_path": str(seed_ranking_path),
+        "seed_ranking_sha256": hashlib.sha256(
+            seed_ranking_path.read_bytes()
+        ).hexdigest(),
         "out": str(out),
         "run_dir": str(run_dir),
         "top_n": config.top_n,
@@ -1393,24 +1465,77 @@ def randomize_tournament_pairs(
 
 
 def build_swiss_round_pairs(standings_ids: list[str], played_pair_keys: set[frozenset[str]]) -> list[tuple[str, str]]:
-    pairs: list[tuple[str, str]] = []
-    used: set[str] = set()
-    for paper_id in standings_ids:
-        if paper_id in used:
-            continue
-        opponent = None
-        for candidate_id in standings_ids:
-            key = frozenset((paper_id, candidate_id))
-            if candidate_id == paper_id or candidate_id in used or key in played_pair_keys:
-                continue
-            opponent = candidate_id
-            break
-        if opponent is None:
-            continue
-        used.add(paper_id)
-        used.add(opponent)
-        played_pair_keys.add(frozenset((paper_id, opponent)))
-        pairs.append((paper_id, opponent))
+    if len(set(standings_ids)) != len(standings_ids):
+        raise ValueError("Swiss standings contain duplicate paper IDs")
+
+    position = {paper_id: index for index, paper_id in enumerate(standings_ids)}
+    failed_states: set[frozenset[str]] = set()
+
+    def find_matching(remaining: tuple[str, ...]) -> list[tuple[str, str]] | None:
+        if not remaining:
+            return []
+        state = frozenset(remaining)
+        if state in failed_states:
+            return None
+
+        available_by_paper = {
+            paper_id: [
+                candidate_id
+                for candidate_id in remaining
+                if candidate_id != paper_id
+                and frozenset((paper_id, candidate_id)) not in played_pair_keys
+            ]
+            for paper_id in remaining
+        }
+        paper_id = min(
+            remaining,
+            key=lambda value: (
+                len(available_by_paper[value]),
+                position[value],
+            ),
+        )
+        opponents = sorted(
+            available_by_paper[paper_id],
+            key=lambda value: (
+                abs(position[value] - position[paper_id]),
+                position[value],
+            ),
+        )
+        for opponent_id in opponents:
+            next_remaining = tuple(
+                value
+                for value in remaining
+                if value not in {paper_id, opponent_id}
+            )
+            suffix = find_matching(next_remaining)
+            if suffix is not None:
+                return [(paper_id, opponent_id), *suffix]
+
+        failed_states.add(state)
+        return None
+
+    if len(standings_ids) % 2 == 0:
+        pairs = find_matching(tuple(standings_ids))
+    else:
+        pairs = None
+        for bye_id in reversed(standings_ids):
+            remaining = tuple(
+                paper_id for paper_id in standings_ids if paper_id != bye_id
+            )
+            pairs = find_matching(remaining)
+            if pairs is not None:
+                break
+
+    if pairs is None:
+        raise ValueError(
+            "Swiss scheduler could not construct a complete round without repeated pairs"
+        )
+    expected_pair_count = len(standings_ids) // 2
+    if len(pairs) != expected_pair_count:
+        raise ValueError(
+            f"Swiss scheduler produced {len(pairs)} of {expected_pair_count} required pairs"
+        )
+    played_pair_keys.update(frozenset(pair) for pair in pairs)
     return pairs
 
 
@@ -1957,8 +2082,121 @@ def validate_synthesis_ranking(parsed: dict[str, Any], *, expected_ids: list[str
     return errors
 
 
-def ensemble_item(paper_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
-    cards = [row.get("card") for row in rows if isinstance(row.get("card"), dict)]
+FRONTIER_RANK_SCORE_KEYS = (
+    "overall_gold_priority_score",
+    "broad_scientific_impact_score",
+    "ml_field_impact_score",
+    "technical_soundness_score",
+    "evidence_confidence_score",
+    "novelty_score",
+)
+
+FRONTIER_ALL_SCORE_KEYS = FRONTIER_RANK_SCORE_KEYS + ("visual_evidence_importance_score",)
+
+
+def load_complete_card_stream(*, path: Path, label: str) -> dict[str, dict[str, Any]]:
+    rows = load_card_rows([path])
+    if not rows:
+        raise ValueError(f"frontier card stream is empty: {label} ({path})")
+    by_paper: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        paper_id = str(row.get("paper_id") or "")
+        if not paper_id:
+            raise ValueError(f"frontier card stream {label} contains a row without paper_id")
+        if paper_id in by_paper:
+            raise ValueError(f"frontier card stream {label} has duplicate paper_id {paper_id}")
+        if row.get("status") != "ok":
+            raise ValueError(
+                f"frontier card stream {label} has non-ok paper {paper_id}: {row.get('status')}"
+            )
+        card = row.get("card")
+        if not isinstance(card, dict):
+            raise ValueError(f"frontier card stream {label} has no card for {paper_id}")
+        validation_errors = validate_frontier_card(card, expected_paper_id=paper_id)
+        if validation_errors:
+            raise ValueError(
+                f"frontier card stream {label} has invalid paper {paper_id}: {validation_errors}"
+            )
+        by_paper[paper_id] = dict(row)
+    return by_paper
+
+
+def rank_frontier_card_stream(
+    rows_by_paper: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    paper_ids = list(rows_by_paper)
+    ranking_values = {
+        paper_id: tuple(
+            card_score(rows_by_paper[paper_id]["card"], key)
+            for key in FRONTIER_RANK_SCORE_KEYS
+        )
+        for paper_id in paper_ids
+    }
+    ranks = tie_aware_descending_ranks(ranking_values)
+    axis_percentiles = {
+        key: rank_percentiles(
+            tie_aware_descending_ranks(
+                {
+                    paper_id: (card_score(rows_by_paper[paper_id]["card"], key),)
+                    for paper_id in paper_ids
+                }
+            )
+        )
+        for key in FRONTIER_ALL_SCORE_KEYS
+    }
+    percentiles = rank_percentiles(ranks)
+    ranked: dict[str, dict[str, Any]] = {}
+    for paper_id, row in rows_by_paper.items():
+        ranked[paper_id] = {
+            **row,
+            "within_judge_rank": round(ranks[paper_id], 6),
+            "within_judge_percentile": round(percentiles[paper_id], 9),
+            "within_judge_axis_percentiles": {
+                key: round(values[paper_id], 9)
+                for key, values in axis_percentiles.items()
+            },
+        }
+    return ranked
+
+
+def tie_aware_descending_ranks(
+    values_by_paper: dict[str, tuple[float, ...]],
+) -> dict[str, float]:
+    ordered = sorted(
+        values_by_paper,
+        key=lambda paper_id: values_by_paper[paper_id],
+        reverse=True,
+    )
+    ranks: dict[str, float] = {}
+    index = 0
+    while index < len(ordered):
+        end = index + 1
+        value = values_by_paper[ordered[index]]
+        while end < len(ordered) and values_by_paper[ordered[end]] == value:
+            end += 1
+        average_rank = (index + 1 + end) / 2.0
+        for tied_index in range(index, end):
+            ranks[ordered[tied_index]] = average_rank
+        index = end
+    return ranks
+
+
+def rank_percentiles(ranks_by_paper: dict[str, float]) -> dict[str, float]:
+    count = len(ranks_by_paper)
+    if count <= 1:
+        return {paper_id: 1.0 for paper_id in ranks_by_paper}
+    return {
+        paper_id: (count - rank) / (count - 1)
+        for paper_id, rank in ranks_by_paper.items()
+    }
+
+
+def ensemble_item(
+    paper_id: str,
+    rows_by_label: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    rows = list(rows_by_label.values())
+    cards = [row["card"] for row in rows]
     score_keys = [
         "overall_gold_priority_score",
         "broad_scientific_impact_score",
@@ -1970,6 +2208,18 @@ def ensemble_item(paper_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     means = {key: mean([card_score(card, key) for card in cards]) for key in score_keys}
     overall_values = [card_score(card, "overall_gold_priority_score") for card in cards]
+    judge_percentiles = {
+        label: number(row.get("within_judge_percentile"))
+        for label, row in rows_by_label.items()
+    }
+    rank_score = statistics.mean(judge_percentiles.values())
+    consensus_axis_percentiles = {
+        key: statistics.mean(
+            number(row.get("within_judge_axis_percentiles", {}).get(key))
+            for row in rows
+        )
+        for key in FRONTIER_ALL_SCORE_KEYS
+    }
     primary_class = majority(
         str(card.get("primary_contribution_class") or "other")
         for card in cards
@@ -1998,15 +2248,56 @@ def ensemble_item(paper_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         "novelty_score": round(means["novelty_score"], 3),
         "evidence_confidence_score": round(means["evidence_confidence_score"], 3),
         "visual_evidence_importance_score": round(means["visual_evidence_importance_score"], 3),
-        "ensemble_gold_priority_score": round(means["overall_gold_priority_score"], 3),
-        "ensemble_broad_scientific_impact_score": round(means["broad_scientific_impact_score"], 3),
-        "ensemble_technical_soundness_score": round(means["technical_soundness_score"], 3),
+        "ensemble_rank_score": round(rank_score, 9),
+        "ensemble_gold_priority_score": round(rank_score, 9),
+        "ensemble_broad_scientific_impact_score": round(
+            consensus_axis_percentiles["broad_scientific_impact_score"],
+            9,
+        ),
+        "ensemble_technical_soundness_score": round(
+            consensus_axis_percentiles["technical_soundness_score"],
+            9,
+        ),
+        "consensus_axis_percentiles": {
+            key: round(value, 9)
+            for key, value in consensus_axis_percentiles.items()
+        },
+        "raw_mean_scores": {key: round(value, 3) for key, value in means.items()},
         "judge_count": len(cards),
         "judge_score_stddev": round(statistics.pstdev(overall_values), 3) if len(overall_values) > 1 else 0.0,
+        "judge_rank_stddev": round(
+            statistics.pstdev(judge_percentiles.values()),
+            9,
+        )
+        if len(judge_percentiles) > 1
+        else 0.0,
+        "judge_rank_range": round(
+            max(judge_percentiles.values()) - min(judge_percentiles.values()),
+            9,
+        )
+        if judge_percentiles
+        else 0.0,
+        "source_judge_percentiles": {
+            label: round(value, 9)
+            for label, value in judge_percentiles.items()
+        },
+        "source_judge_ranks": {
+            label: round(number(row.get("within_judge_rank")), 6)
+            for label, row in rows_by_label.items()
+        },
         "advance_to_final_review": True,
         "judge_summaries": [
             {
+                "stream_label": label,
                 "judge": card.get("judge"),
+                "requested_model": row.get("fallback_from_model") or row.get("model"),
+                "served_model": row.get("served_model"),
+                "fallback_from_model": row.get("fallback_from_model"),
+                "within_judge_rank": round(number(row.get("within_judge_rank")), 6),
+                "within_judge_percentile": round(
+                    number(row.get("within_judge_percentile")),
+                    9,
+                ),
                 "overall_gold_priority_score": card_score(card, "overall_gold_priority_score"),
                 "broad_scientific_impact_score": card_score(card, "broad_scientific_impact_score"),
                 "technical_soundness_score": card_score(card, "technical_soundness_score"),
@@ -2019,7 +2310,8 @@ def ensemble_item(paper_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
                 ),
                 "one_sentence_summary": card.get("one_sentence_summary"),
             }
-            for card in cards
+            for label, row in rows_by_label.items()
+            for card in [row["card"]]
         ],
         "why_ranked_here": synthesize_why_ranked(cards),
         "best_case_for_impact": first_nonempty(
@@ -2029,10 +2321,36 @@ def ensemble_item(paper_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def frontier_ensemble_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    axis = item.get("consensus_axis_percentiles")
+    axis = axis if isinstance(axis, dict) else {}
+    return (
+        -number(item.get("ensemble_rank_score")),
+        -number(axis.get("broad_scientific_impact_score")),
+        -number(axis.get("ml_field_impact_score")),
+        -number(axis.get("technical_soundness_score")),
+        -number(axis.get("evidence_confidence_score")),
+        -number(axis.get("novelty_score")),
+        number(item.get("judge_rank_stddev")),
+        str(item.get("paper_id") or ""),
+    )
+
+
+def _counts(values: Any) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
 def validate_frontier_card(parsed: dict[str, Any], *, expected_paper_id: str) -> list[str]:
     errors: list[str] = []
     if str(parsed.get("paper_id") or "") != expected_paper_id:
         errors.append(f"paper_id mismatch: expected {expected_paper_id}, got {parsed.get('paper_id')}")
+    if parsed.get("evaluation_mode") != "frontier_pdf_paper_card":
+        errors.append("evaluation_mode must be frontier_pdf_paper_card")
+    if not isinstance(parsed.get("title"), str) or not parsed["title"].strip():
+        errors.append("title must be a non-empty string")
     scores = parsed.get("scores")
     if not isinstance(scores, dict):
         errors.append("missing scores object")
@@ -2042,6 +2360,9 @@ def validate_frontier_card(parsed: dict[str, Any], *, expected_paper_id: str) ->
             "broad_scientific_impact_score",
             "ml_field_impact_score",
             "technical_soundness_score",
+            "novelty_score",
+            "evidence_confidence_score",
+            "visual_evidence_importance_score",
         ]:
             value = number(scores.get(key))
             if value < 1 or value > 10:
@@ -2049,7 +2370,68 @@ def validate_frontier_card(parsed: dict[str, Any], *, expected_paper_id: str) ->
     contribution_class = str(parsed.get("primary_contribution_class") or "")
     if contribution_class not in CONTRIBUTION_CLASSES:
         errors.append(f"unknown primary_contribution_class: {contribution_class}")
+    secondary_classes = parsed.get("secondary_contribution_classes")
+    if not isinstance(secondary_classes, list):
+        errors.append("secondary_contribution_classes must be a list")
+    elif any(str(value) not in CONTRIBUTION_CLASSES for value in secondary_classes):
+        errors.append("secondary_contribution_classes contains an unknown class")
+
+    _require_string_fields(
+        parsed,
+        section="impact_assessment",
+        fields=(
+            "two_year_adoption_path",
+            "five_year_field_effect",
+            "best_case_for_impact",
+            "main_risk",
+            "why_not_higher",
+            "why_not_lower",
+        ),
+        errors=errors,
+    )
+    _require_string_fields(
+        parsed,
+        section="ranking_hooks",
+        fields=("beats_papers_when", "loses_to_papers_when", "top_10_case"),
+        errors=errors,
+    )
+    ranking_hooks = parsed.get("ranking_hooks")
+    if isinstance(ranking_hooks, dict) and not isinstance(ranking_hooks.get("category_standout"), bool):
+        errors.append("ranking_hooks.category_standout must be a boolean")
+    evidence = parsed.get("evidence_from_pdf")
+    if not isinstance(evidence, dict):
+        errors.append("missing evidence_from_pdf object")
+    else:
+        for key in ("figures_or_tables_that_matter", "missing_or_weak_visual_evidence"):
+            if not isinstance(evidence.get(key), list):
+                errors.append(f"evidence_from_pdf.{key} must be a list")
+        visual_judgment = evidence.get("visual_or_tabular_evidence_changes_judgment")
+        if not isinstance(visual_judgment, str) or not visual_judgment.strip():
+            errors.append(
+                "evidence_from_pdf.visual_or_tabular_evidence_changes_judgment "
+                "must be a non-empty string"
+            )
+    summary = parsed.get("one_sentence_summary")
+    if not isinstance(summary, str) or not summary.strip():
+        errors.append("one_sentence_summary must be a non-empty string")
     return errors
+
+
+def _require_string_fields(
+    payload: dict[str, Any],
+    *,
+    section: str,
+    fields: tuple[str, ...],
+    errors: list[str],
+) -> None:
+    value = payload.get(section)
+    if not isinstance(value, dict):
+        errors.append(f"missing {section} object")
+        return
+    for field in fields:
+        child = value.get(field)
+        if not isinstance(child, str) or not child.strip():
+            errors.append(f"{section}.{field} must be a non-empty string")
 
 
 def load_card_rows(paths: list[Path]) -> list[dict[str, Any]]:

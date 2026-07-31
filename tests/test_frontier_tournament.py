@@ -3,6 +3,7 @@ import unittest
 from icml_ai_ac.scoring.frontier_gold import (
     aggregate_tournament_matches,
     batch_tournament_pairs,
+    build_swiss_round_pairs,
     build_tournament_pairs,
     normalize_tournament_batch,
     pair_id_for,
@@ -56,6 +57,20 @@ class FrontierTournamentTests(unittest.TestCase):
         self.assertTrue(
             any(pair == original_orientation[frozenset(pair)] for pair in randomized)
         )
+
+    def test_swiss_scheduler_completes_ten_rounds_for_172_papers(self) -> None:
+        paper_ids = [f"p{index:03d}" for index in range(172)]
+        played: set[frozenset[str]] = set()
+
+        for _ in range(10):
+            pairs = build_swiss_round_pairs(paper_ids, played)
+            self.assertEqual(len(pairs), 86)
+            self.assertEqual(
+                len({paper_id for pair in pairs for paper_id in pair}),
+                172,
+            )
+
+        self.assertEqual(len(played), 860)
 
     def test_tournament_prompt_fingerprint_covers_decoding_configuration(self) -> None:
         payload = {

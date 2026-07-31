@@ -14,11 +14,68 @@ from icml_ai_ac.scoring.frontier_gold import (
     frontier_card_request_fingerprint,
     run_frontier_pdf_cards,
     run_pair_batches,
+    validate_frontier_card,
 )
 from icml_ai_ac.models import PaperRecord
 
 
 class FrontierCardFallbackTests(unittest.TestCase):
+    def test_frontier_card_validation_requires_complete_structure(self) -> None:
+        card = {
+            "evaluation_mode": "frontier_pdf_paper_card",
+            "paper_id": "p1",
+            "title": "Paper",
+            "primary_contribution_class": "core_ml_algorithm",
+            "secondary_contribution_classes": [],
+            "scores": {
+                "overall_gold_priority_score": 7,
+                "broad_scientific_impact_score": 6,
+                "ml_field_impact_score": 7,
+                "technical_soundness_score": 8,
+                "novelty_score": 7,
+                "evidence_confidence_score": 6,
+                "visual_evidence_importance_score": 5,
+            },
+            "impact_assessment": {
+                "two_year_adoption_path": "Adoption path.",
+                "five_year_field_effect": "Field effect.",
+                "best_case_for_impact": "Best case.",
+                "main_risk": "Main risk.",
+                "why_not_higher": "Ceiling.",
+                "why_not_lower": "Floor.",
+            },
+            "evidence_from_pdf": {
+                "figures_or_tables_that_matter": [],
+                "visual_or_tabular_evidence_changes_judgment": "no",
+                "missing_or_weak_visual_evidence": [],
+            },
+            "ranking_hooks": {
+                "beats_papers_when": "Condition.",
+                "loses_to_papers_when": "Condition.",
+                "category_standout": False,
+                "top_10_case": "Case.",
+            },
+            "one_sentence_summary": "Summary.",
+        }
+
+        self.assertEqual(validate_frontier_card(card, expected_paper_id="p1"), [])
+
+        malformed = dict(card)
+        malformed["impact_assessment"] = {
+            **card["impact_assessment"],
+            "evidence_from_pdf": card["evidence_from_pdf"],
+            "ranking_hooks": card["ranking_hooks"],
+            "one_sentence_summary": card["one_sentence_summary"],
+        }
+        malformed.pop("evidence_from_pdf")
+        malformed.pop("ranking_hooks")
+        malformed.pop("one_sentence_summary")
+        errors = validate_frontier_card(malformed, expected_paper_id="p1")
+
+        self.assertIn("missing evidence_from_pdf object", errors)
+        self.assertIn("missing ranking_hooks object", errors)
+        self.assertIn("one_sentence_summary must be a non-empty string", errors)
+
     def test_card_fingerprint_covers_model_and_content_but_not_human_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -710,7 +710,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     frontier_cards.add_argument("--pdf-settings", default="/ebook", help="Ghostscript PDFSETTINGS value for oversized excerpts.")
     frontier_cards.add_argument("--temperature", type=float, default=0.0)
-    frontier_cards.add_argument("--max-output-tokens", type=int, default=6000)
+    frontier_cards.add_argument("--max-output-tokens", type=int, default=12_000)
     frontier_cards.add_argument("--seed", type=int, default=None)
     frontier_cards.add_argument("--dry-run", action="store_true")
     frontier_cards.add_argument("--overwrite", action="store_true")
@@ -732,6 +732,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Aggregate multiple PDF-aware frontier card JSONL files into a reference ranking prior.",
     )
     frontier_ensemble.add_argument("--cards", type=Path, required=True, action="append")
+    frontier_ensemble.add_argument(
+        "--label",
+        action="append",
+        default=None,
+        help="Stable judge-stream label. Supply once per --cards path in the same order.",
+    )
     frontier_ensemble.add_argument("--out", type=Path, required=True)
     frontier_ensemble.add_argument("--paper-set-name", default="icml_2025_accepted_50")
     frontier_ensemble.add_argument("--prompt-version", default=FRONTIER_CARD_ENSEMBLE_VERSION)
@@ -2877,6 +2883,7 @@ def cmd_rank_frontier_pdf_cards(args: argparse.Namespace) -> int:
 def cmd_rank_frontier_card_ensemble(args: argparse.Namespace) -> int:
     result = build_frontier_card_ensemble(
         card_paths=args.cards,
+        labels=args.label,
         out=args.out,
         paper_set_name=args.paper_set_name,
         prompt_version=args.prompt_version,

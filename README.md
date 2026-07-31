@@ -168,7 +168,8 @@ the synthesis seed cannot leak into the adjudicator through prompt position.
 
 Recommended defaults: cheap shortlist top 20%, Terra/Sonnet semifinal over the
 full shortlist in size-8 batches and two partitions, 250 PDF-aware finalists,
-150-paper Swiss pool, 10 Swiss rounds, and a 60-paper dense playoff.
+a recall-preserving union of the synthesis and card-ensemble top-150 sets
+(172 papers in production), 10 Swiss rounds, and a 60-paper dense playoff.
 
 ### 6. Human Comparison
 
@@ -314,6 +315,8 @@ and potentially gets right.
 
 ## Internal Methodology Docs
 
+- Static blog and mock awards preview: [`site/index.html`](site/index.html)
+- Blog data rebuild and local preview: [`site/README.md`](site/README.md)
 - Detailed pipeline: [`docs/final_pipeline_methodology.md`](docs/final_pipeline_methodology.md)
 - Final run plan: [`docs/final_run_plan.md`](docs/final_run_plan.md)
 - Production preflight: [`docs/production_preflight_2026-07-25.md`](docs/production_preflight_2026-07-25.md)
