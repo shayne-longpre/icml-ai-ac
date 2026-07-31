@@ -6,6 +6,12 @@ Build the data bundle from the frozen ranking and canonical post hoc metadata:
 python3 site/build_data.py
 ```
 
+For a separately downloaded analysis bundle, pass `--data-root`, `--summary`,
+`--overrides`, and `--output`. The higher-level reproducibility command in
+[`docs/reproducibility.md`](../docs/reproducibility.md) regenerates the human
+comparison reports and website data together, then verifies them against the
+frozen production references.
+
 Preview from the repository root:
 
 ```bash

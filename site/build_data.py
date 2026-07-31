@@ -2,21 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import unicodedata
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[1]
-TOURNAMENT = ROOT / "data/scores/icml_2026_frontier_tournament_sol56_union172_swiss10_playoff60.json"
-TOURNAMENT_SEED = ROOT / "data/scores/icml_2026_tournament_seed_union172.json"
-FINALISTS = ROOT / "data/scores/icml_2026_finalists250.jsonl"
-MANIFEST = ROOT / "data/metadata/icml_2026_scoring_manifest.jsonl"
-ARXIV_MATCHES = ROOT / "data/metadata/icml_2026_ai_orals60_with_arxiv.jsonl"
 ARXIV_OVERRIDES = ROOT / "site/arxiv_overrides.json"
-SUMMARY = ROOT / "data/evals/icml_2026_stage7_summary.json"
 OUTPUT = ROOT / "site/data.js"
 
 
@@ -277,14 +271,35 @@ def build_method_diagram(tournament: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build() -> dict[str, Any]:
-    tournament = json.loads(TOURNAMENT.read_text(encoding="utf-8"))
-    tournament_seed = json.loads(TOURNAMENT_SEED.read_text(encoding="utf-8"))
-    finalists = read_jsonl(FINALISTS)
-    summary = json.loads(SUMMARY.read_text(encoding="utf-8"))
-    manifest = {row["paper_id"]: row for row in read_jsonl(MANIFEST)}
-    arxiv_matches = {row["paper_id"]: row for row in read_jsonl(ARXIV_MATCHES)}
-    arxiv_overrides = json.loads(ARXIV_OVERRIDES.read_text(encoding="utf-8"))
+def build(
+    *,
+    data_root: Path | None = None,
+    summary_path: Path | None = None,
+    overrides_path: Path = ARXIV_OVERRIDES,
+) -> dict[str, Any]:
+    data_root = data_root or ROOT / "data"
+    scores = data_root / "scores"
+    metadata = data_root / "metadata"
+    summary_path = summary_path or data_root / "evals/icml_2026_stage7_summary.json"
+    tournament = json.loads(
+        (scores / "icml_2026_frontier_tournament_sol56_union172_swiss10_playoff60.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    tournament_seed = json.loads(
+        (scores / "icml_2026_tournament_seed_union172.json").read_text(encoding="utf-8")
+    )
+    finalists = read_jsonl(scores / "icml_2026_finalists250.jsonl")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    manifest = {
+        row["paper_id"]: row
+        for row in read_jsonl(metadata / "icml_2026_scoring_manifest.jsonl")
+    }
+    arxiv_matches = {
+        row["paper_id"]: row
+        for row in read_jsonl(metadata / "icml_2026_ai_orals60_with_arxiv.jsonl")
+    }
+    arxiv_overrides = json.loads(overrides_path.read_text(encoding="utf-8"))
     ranked = tournament["ranked_papers"]
     playoff = ranked[:60]
 
@@ -384,9 +399,28 @@ def build() -> dict[str, Any]:
 
 
 def main() -> None:
-    payload = json.dumps(build(), ensure_ascii=False, indent=2)
-    OUTPUT.write_text(f"window.ICML_AI_AC_DATA = {payload};\n", encoding="utf-8")
-    print(f"Wrote {OUTPUT.relative_to(ROOT)}")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-root", type=Path, default=ROOT / "data")
+    parser.add_argument("--summary", type=Path, default=None)
+    parser.add_argument("--overrides", type=Path, default=ARXIV_OVERRIDES)
+    parser.add_argument("--output", type=Path, default=OUTPUT)
+    args = parser.parse_args()
+    payload = json.dumps(
+        build(
+            data_root=args.data_root,
+            summary_path=args.summary,
+            overrides_path=args.overrides,
+        ),
+        ensure_ascii=False,
+        indent=2,
+    )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(f"window.ICML_AI_AC_DATA = {payload};\n", encoding="utf-8")
+    try:
+        label = args.output.relative_to(ROOT)
+    except ValueError:
+        label = args.output
+    print(f"Wrote {label}")
 
 
 if __name__ == "__main__":

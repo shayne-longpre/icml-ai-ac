@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 icml-ai-ac = "icml_ai_ac.cli:main"
+icml-ai-ac-repro = "icml_ai_ac.reproducibility:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
