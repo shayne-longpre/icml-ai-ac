@@ -206,23 +206,49 @@
             <div class="section-heading">
               <span class="section-number">05</span>
               <div>
-                <p class="eyebrow">What this tells us</p>
-                <h2>AI did not recreate ICML. It selected a different ICML.</h2>
+                <p class="eyebrow">Purpose and limitations</p>
+                <h2>A thought experiment, not a proposal for AI area chairs</h2>
               </div>
             </div>
-            <div class="closing-grid">
-              <p>
-                The experiment is deliberately narrower than peer review. Models evaluated
-                paper artifacts, not rebuttals, reviewer discussion, author reputation, or
-                community context. That makes the comparison interpretable: it isolates the
-                ranking induced by paper-only AI judgment.
-              </p>
-              <p>
-                The result is not a replacement for peer review. It is a measurable picture
-                of what an AI-centered evaluation regime elevates, overlooks, and values
-                differently.
-              </p>
+            <p class="purpose-lede">
+              We are not advocating that AI replace reviewers or area chairs. We make this
+              counterfactual concrete because AI preferences, for better or worse, already enter
+              science long before any final decision: in brainstorming, research planning,
+              writing, reviewing, and rebuttal. Even without formal authority, models can
+              influence which questions are pursued, which claims appear important, and which
+              weaknesses receive attention.
+            </p>
+            <div class="purpose-grid">
+              <div>
+                <h3>Why run the experiment?</h3>
+                <p>
+                  A reproducible, deliberately extreme thought experiment makes those scientific
+                  preferences inspectable. The rankings and intermediate judgments let researchers
+                  study what current models reward, overlook, and value differently from a
+                  human-led conference.
+                </p>
+              </div>
+              <div>
+                <h3>What can it not establish?</h3>
+                <ul class="limitations-list">
+                  <li><strong>Not peer review.</strong> Models saw paper artifacts, not rebuttals,
+                    reviewer discussion, community context, or downstream evidence.</li>
+                  <li><strong>Not a ground-truth ranking.</strong> Both AI judgments and conference
+                    outcomes reflect noisy, contingent preferences.</li>
+                  <li><strong>Not model-independent.</strong> Results depend on the selected models,
+                    prompts, rubric, context limits, and possible training-data contamination.</li>
+                  <li><strong>Not a full acceptance study.</strong> This analysis ranks the accepted
+                    corpus; it does not reconstruct the complete submission and rejection process.</li>
+                </ul>
+              </div>
             </div>
+            <p class="future-question">
+              As conferences and models evolve, repeated snapshots can track whether human and AI
+              preferences become more aligned. If they do, agreement alone will not explain why:
+              are models becoming better scientific judges, are humans delegating more judgment to
+              AI, or are both happening? This release provides a baseline for investigating that
+              distinction.
+            </p>
             <div class="source-links">
               <a href="../docs/stage7_human_comparison.md">Detailed results</a>
               <a href="../docs/final_pipeline_methodology.md">Methodology</a>

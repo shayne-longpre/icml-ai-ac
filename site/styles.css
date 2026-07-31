@@ -885,14 +885,67 @@ a {
   color: #efb4b8;
 }
 
-.closing-grid {
+.purpose-lede {
+  max-width: 940px;
+  margin: 0;
+  color: #f2f2f2;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 24px;
+  line-height: 1.55;
+}
+
+.purpose-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 60px;
-  max-width: 900px;
+  max-width: 980px;
+  margin-top: 50px;
   color: #d4d4d4;
+}
+
+.purpose-grid h3 {
+  margin: 0 0 14px;
+  color: white;
   font-family: Georgia, "Times New Roman", serif;
-  font-size: 19px;
+  font-size: 23px;
+  font-weight: 500;
+}
+
+.purpose-grid p {
+  margin: 0;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 18px;
+}
+
+.limitations-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.limitations-list li {
+  padding: 12px 0;
+  border-top: 1px solid #3f3f3f;
+  font-size: 14px;
+}
+
+.limitations-list li:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.limitations-list strong {
+  color: white;
+}
+
+.future-question {
+  max-width: 980px;
+  margin: 50px 0 0;
+  padding: 22px 0 22px 26px;
+  border-left: 3px solid var(--red);
+  color: #f2f2f2;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 20px;
 }
 
 .source-links {
@@ -1407,9 +1460,18 @@ a {
     gap: 7px;
   }
 
-  .closing-grid {
+  .purpose-grid {
     grid-template-columns: 1fr;
-    gap: 12px;
+    gap: 42px;
+  }
+
+  .purpose-lede {
+    font-size: 21px;
+  }
+
+  .future-question {
+    padding-left: 20px;
+    font-size: 18px;
   }
 
   .outstanding-card {
