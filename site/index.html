@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="A paper-only AI ranking of the ICML 2026 accepted corpus.">
+    <title>AI as Area Chair | ICML 2026</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="wordmark" href="#story" aria-label="AI as Area Chair home">
+        <span class="wordmark-mark">AC</span>
+        <span>AI as Area Chair</span>
+      </a>
+      <nav class="view-tabs" aria-label="Report views">
+        <button class="view-tab is-active" type="button" data-view="story">The experiment</button>
+        <button class="view-tab" type="button" data-view="awards">AI awards</button>
+      </nav>
+      <a class="repo-link" href="https://github.com/shayne-longpre/icml-ai-ac" target="_blank" rel="noreferrer">
+        Repository
+      </a>
+    </header>
+
+    <main>
+      <section id="story-view" class="view is-active" data-view-panel="story">
+        <article>
+          <header class="article-hero">
+            <div class="article-meta">
+              <span>ICML 2026</span>
+              <span>6,617 papers</span>
+              <span>Paper-only evaluation</span>
+            </div>
+            <h1>AI as Area Chair: What Science Would AI Send to ICML?</h1>
+            <p class="dek">
+              AI increasingly helps plan, write, and review science. We took that influence
+              to its logical extreme: what if AI alone decided which ICML papers mattered most?
+            </p>
+            <p class="byline">An independent ranking experiment across the ICML 2026 accepted corpus</p>
+          </header>
+
+          <div class="paper-mosaic-band" aria-label="First pages from the highest-ranked papers">
+            <div id="paper-mosaic" class="paper-mosaic"></div>
+          </div>
+
+          <section class="article-section opening-section">
+            <p class="opening">
+              We asked a panel of AI systems to identify the papers that were most technically
+              sound, most consequential for machine learning, and most important for scientific
+              progress. The models saw the papers. They did not see the authors, reviews,
+              reviewer scores, area-chair comments, decisions, presentation tiers, or awards.
+            </p>
+            <p>
+              Only after the ranking was frozen did we compare it with ICML's human-led outcomes.
+              The result is neither agreement nor rebellion. AI found a set rich in papers humans
+              also honored, then imposed a distinctly different ordering on it.
+            </p>
+          </section>
+
+          <section class="method-band">
+            <div class="section-heading">
+              <span class="section-number">01</span>
+              <div>
+                <p class="eyebrow">The experiment</p>
+                <h2>From 6,617 papers to a 60-paper final</h2>
+              </div>
+            </div>
+            <div id="method-diagram" class="method-diagram" aria-label="Ranking pipeline"></div>
+            <p class="method-note">
+              The frontier panel read each finalist once. Its reusable cards fed both an
+              equal-weight three-judge ensemble and Sol synthesis; their top-150 union formed
+              the 172-paper Swiss pool. Only the final 60 received a complete pairwise graph.
+            </p>
+          </section>
+
+          <section class="article-section">
+            <div class="section-heading">
+              <span class="section-number">02</span>
+              <div>
+                <p class="eyebrow">The result</p>
+                <h2>The papers AI put first</h2>
+              </div>
+            </div>
+            <div id="top-ten" class="top-ten"></div>
+            <button class="text-action" type="button" data-go-awards>
+              See the complete AI awards and oral program
+            </button>
+          </section>
+
+          <section class="results-band">
+            <div class="section-heading">
+              <span class="section-number">03</span>
+              <div>
+                <p class="eyebrow">AI versus ICML</p>
+                <h2>Agreement without imitation</h2>
+              </div>
+            </div>
+            <div class="comparison-lede">
+              <div class="finding-copy">
+                <p class="big-finding">
+                  Human-honored papers were <strong>4.7x more common</strong> in AI's top 10
+                  than in the main-track baseline.
+                </p>
+                <p>
+                  Four of the top 10 were human orals or spotlights. Yet only two of ICML's
+                  seven award papers reached the 250 finalists, one reached the final 60,
+                  and none reached AI's top 10.
+                </p>
+                <p>
+                  Across all main-track papers, AI distinguished oral/spotlight papers from
+                  posters with an AUC of 0.602: real agreement, but far from replication.
+                </p>
+              </div>
+              <div class="comparison-stats" aria-label="Headline comparison statistics">
+                <div>
+                  <strong>4.7x</strong>
+                  <span>human-honor enrichment in AI's top 10</span>
+                </div>
+                <div>
+                  <strong>2 / 7</strong>
+                  <span>official award papers reached the finalists</span>
+                </div>
+                <div>
+                  <strong>#28</strong>
+                  <span>highest AI rank of an official award paper</span>
+                </div>
+              </div>
+            </div>
+
+            <figure class="comparison-figure recognition-figure">
+              <div class="figure-heading">
+                <p class="eyebrow">Advancement through the pipeline</p>
+                <h3>Human recognition concentrated; award overlap did not</h3>
+              </div>
+              <div id="recognition-trajectory" class="chart-scroll"></div>
+              <figcaption>
+                Circles show the share of each AI-selected set that ICML designated oral or
+                spotlight. Gold stars show how many of ICML's seven official award papers
+                remained. Human outcomes were joined only after the AI ranking was frozen.
+              </figcaption>
+            </figure>
+
+            <figure class="comparison-figure rank-map-figure">
+              <div class="figure-heading">
+                <p class="eyebrow">Inside the dense final</p>
+                <h3>Where human-honored papers landed in AI's top 60</h3>
+              </div>
+              <div id="playoff-rank-map" class="chart-scroll"></div>
+              <figcaption id="playoff-rank-caption"></figcaption>
+            </figure>
+          </section>
+
+          <section class="article-section">
+            <div class="section-heading">
+              <span class="section-number">04</span>
+              <div>
+                <p class="eyebrow">A different theory of importance</p>
+                <h2>AI preferred general mechanisms over specialized applications</h2>
+              </div>
+            </div>
+            <p class="section-intro">
+              AI's finalist slate overrepresented core algorithms, theory, scientific tools,
+              and safety/evaluation work. Application-specific methods fell from 18.4% of the
+              corpus to 1.6% of the finalists.
+            </p>
+            <div class="composition-figure">
+              <div class="composition-row">
+                <span class="composition-label">All papers</span>
+                <div class="stacked-bar" aria-label="Contribution mix across all papers">
+                  <span class="seg core" style="width:30%" title="Core ML algorithm 30.0%"></span>
+                  <span class="seg application" style="width:18.4%" title="Application method 18.4%"></span>
+                  <span class="seg theory" style="width:12.9%" title="Theory 12.9%"></span>
+                  <span class="seg safety" style="width:8.4%" title="Safety and evaluation 8.4%"></span>
+                  <span class="seg science" style="width:8.3%" title="Scientific modeling 8.3%"></span>
+                  <span class="seg other" style="width:22%" title="Other contribution types 22.0%"></span>
+                </div>
+              </div>
+              <div class="composition-row">
+                <span class="composition-label">AI finalists</span>
+                <div class="stacked-bar" aria-label="Contribution mix among AI finalists">
+                  <span class="seg core" style="width:35.2%" title="Core ML algorithm 35.2%"></span>
+                  <span class="seg application" style="width:1.6%" title="Application method 1.6%"></span>
+                  <span class="seg theory" style="width:18.4%" title="Theory 18.4%"></span>
+                  <span class="seg safety" style="width:14.8%" title="Safety and evaluation 14.8%"></span>
+                  <span class="seg science" style="width:12%" title="Scientific modeling 12.0%"></span>
+                  <span class="seg other" style="width:18%" title="Other contribution types 18.0%"></span>
+                </div>
+              </div>
+              <div class="chart-legend" aria-label="Contribution type legend">
+                <span><i class="core"></i>Core ML</span>
+                <span><i class="application"></i>Applications</span>
+                <span><i class="theory"></i>Theory</span>
+                <span><i class="safety"></i>Safety / eval</span>
+                <span><i class="science"></i>Science tools</span>
+                <span><i class="other"></i>Other</span>
+              </div>
+            </div>
+            <p>
+              This was not a missing-data artifact. Sampled high-human, low-AI papers had all
+              eight expected cheap-model judgments, and the models consistently ranked them
+              low. The divergence is a preference of the rubric and models, not a broken batch.
+            </p>
+          </section>
+
+          <section class="closing-band">
+            <div class="section-heading">
+              <span class="section-number">05</span>
+              <div>
+                <p class="eyebrow">What this tells us</p>
+                <h2>AI did not recreate ICML. It selected a different ICML.</h2>
+              </div>
+            </div>
+            <div class="closing-grid">
+              <p>
+                The experiment is deliberately narrower than peer review. Models evaluated
+                paper artifacts, not rebuttals, reviewer discussion, author reputation, or
+                community context. That makes the comparison interpretable: it isolates the
+                ranking induced by paper-only AI judgment.
+              </p>
+              <p>
+                The result is not a replacement for peer review. It is a measurable picture
+                of what an AI-centered evaluation regime elevates, overlooks, and values
+                differently.
+              </p>
+            </div>
+            <div class="source-links">
+              <a href="../docs/stage7_human_comparison.md">Detailed results</a>
+              <a href="../docs/final_pipeline_methodology.md">Methodology</a>
+              <a href="https://github.com/shayne-longpre/icml-ai-ac" target="_blank" rel="noreferrer">Code and artifacts</a>
+            </div>
+          </section>
+        </article>
+      </section>
+
+      <section id="awards-view" class="view" data-view-panel="awards" hidden>
+        <header class="awards-hero">
+          <div class="article-meta">
+            <span>Mock conference program</span>
+            <span>Frozen July 30, 2026</span>
+          </div>
+          <h1>The ICML awards AI would have announced</h1>
+          <p class="dek">
+            A counterfactual awards slate drawn directly from the final paper-only ranking.
+          </p>
+          <div class="rule-note">
+            <strong>Program rule</strong>
+            <span>Ranks 1–2: Outstanding Papers</span>
+            <span>Ranks 3–7: Honorable Mentions</span>
+            <span>Ranks 1–60: AI Orals</span>
+          </div>
+        </header>
+
+        <section class="award-section outstanding-section">
+          <div class="section-heading">
+            <span class="section-number">AI</span>
+            <div>
+              <p class="eyebrow">Highest distinction</p>
+              <h2>Outstanding Papers</h2>
+            </div>
+          </div>
+          <div id="outstanding-papers" class="outstanding-papers"></div>
+        </section>
+
+        <section class="award-section mention-section">
+          <div class="section-heading">
+            <span class="section-number">05</span>
+            <div>
+              <p class="eyebrow">Additional distinction</p>
+              <h2>Honorable Mentions</h2>
+            </div>
+          </div>
+          <div id="honorable-mentions" class="honorable-mentions"></div>
+        </section>
+
+        <section class="oral-section">
+          <div class="oral-header">
+            <div class="section-heading">
+              <span class="section-number">60</span>
+              <div>
+                <p class="eyebrow">Complete all-pairs playoff</p>
+                <h2>AI Oral Program</h2>
+              </div>
+            </div>
+            <p>
+              These are the only papers for which every pair was directly compared.
+              Human outcomes are shown only as a post hoc reference.
+            </p>
+          </div>
+          <div class="oral-controls">
+            <label>
+              <span>Search papers</span>
+              <input id="oral-search" type="search" placeholder="Title or paper ID" autocomplete="off">
+            </label>
+            <label>
+              <span>Contribution type</span>
+              <select id="oral-class-filter">
+                <option value="">All contribution types</option>
+              </select>
+            </label>
+            <div id="oral-result-count" class="result-count" aria-live="polite"></div>
+          </div>
+          <div id="oral-list" class="oral-list"></div>
+        </section>
+
+        <footer class="awards-footer">
+          <p>
+            This is a research artifact, not an official ICML decision. AI awards were assigned
+            mechanically from the frozen final ranking; ICML's actual outcomes never entered
+            model inputs.
+          </p>
+          <button class="text-action" type="button" data-go-story>Read the experiment</button>
+        </footer>
+      </section>
+    </main>
+
+    <script src="data.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
