@@ -9,16 +9,53 @@ from icml_ai_ac.model_presets import PRODUCTION_FRONTIER_JUDGES
 from icml_ai_ac.scoring.batch import Pass1BatchSuiteConfig, run_pass1_batch_suite
 from icml_ai_ac.scoring.prompts import build_pass1_prompt
 from icml_ai_ac.scoring.runner import ScoreRunConfig, score_record
-from icml_ai_ac.scoring.schema import CORE_SCORE_FIELDS, IMPACT_AXIS_FIELDS, validate_scoring_output
+from icml_ai_ac.scoring.schema import (
+    CORE_SCORE_FIELDS,
+    IMPACT_AXIS_FIELDS,
+    parse_json_response,
+    validate_scoring_output,
+)
 
 
 class ScoringTests(unittest.TestCase):
+    def test_parse_json_repairs_unescaped_latex_commands(self) -> None:
+        parsed = parse_json_response('{"title":"Fast Min-$\\epsilon$ Regression"}')
+
+        self.assertEqual(parsed["title"], "Fast Min-$\\epsilon$ Regression")
+
+    def test_parse_json_quotes_unquoted_object_keys(self) -> None:
+        parsed = parse_json_response(
+            """{
+  "paper_id": "p1",
+  main_risk": "limited validation",
+  vulnerability or risk: "narrow adoption",
+  $paper_isolation_check$: "specific method"
+}"""
+        )
+
+        self.assertEqual(parsed["main_risk"], "limited validation")
+        self.assertEqual(parsed["vulnerability or risk"], "narrow adoption")
+        self.assertEqual(parsed["$paper_isolation_check$"], "specific method")
+
+    def test_parse_json_accepts_unescaped_control_character_in_string(self) -> None:
+        parsed = parse_json_response('{"rationale":"first line\nsecond line"}')
+
+        self.assertEqual(parsed["rationale"], "first line\nsecond line")
+
+    def test_parse_json_removes_trailing_comma_without_changing_string_content(self) -> None:
+        parsed = parse_json_response(
+            '{"rationale":"literal comma before brace,}", "scores":[1, 2,],}'
+        )
+
+        self.assertEqual(parsed["rationale"], "literal comma before brace,}")
+        self.assertEqual(parsed["scores"], [1, 2])
+
     def test_production_cheap_preset_is_the_validated_four_model_panel(self) -> None:
         self.assertEqual(
             CHEAP_MODEL_PRESETS["production_2026_v2"].models,
             (
                 "nvidia/nemotron-3-ultra-550b-a55b",
-                "google/gemini-3.1-flash-lite",
+                "google/gemini-3.5-flash-lite",
                 "openai/gpt-5.6-luna",
                 "x-ai/grok-4.3",
             ),
@@ -26,22 +63,42 @@ class ScoringTests(unittest.TestCase):
 
     def test_production_frontier_panel_spans_three_model_families(self) -> None:
         self.assertEqual(
-            [(judge.model, judge.reasoning_effort) for judge in PRODUCTION_FRONTIER_JUDGES],
             [
-                ("openai/gpt-5.6-sol", "xhigh"),
-                ("anthropic/claude-fable-5", "high"),
-                ("google/gemini-3.1-pro-preview", "high"),
+                (
+                    judge.model,
+                    judge.reasoning_effort,
+                    judge.fallback_model,
+                    judge.fallback_reasoning_effort,
+                )
+                for judge in PRODUCTION_FRONTIER_JUDGES
+            ],
+            [
+                ("openai/gpt-5.6-sol", "xhigh", None, None),
+                (
+                    "anthropic/claude-fable-5",
+                    "high",
+                    "anthropic/claude-opus-4.8",
+                    "high",
+                ),
+                ("google/gemini-3.1-pro-preview", "high", None, None),
             ],
         )
 
-    def test_prompt_omits_author_line_and_includes_schema(self) -> None:
-        record = PaperRecord(paper_id="p1", source="accepted", title="Test Paper")
+    def test_prompt_omits_author_and_human_outcome_fields(self) -> None:
+        record = PaperRecord(
+            paper_id="p1",
+            source="SENTINEL_HUMAN_SOURCE",
+            title="Test Paper",
+            decision_label="SENTINEL_HUMAN_DECISION",
+        )
         compact = "Title: Test Paper\nAuthors: A, B\n\nAbstract:\nA contribution."
 
         prompt = build_pass1_prompt(record, compact)
 
         self.assertIn("Required JSON schema", prompt.user)
         self.assertNotIn("Authors: A, B", prompt.user)
+        self.assertNotIn("SENTINEL_HUMAN_SOURCE", prompt.user)
+        self.assertNotIn("SENTINEL_HUMAN_DECISION", prompt.user)
         self.assertIn("Do not use web search", prompt.system)
 
     def test_validate_scoring_output_accepts_required_scores(self) -> None:
@@ -112,7 +169,7 @@ class ScoringTests(unittest.TestCase):
             config = ScoreRunConfig(
                 provider="openrouter",
                 model=DEFAULT_CHEAP_MODEL,
-                prompt_version="pass1_executive_ac_v4",
+                prompt_version="pass1_executive_ac_v5",
                 temperature=0.2,
                 max_output_tokens=1000,
                 seed=None,

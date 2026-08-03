@@ -58,7 +58,6 @@ def score_record(
         "paper_id": record.paper_id,
         "title": record.title,
         "source": record.source,
-        "decision_label": record.decision_label,
         "provider": config.provider,
         "model": config.model,
         "prompt_version": config.prompt_version,
@@ -145,23 +144,54 @@ def read_text_path(path: str | None) -> str:
 def resolve_record_text_path(record: PaperRecord, text_source: str) -> tuple[str, str]:
     artifacts = record.extra.get("text_artifacts") if isinstance(record.extra, dict) else None
     artifacts = artifacts if isinstance(artifacts, dict) else {}
+    scoring_artifacts = record.extra.get("scoring_artifacts") if isinstance(record.extra, dict) else None
+    scoring_artifacts = scoring_artifacts if isinstance(scoring_artifacts, dict) else {}
+    anonymization = record.extra.get("anonymization") if isinstance(record.extra, dict) else None
+    if isinstance(anonymization, dict) and anonymization.get("status") != "ok":
+        raise ValueError(
+            f"record {record.paper_id} has non-passing anonymization status: "
+            f"{anonymization.get('status')}"
+        )
     if text_source == "compact":
-        path = record.text_compact or artifacts.get("compact_repr")
-        resolved = "compact"
+        path = scoring_artifacts.get("compact_repr") or record.text_compact or artifacts.get("compact_repr")
+        resolved = "anonymized_compact" if scoring_artifacts.get("compact_repr") else "compact"
     elif text_source == "full":
-        path = record.text_full or artifacts.get("full_repr")
-        resolved = "full"
+        path = scoring_artifacts.get("full_repr") or record.text_full or artifacts.get("full_repr")
+        resolved = "anonymized_full" if scoring_artifacts.get("full_repr") else "full"
     elif text_source == "scoring":
-        path = record.text_scoring or artifacts.get("scoring_repr")
-        resolved = "scoring"
+        path = scoring_artifacts.get("scoring_repr") or record.text_scoring or artifacts.get("scoring_repr")
+        resolved = "anonymized_scoring" if scoring_artifacts.get("scoring_repr") else "scoring"
         if not path:
-            path = record.text_full or artifacts.get("full_repr")
-            resolved = "full_fallback_from_scoring"
+            path = scoring_artifacts.get("full_repr") or record.text_full or artifacts.get("full_repr")
+            resolved = (
+                "anonymized_full_fallback_from_scoring"
+                if scoring_artifacts.get("full_repr")
+                else "full_fallback_from_scoring"
+            )
     else:
         raise ValueError(f"Unsupported text_source: {text_source}")
     if not path:
         raise ValueError(f"record has no {text_source} text path")
     return str(path), resolved
+
+
+def resolve_record_pdf_path(record: PaperRecord) -> tuple[Path, str]:
+    scoring_artifacts = record.extra.get("scoring_artifacts") if isinstance(record.extra, dict) else None
+    scoring_artifacts = scoring_artifacts if isinstance(scoring_artifacts, dict) else {}
+    anonymization = record.extra.get("anonymization") if isinstance(record.extra, dict) else None
+    if isinstance(anonymization, dict):
+        if anonymization.get("status") != "ok":
+            raise ValueError(
+                f"record {record.paper_id} has non-passing anonymization status: "
+                f"{anonymization.get('status')}"
+            )
+        path = scoring_artifacts.get("pdf")
+        if not path:
+            raise ValueError(f"record {record.paper_id} is missing its anonymized scoring PDF")
+        return Path(path), "anonymized_pdf"
+    if not record.pdf_path:
+        raise ValueError(f"record {record.paper_id} has no PDF path")
+    return Path(record.pdf_path), "canonical_pdf"
 
 
 def estimate_tokens(text: str) -> int:

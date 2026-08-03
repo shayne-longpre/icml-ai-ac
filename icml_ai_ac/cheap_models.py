@@ -18,14 +18,15 @@ CHEAP_MODEL_PRESETS: dict[str, CheapModelPreset] = {
         name="production_2026_v2",
         models=(
             "nvidia/nemotron-3-ultra-550b-a55b",
-            "google/gemini-3.1-flash-lite",
+            "google/gemini-3.5-flash-lite",
             "openai/gpt-5.6-luna",
             "x-ai/grok-4.3",
         ),
         notes=(
-            "Gold-50 validated high-recall ensemble selected after a fourteen-model "
-            "July 2026 screen and all 330 subsets of the eleven usable rankings. "
-            "The four families balance recall, reliability, latency, and cost."
+            "Gold-50 validated high-recall ensemble. The four families were selected "
+            "after a fourteen-model screen and all 330 subsets of the eleven usable "
+            "rankings; a later matched bakeoff upgraded its Gemini stream from 3.1 "
+            "to 3.5 Flash Lite for stronger top-tail recall."
         ),
     ),
     "production_2026_v1": CheapModelPreset(
@@ -46,6 +47,7 @@ CHEAP_MODEL_PRESETS: dict[str, CheapModelPreset] = {
             DEFAULT_CHEAP_MODEL,
             "nvidia/nemotron-3-ultra-550b-a55b",
             "google/gemini-3.1-flash-lite",
+            "google/gemini-3.5-flash-lite",
             "stepfun/step-3.7-flash",
             "inclusionai/ring-2.6-1t",
         ),
@@ -60,6 +62,7 @@ CHEAP_MODEL_PRESETS: dict[str, CheapModelPreset] = {
             DEFAULT_CHEAP_MODEL,
             "nvidia/nemotron-3-ultra-550b-a55b",
             "google/gemini-3.1-flash-lite",
+            "google/gemini-3.5-flash-lite",
             "openai/gpt-5.6-luna",
             "deepseek/deepseek-v4-pro",
             "minimax/minimax-m3",

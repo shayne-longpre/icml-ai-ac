@@ -37,6 +37,11 @@ As of **2026-07-15**:
   All 6,614 official files were downloaded and validated; parsing produced
   6,611 `ok`, three `needs_review`, and zero failures. The remaining 14 records
   have no OpenReview forum ID rather than failed PDF requests.
+- The frozen scoring manifest contains **6,617/6,628 papers (99.83%)**:
+  6,614 official PDFs plus three validated high-confidence arXiv fallbacks.
+  The three parser-review cases were inspected and included because their
+  abstracts and main bodies are intact. Eleven records have no usable PDF and
+  are listed explicitly in the manifest report.
 - The current metadata snapshot includes published reviewer ratings for
   **6,341** accepted papers: overall assessment, soundness, and confidence.
 - Official awards are linked for two Outstanding Papers, five Honorable
@@ -54,6 +59,13 @@ As of **2026-07-15**:
 
 ## Methodology
 
+All ranking stages are paper-only: reviews, reviewer ratings, area-chair
+comments, decisions, presentation tiers, and awards are excluded from model
+inputs and joined only after the AI ranking is frozen. Retrieval and web search
+are disabled. Before scoring, validated derivatives remove the author byline,
+affiliations, emails, acknowledgements, and PDF author metadata. The canonical
+PDFs remain unchanged.
+
 ### 1. Corpus and PDF Processing
 
 We use the ICML virtual-site JSON feed as the accepted-paper inventory, resolve
@@ -64,14 +76,15 @@ PDFs are parsed with Poppler. For ICML 2026 camera-ready papers, we use the
 first **9 PDF pages** as the main-paper prior, then strip references and detected
 appendix/supplement material; original submissions use 8 pages. The pipeline
 writes compact, scoring, and full paper representations. Substantive scoring
-uses the main-paper `scoring_repr`.
+uses the main-paper `scoring_repr`. Identity-redacted PDF and text derivatives
+are fingerprinted, validated, and fail closed before entering scoring.
 
 ### 2. Cheap High-Recall Triage
 
 Every parsed paper is scored by a low-cost OpenRouter ensemble:
 
 - `nvidia/nemotron-3-ultra-550b-a55b`
-- `google/gemini-3.1-flash-lite`
+- `google/gemini-3.5-flash-lite`
 - `openai/gpt-5.6-luna`
 - `x-ai/grok-4.3`
 
@@ -80,23 +93,34 @@ scores, which were too compressed in early tests. Models judge technical
 soundness, novelty, clarity, empirical credibility, ML-field impact, broader
 scientific importance, contribution type, and whether the paper should advance.
 
-Papers are grouped by contribution route: algorithm, theory, benchmark/data,
-infrastructure, scientific tool, safety/evaluation, application, or analysis.
-We aggregate by source model and select a top **15-20%** class-balanced
-shortlist, preserving per-class leaders, strong rejected candidates, and
-cheap/strong disagreement cases. This pass is a recall filter, not the final
-ranking.
+Gemini 3.1 Flash Lite first assigns provisional contribution routes in a fixed
+hash-randomized order, preventing source order from being confounded with prompt
+position. The four-model ranking pass also stores its class votes and agreement,
+which define the downstream ensemble category signal.
+
+We aggregate by source model and advance a top **15-20%** class-balanced
+shortlist. A within-paper position sensitivity check expands the handoff when
+raw and position-adjusted cutoffs disagree. This pass is a recall filter, not
+the final ranking. Classification and ranking batches are fingerprinted and
+resumable; reruns reuse valid responses and retry only unfinished batches.
+
+After a bounded preflight, the four model streams can run concurrently with
+`--model-workers 4`; batches within each stream remain sequential.
 
 ### 3. Strong Semifinal and Conservative Finalists
 
-The shortlist is independently reranked over `scoring_repr` by:
+The complete shortlist is independently evaluated over `scoring_repr` by:
 
-- `gpt-5.6-terra` with `high` reasoning
+- `openai/gpt-5.6-terra` through OpenRouter with `high` reasoning
 - `anthropic/claude-sonnet-5` with `high` reasoning
 
-We average normalized ranks with equal weight and retain each judge's rank,
-rationale, requested/served model ID, and disagreement signal. Because our ICML
-2025 gold-set evaluation found that aggressive intermediate cuts lost true top
+Each judge uses two deterministic, class-stratified listwise partitions instead
+of one infeasible corpus-wide response. We average normalized local ranks
+within judge, then combine judges with equal weight. We retain batch judgments,
+requested/served model IDs, and disagreement signals. A run fails closed unless
+every paper is judged in every partition and the overlapping batches form one
+connected comparison graph. Because our ICML 2025
+gold-set evaluation found that aggressive intermediate cuts lost true top
 papers, this stage improves ordering but does not make a narrow cut.
 
 Finalists combine the consensus rank, cheap-ensemble and per-class leaders, and
@@ -113,8 +137,10 @@ extracted main-paper text and produce independent structured judgment cards:
 - `anthropic/claude-fable-5` with `high` reasoning
 - `google/gemini-3.1-pro-preview` with `high` reasoning
 
-Requested and served model IDs are stored for every card. This matters because
-a safeguarded Fable request can be routed to Opus. The historical ICML 2025
+Requested and served model IDs are stored for every card. A failed or
+safeguarded Fable request explicitly falls back to
+`anthropic/claude-opus-4.8` high; both attempts, the fallback reason, model IDs,
+and cumulative usage remain attached to the paper. The historical ICML 2025
 gold-set protocol used:
 
 - `openai/gpt-5.5` with `xhigh` reasoning
@@ -134,11 +160,90 @@ the synthesis and pairwise adjudication model. Small finalist sets use
 all-pairs comparison; larger pools use Swiss pairwise comparisons over a broad
 pool, followed by dense all-pairs comparison within the provisional playoff
 subset. Headline claims come from the dense playoff, while Swiss standings
-provide broader finalist ordering.
+provide broader finalist ordering. Regularized Bradley-Terry strengths adjust
+the sparse Swiss standings for opponent difficulty; direct win rates remain the
+transparent primary check for the balanced all-pairs playoff. Pair batching,
+A/B presentation, and evidence-block order are deterministically randomized so
+the synthesis seed cannot leak into the adjudicator through prompt position.
 
 Recommended defaults: cheap shortlist top 20%, Terra/Sonnet semifinal over the
-full shortlist, 250 PDF-aware finalists, 150-paper Swiss pool, 10 Swiss rounds,
-and a 60-paper dense playoff.
+full shortlist in size-8 batches and two partitions, 250 PDF-aware finalists,
+a recall-preserving union of the synthesis and card-ensemble top-150 sets
+(172 papers in production), 10 Swiss rounds, and a 60-paper dense playoff.
+
+### 6. Human Comparison
+
+We compare the canonical full-coverage ensemble ranking with presentation tier,
+published reviewer ratings, awards, and, where public, acceptance versus
+rejection. Coverage must be explicit and complete; strong-stage comparisons
+evaluate cheap and strong rankings on the same finalist subset and separately
+report which human-honored papers survived selection. Divergence case studies
+use fixed rank tails, and an independently coded, frozen taxonomy reports
+recurring reasons with held-out summaries and inter-model agreement.
+
+### Querying Ranked Papers
+
+For a fresh shell or LLM thread, the shortest interface returns machine-readable
+JSONL from the frozen 250-paper finalist ranking:
+
+```bash
+python3 -m icml_ai_ac.cli list-ranking-categories
+python3 -m icml_ai_ac.cli top-ranked-papers \
+  --category data-pretraining --top 20
+```
+
+`--category` accepts a preset (`data-pretraining`), contribution class
+(`theory`, `benchmark_dataset`, and so on), official topic family
+(`Deep Learning`), or explicit leaf topic prefixed with `topic:`. Use
+`--scope tournament`, `--scope playoff`, or `--scope all` to change the default
+finalist scope.
+
+The same operation is available as a Python API with production paths already
+configured:
+
+```python
+from icml_ai_ac.ranking_query import top_ranked_papers
+
+papers = top_ranked_papers("data and pretraining", top_n=20)
+```
+
+For arbitrary combinations, `query-ranked-papers` joins the frozen ranking to
+titles, abstracts, official ICML topics, and contribution classes without
+rerunning any model:
+
+```bash
+python3 -m icml_ai_ac.cli query-ranked-papers \
+  --preset data-pretraining \
+  --out data/analysis/icml_2026_data_pretraining_ranked.csv
+```
+
+The transparent `data-pretraining` preset matches the official
+`General Machine Learning->Data` topic, the `benchmark_dataset` contribution
+class, specific data-practice language such as data curation or training data,
+or explicit pretraining terms in the title or abstract. Every result includes
+`match_reasons`, its full-corpus `cheap_rank`, and, when applicable, its frozen
+`final_rank` and ranking stage. Papers outside the 250 frontier finalists have
+no `final_rank`; this is distinct from receiving a low final rank.
+
+Filters can also be composed directly:
+
+```bash
+# Only data/pretraining papers among the 250 frontier finalists.
+python3 -m icml_ai_ac.cli query-ranked-papers \
+  --preset data-pretraining --scope finalists
+
+# Exact official-topic family, using a case-insensitive glob.
+python3 -m icml_ai_ac.cli query-ranked-papers \
+  --topic 'Deep Learning->*' --contribution-class benchmark_dataset
+
+# Explicit pretraining papers that reached the 60-paper all-pairs playoff.
+python3 -m icml_ai_ac.cli query-ranked-papers \
+  --preset pretraining --scope playoff
+```
+
+Use `--query` for a case-insensitive title/abstract/topic search, `--scope` for
+`all`, `finalists`, `tournament`, or `playoff`, and `--format` for CSV, JSONL,
+or TSV output. The input paths are configurable for rebuilt or alternate runs.
 
 ## Gold-Set Validation
 
@@ -149,36 +254,57 @@ The current reference is not a single text-only model ranking. It uses:
 2. GPT-5.5 synthesis over those cards;
 3. GPT-5.5 xhigh all-pairs tournament over the synthesis top 30.
 
-The all-pairs tournament completed **435/435** comparisons in 18 resumable
-batches, cost about **$8.10** in reported OpenRouter usage, and took about
-57.5 minutes.
+The corrected all-pairs tournament completed **435/435** comparisons in 18
+resumable batches. It deterministically randomized pair batching, A/B
+presentation, and evidence order, producing 221 A wins and 214 B wins. Valid
+batches cost **$8.52** in reported OpenRouter usage and took 38 minutes of
+provider time; one rejected malformed batch added about $0.41 and was retried
+without repeating completed work.
 
 Key lessons:
 
-- the old text-only gold ranking had Spearman 0.2875 against the tournament
+- the old text-only gold ranking had Spearman 0.290 against the tournament
   gold;
-- the PDF card ensemble had Spearman 0.9608;
-- the PDF card synthesis had Spearman 0.9769;
-- the cheap ensemble top-45 captured 10/10 gold top-10 and 19/20 gold top-20;
-- an aggressive GPT stage-2 top-35 cut missed 2 gold top-10 and 3 gold top-20
-  papers.
+- the PDF card ensemble had Spearman 0.962, and the PDF card synthesis had
+  Spearman 0.984 with 10/10 top-10 recall;
+- the current four-model cheap ensemble captured 10/10 gold top-10 papers by
+  shortlist rank 20 and 18/20 gold top-20 papers by rank 30;
+- the old strong-model top-35 cut captured only 8/10 gold top-10 and 15/20 gold
+  top-20 papers by rank 30;
+- regularized Bradley-Terry and direct all-pairs ranks had Spearman 0.997,
+  shared 9/10 top-10 papers, and differed by at most two rank positions;
+- a simulated 10-round Swiss plus top-20 dense playoff used 255 rather than 435
+  comparisons, retained 10/10 top-10 and 19/20 top-20 papers, and had Spearman
+  0.996 against all-pairs.
 
 The main empirical lesson is to preserve candidates generously before
 PDF-aware carding and tournament adjudication.
 
 The July 2026 Terra/Sonnet semifinal ensemble is an auditable diversity and
-reliability improvement, but it has not yet replaced the historical gold-set
-metrics above. We will compare it with Terra alone at an equal finalist budget
-before freezing the production analysis.
+reliability improvement. Because it postdates the accepted-50 artifacts, its
+incremental ranking benefit will be reported on the full production run rather
+than inferred from a mismatched historical pass.
+
+A July 25 end-to-end preflight ran 48 real ICML 2026 papers, including awards,
+orals, spotlights, regular papers, and missing-score cases. All stages
+completed. The cheap top-32 retained all nine award papers; the 12-paper
+PDF-aware tournament completed 66/66 randomized comparisons with 32 A wins and
+34 B wins. Against that tournament, card synthesis had Spearman 0.972 and
+top-5/top-10 recall 1.0; semifinal and cheap rankings had Spearman 0.664 and
+0.546. These are diagnostic rather than population estimates because the
+sample was deliberately stratified by human outcomes.
 
 A July 2026 refresh screened 14 current OpenRouter models on the same 50-paper
 set and produced 11 usable rankings. All 330 four-model subsets were evaluated.
-The selected four-model panel retained
-10/10 gold top-10 papers by shortlist rank 20 and 18/20 gold top-20 papers by
-rank 30, versus 17/20 for the previous three-model preset. The full 11-model
-aggregate matched 18/20 but recovered only 23/30 gold top-30 papers versus
-24/30 for the selected four at roughly four times the cost. No equally strong
-four-model subset was cheaper or faster.
+The initially selected Gemini 3.1 panel retained 10/10 gold top-10 papers by
+shortlist rank 20, 18/20 gold top-20 papers by rank 30, and 24/30 gold top-30
+papers. A subsequent matched Flash Lite comparison replaced
+Gemini 3.1 with Gemini 3.5 for ranking: ensemble Spearman rose from 0.646 to
+0.662, gold top-10 recall at rank 10 rose from 6/10 to 7/10, and gold top-20
+recall at rank 20 rose from 15/20 to 16/20; both variants retained 10/10 by rank
+20 and 18/20 by rank 30, while top-30 same-k recall moved from 23/30 to 22/30.
+Gemini 3.1 remains the contribution classifier because it achieved 0.80
+accuracy and 0.764 macro-F1 versus 0.72 and 0.602 for 3.5.
 
 ## Cost and Runtime
 
@@ -190,24 +316,28 @@ four-model subset was cheaper or faster.
 - **PDF parsing:** local and fast. A 200-PDF parse took about 54 seconds;
   full-corpus parsing should be on the order of tens of minutes once PDFs are
   present.
-- **Cheap first pass:** the selected four-model panel cost **$0.78** for the
-  accepted-50 probe, projecting to roughly **$104** for 6,628 papers under the
-  same batching and context budget. Sequential runtime projects to about 18
-  hours; model-level parallelism can reduce wall time subject to provider limits.
+- **Cheap first pass:** measured probes imply roughly **$100-$215** for 6,617
+  papers. On the 48-paper preflight, the four streams cost $1.53 and 18.6
+  summed model-minutes; four-stream concurrency projects to about 14-15 hours
+  at the slowest observed rate.
 - **Strong semifinal:** Terra and Sonnet run independently, so either result can
   be retried without repeating the other. At equal token usage, the two-judge
   panel is roughly 1.7-1.8 times the cost of Terra alone at current rates and
-  remains substantially cheaper than PDF-aware frontier review.
+  remains substantially cheaper than PDF-aware frontier review. The 32-paper
+  preflight took 6.3 minutes for Terra and 13.0 minutes for Sonnet; run them
+  concurrently in production.
 - **Frontier PDF cards:** the historical ICML 2025 gold-set cards cost about
-  **$33.82** for 150 card rows. The refreshed production panel is more capable
-  but Fable 5 is pricier. Its three one-paper smoke cards cost **$0.93** total,
-  a rough **$233** projection for 250 finalists before paper-level variation.
-- **Tournament:** the 30-paper all-pairs tournament cost about **$8.10** for 435
-  comparisons.
+  **$33.82** for 150 card rows. The refreshed panel cost about **$12.00** for
+  36 successful cards in the 12-paper preflight, including one Opus fallback,
+  or roughly **$250** for 250 finalists before paper-level variation.
+- **Tournament:** the corrected 12-paper Sol tournament cost **$0.89** for 66
+  comparisons. A 60-paper all-pairs playoff projects to roughly **$24** at the
+  same prompt density; Swiss exploration adds cost linearly in scheduled pairs.
 
 Working full-run estimate: **$500-$2,000**, depending mainly on context budgets,
 reruns, final tournament size, and the public rejected-paper count. Runtime
-should fit in a same-day or overnight run after PDFs are downloaded.
+should be planned as roughly **one to two days** after PDFs are downloaded,
+with each stage resumable and provider throughput the main uncertainty.
 
 ## Limitations
 
@@ -218,6 +348,10 @@ should fit in a same-day or overnight run after PDFs are downloaded.
   This can be mitigated, but not eliminated, by disabling retrieval, using
   paper-grounded prompts, comparing model families, and testing pre-decision or
   open-weight snapshots when feasible.
+- **Anonymization is not perfect blinding.** Direct author, affiliation, email,
+  acknowledgement, and PDF-metadata cues are removed from validated derivatives,
+  but titles, self-citations, project names, writing style, or model memory may
+  still reveal a paper's identity.
 - **AI is not reproducing the real review process.** This is intentional: the
   study measures a paper-only executive AI judgment, not an AI simulation of
   reviewer discussion.
@@ -245,7 +379,12 @@ and potentially gets right.
 
 ## Internal Methodology Docs
 
+- Static blog and mock awards preview: [`site/index.html`](site/index.html)
+- Blog data rebuild and local preview: [`site/README.md`](site/README.md)
+- Results bundles and one-command deterministic rebuild: [`docs/reproducibility.md`](docs/reproducibility.md)
 - Detailed pipeline: [`docs/final_pipeline_methodology.md`](docs/final_pipeline_methodology.md)
+- Final run plan: [`docs/final_run_plan.md`](docs/final_run_plan.md)
+- Production preflight: [`docs/production_preflight_2026-07-25.md`](docs/production_preflight_2026-07-25.md)
 - Scoring and model details: [`docs/scoring.md`](docs/scoring.md)
 - Crawling and PDF acquisition: [`docs/crawling.md`](docs/crawling.md)
 - Methodology decision log: [`docs/methodology_decisions.md`](docs/methodology_decisions.md)

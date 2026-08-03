@@ -6,7 +6,7 @@ from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.scoring.schema import CONTRIBUTION_CLASSES, schema_for_prompt
 
 
-PROMPT_VERSION = "pass1_executive_ac_v4"
+PROMPT_VERSION = "pass1_executive_ac_v5"
 
 
 @dataclass(slots=True)
@@ -86,8 +86,6 @@ Additional field guidance:
 Paper metadata:
 paper_id: {record.paper_id}
 title: {record.title or ""}
-source: {record.source}
-decision_label: {record.decision_label or ""}
 
 Paper text:
 <<<PAPER_TEXT

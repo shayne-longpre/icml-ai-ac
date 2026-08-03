@@ -18,6 +18,11 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 OPENAI_FILES_URL = "https://api.openai.com/v1/files"
+OPENROUTER_MODELS_REQUIRING_MINIMAL_REASONING = frozenset(
+    {
+        "google/gemini-3.5-flash-lite",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -32,6 +37,30 @@ class ChatResult:
     elapsed_seconds: float
 
 
+class ChatResponseContentError(ValueError):
+    """A provider returned a response object without usable assistant text."""
+
+    def __init__(self, message: str, *, response: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.response = response
+        self.usage = response.get("usage", {}) if isinstance(response.get("usage"), dict) else {}
+        self.served_model = response_model(response)
+
+
+def effective_openrouter_reasoning_effort(
+    *,
+    model: str,
+    requested_effort: str | None,
+) -> str | None:
+    effort = requested_effort
+    if effort is None:
+        effort = os.environ.get("OPENROUTER_REASONING_EFFORT", "none")
+    effort = effort.strip().lower() or "none"
+    if effort == "none" and model in OPENROUTER_MODELS_REQUIRING_MINIMAL_REASONING:
+        return "minimal"
+    return effort or None
+
+
 class ChatCompletionClient:
     def __init__(
         self,
@@ -40,6 +69,7 @@ class ChatCompletionClient:
         model: str,
         reasoning_effort: str | None = None,
         openrouter_pdf_engine: str | None = None,
+        openrouter_provider_preferences: dict[str, Any] | None = None,
         timeout_seconds: float = 120.0,
         retries: int = 3,
         backoff_seconds: float = 5.0,
@@ -48,6 +78,9 @@ class ChatCompletionClient:
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.openrouter_pdf_engine = openrouter_pdf_engine
+        self.openrouter_provider_preferences = (
+            dict(openrouter_provider_preferences) if openrouter_provider_preferences else None
+        )
         self.timeout_seconds = timeout_seconds
         self.retries = retries
         self.backoff_seconds = backoff_seconds
@@ -80,15 +113,17 @@ class ChatCompletionClient:
         if self.provider == "openrouter":
             request_body.pop("max_completion_tokens")
             request_body["max_tokens"] = max_output_tokens
+            if self.openrouter_provider_preferences:
+                request_body["provider"] = dict(self.openrouter_provider_preferences)
         if seed is not None:
             request_body["seed"] = seed
         if response_format is not None:
             request_body["response_format"] = response_format
         if self.provider == "openrouter":
-            reasoning_effort = self.reasoning_effort
-            if reasoning_effort is None:
-                reasoning_effort = os.environ.get("OPENROUTER_REASONING_EFFORT", "none")
-            reasoning_effort = reasoning_effort.strip().lower()
+            reasoning_effort = effective_openrouter_reasoning_effort(
+                model=self.model,
+                requested_effort=self.reasoning_effort,
+            )
             if reasoning_effort:
                 request_body["reasoning"] = {"effort": reasoning_effort, "exclude": True}
             if self.openrouter_pdf_engine:
@@ -113,7 +148,10 @@ class ChatCompletionClient:
             retries=self.retries,
             backoff_seconds=self.backoff_seconds,
         )
-        content = extract_content(response)
+        try:
+            content = extract_content(response)
+        except ValueError as exc:
+            raise ChatResponseContentError(str(exc), response=response) from exc
         return ChatResult(
             provider=self.provider,
             model=self.model,
@@ -150,8 +188,6 @@ class ChatCompletionClient:
         }
         if instructions:
             request_body["instructions"] = instructions
-        if seed is not None:
-            request_body["seed"] = seed
         if response_format is not None:
             request_body["text"] = {"format": response_format}
         headers = {
@@ -167,7 +203,10 @@ class ChatCompletionClient:
             retries=self.retries,
             backoff_seconds=self.backoff_seconds,
         )
-        content = extract_responses_output_text(response)
+        try:
+            content = extract_responses_output_text(response)
+        except ValueError as exc:
+            raise ChatResponseContentError(str(exc), response=response) from exc
         return ChatResult(
             provider=self.provider,
             model=self.model,
@@ -197,6 +236,18 @@ class ChatCompletionClient:
         if self.provider == "openai":
             return OPENAI_CHAT_URL
         raise ValueError(f"Unsupported provider: {self.provider}")
+
+
+def is_batch_blocking_provider_error(exc: Exception) -> bool:
+    """Return whether a request error should stop the remaining batch suite."""
+    blocking_statuses = {400, 401, 402, 403, 404, 422, 429}
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in blocking_statuses
+    message = str(exc).lower()
+    return any(
+        f"http {status} " in message or f"http error {status}" in message
+        for status in blocking_statuses
+    )
 
 
 def post_json_with_retries(
@@ -403,9 +454,34 @@ def extract_content(response: dict[str, Any]) -> str:
     if not isinstance(message, dict):
         raise ValueError("chat response choice has no message")
     content = message.get("content")
-    if not isinstance(content, str):
-        raise ValueError("chat response message content must be a string")
-    return content
+    if isinstance(content, str):
+        return content
+    content_blocks = [content] if isinstance(content, dict) else content
+    if isinstance(content_blocks, list):
+        parts: list[str] = []
+        refusals: list[str] = []
+        for part in content_blocks:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+            elif isinstance(text, dict) and isinstance(text.get("value"), str):
+                parts.append(text["value"])
+            refusal = part.get("refusal")
+            if isinstance(refusal, str):
+                refusals.append(refusal)
+        if parts:
+            return "\n".join(parts)
+        if refusals:
+            raise ValueError("chat response contained a refusal instead of output text")
+    refusal = message.get("refusal")
+    if isinstance(refusal, str) and refusal:
+        raise ValueError("chat response contained a refusal instead of output text")
+    raise ValueError("chat response message content must be text or text blocks")
 
 
 def extract_responses_output_text(response: dict[str, Any]) -> str:

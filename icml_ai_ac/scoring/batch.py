@@ -1,21 +1,31 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
+import re
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from icml_ai_ac.models import PaperRecord
-from icml_ai_ac.scoring.providers import ChatCompletionClient
+from icml_ai_ac.scoring.providers import (
+    ChatCompletionClient,
+    effective_openrouter_reasoning_effort,
+    extract_content,
+    is_batch_blocking_provider_error,
+    response_model,
+)
 from icml_ai_ac.scoring.runner import estimate_tokens, read_text_path, resolve_record_text_path
 from icml_ai_ac.scoring.schema import CONTRIBUTION_CLASSES, parse_json_response
-from icml_ai_ac.storage import read_paper_records, write_json, write_jsonl
+from icml_ai_ac.scoring.usage import sum_usage
+from icml_ai_ac.storage import read_json, read_paper_records, write_json, write_jsonl
 
 
-PASS1_BATCH_PROMPT_VERSION = "pass1_cheap_forced_batch_rank_v1"
+PASS1_BATCH_PROMPT_VERSION = "pass1_cheap_forced_batch_rank_v2"
 
 
 @dataclass(slots=True)
@@ -123,7 +133,7 @@ def run_pass1_batch_rank(
         )
         raw_response_path = run_dir / "response.json"
         write_json(raw_response_path, chat.response)
-        parsed = parse_json_response(chat.content)
+        parsed = parse_batch_json_response(chat.content, candidates=candidates)
         parsed_response_path = run_dir / "parsed.json"
         write_json(parsed_response_path, parsed)
         rows = batch_response_to_rows(
@@ -176,6 +186,14 @@ def run_pass1_batch_suite(
     )
     class_by_id = read_class_map(config.class_path)
     partitions = make_batch_partitions(candidates, config=config, class_by_id=class_by_id)
+    effective_reasoning_effort = (
+        effective_openrouter_reasoning_effort(
+            model=config.model,
+            requested_effort=config.reasoning_effort,
+        )
+        if config.provider == "openrouter"
+        else config.reasoning_effort
+    )
     base_result: dict[str, Any] = {
         "status": "dry_run" if config.dry_run else "pending",
         "provider": config.provider,
@@ -188,6 +206,7 @@ def run_pass1_batch_suite(
         "candidate_ids": [candidate.record.paper_id for candidate in candidates],
         "batch_size": config.batch_size,
         "reasoning_effort": config.reasoning_effort,
+        "effective_reasoning_effort": effective_reasoning_effort,
         "partitions": config.partitions,
         "strategy": config.strategy,
         "class_path": str(config.class_path) if config.class_path else None,
@@ -230,9 +249,16 @@ def run_pass1_batch_suite(
                 "batch_size": len(batch_candidates),
                 "candidate_ids": [candidate.record.paper_id for candidate in batch_candidates],
                 "text_source": config.text_source,
+                "reasoning_effort": config.reasoning_effort,
+                "effective_reasoning_effort": effective_reasoning_effort,
+                "temperature": config.temperature,
+                "max_output_tokens": config.max_output_tokens,
+                "seed": config.seed,
                 "messages": messages,
                 "prompt_tokens_estimate": sum(estimate_tokens(message["content"]) for message in messages),
             }
+            fingerprint = batch_prompt_fingerprint(prompt_payload)
+            prompt_payload["fingerprint"] = fingerprint
             write_json(prompt_path, prompt_payload)
             if config.dry_run:
                 batch_rows = build_dry_run_rows(batch_candidates, config=batch_config, prompt_path=prompt_path)
@@ -244,12 +270,49 @@ def run_pass1_batch_suite(
                         "partition_index": partition_index,
                         "batch_index": batch_index,
                         "candidate_count": len(batch_candidates),
+                        "fingerprint": fingerprint,
                         "prompt_path": str(prompt_path),
                     }
                 )
                 continue
             if client is None:
                 raise RuntimeError("live batch suite requires a provider client")
+            cached = load_cached_pass1_batch(
+                batch_dir=batch_dir,
+                fingerprint=fingerprint,
+                candidates=batch_candidates,
+                config=batch_config,
+                prompt_path=prompt_path,
+                partition_index=partition_index,
+                batch_index=batch_index,
+            )
+            if cached is not None:
+                batch_rows, batch_result = cached
+                rows.extend(batch_rows)
+                batch_results.append(batch_result)
+                continue
+            recovered = recover_saved_pass1_batch(
+                batch_dir=batch_dir,
+                fingerprint=fingerprint,
+                candidates=batch_candidates,
+                config=batch_config,
+                prompt_path=prompt_path,
+                partition_index=partition_index,
+                batch_index=batch_index,
+                effective_reasoning_effort=effective_reasoning_effort,
+            )
+            if recovered is not None:
+                batch_rows, batch_result = recovered
+                rows.extend(batch_rows)
+                batch_results.append(batch_result)
+                continue
+            archived_attempt_count = archive_failed_pass1_attempt(
+                batch_dir=batch_dir,
+                fingerprint=fingerprint,
+            )
+            clear_pass1_attempt_artifacts(batch_dir)
+            attempt_index = archived_attempt_count + 1
+            chat = None
             try:
                 chat = client.complete(
                     messages=messages,
@@ -260,7 +323,7 @@ def run_pass1_batch_suite(
                 )
                 raw_response_path = batch_dir / "response.json"
                 write_json(raw_response_path, chat.response)
-                parsed = parse_json_response(chat.content)
+                parsed = parse_batch_json_response(chat.content, candidates=batch_candidates)
                 parsed_response_path = batch_dir / "parsed.json"
                 write_json(parsed_response_path, parsed)
                 batch_rows = batch_response_to_rows(
@@ -282,16 +345,27 @@ def run_pass1_batch_suite(
                         "partition_index": partition_index,
                         "batch_index": batch_index,
                         "candidate_count": len(batch_candidates),
+                        "fingerprint": fingerprint,
                         "prompt_path": str(prompt_path),
                         "raw_response_path": str(raw_response_path),
                         "parsed_response_path": str(parsed_response_path),
                         "usage": chat.usage,
                         "served_model": chat.served_model,
+                        "effective_reasoning": getattr(chat, "request", {}).get("reasoning"),
                         "provider_elapsed_seconds": round(chat.elapsed_seconds, 3),
+                        "resumed": False,
+                        "attempt_index": attempt_index,
                     }
                 )
+                write_json(batch_dir / "batch.json", batch_results[-1])
             except Exception as exc:  # noqa: BLE001 - keep running later batches.
                 failures += 1
+                response = getattr(exc, "response", None)
+                raw_response_path = batch_dir / "response.json"
+                if isinstance(response, dict) and not raw_response_path.exists():
+                    write_json(raw_response_path, response)
+                usage = chat.usage if chat is not None else getattr(exc, "usage", {})
+                served_model = chat.served_model if chat is not None else getattr(exc, "served_model", None)
                 error_path = batch_dir / "error.json"
                 write_json(error_path, {"error": repr(exc)})
                 batch_results.append(
@@ -300,12 +374,21 @@ def run_pass1_batch_suite(
                         "partition_index": partition_index,
                         "batch_index": batch_index,
                         "candidate_count": len(batch_candidates),
+                        "fingerprint": fingerprint,
                         "prompt_path": str(prompt_path),
                         "error_path": str(error_path),
                         "error": repr(exc),
+                        "attempt_index": attempt_index,
                     }
                 )
-                if is_non_retryable_provider_request_error(exc):
+                if raw_response_path.exists():
+                    batch_results[-1]["raw_response_path"] = str(raw_response_path)
+                if isinstance(usage, dict) and usage:
+                    batch_results[-1]["usage"] = usage
+                if served_model:
+                    batch_results[-1]["served_model"] = served_model
+                write_json(batch_dir / "batch.json", batch_results[-1])
+                if is_batch_blocking_provider_error(exc):
                     blocked_reason = repr(exc)
             if config.request_delay_seconds:
                 time.sleep(config.request_delay_seconds)
@@ -322,7 +405,9 @@ def run_pass1_batch_suite(
         "attempted_batch_count": len(batch_results),
         "skipped_batch_count": planned_batches - len(batch_results),
         "failure_count": failures,
+        "resumed_batch_count": sum(bool(result.get("resumed")) for result in batch_results),
         "blocked_reason": blocked_reason,
+        "usage": sum_usage(result.get("usage") for result in batch_results),
         "batch_results": batch_results,
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
@@ -330,9 +415,174 @@ def run_pass1_batch_suite(
     return result
 
 
-def is_non_retryable_provider_request_error(exc: Exception) -> bool:
-    """Identify request-wide client errors that will repeat for every batch."""
-    return str(exc).lower().startswith("http 400 from provider:")
+def batch_prompt_fingerprint(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def archive_failed_pass1_attempt(*, batch_dir: Path, fingerprint: str) -> int:
+    attempts_dir = batch_dir / "attempts"
+    existing_indices = [
+        int(path.name.removeprefix("attempt_"))
+        for path in attempts_dir.glob("attempt_[0-9][0-9][0-9][0-9]")
+        if path.is_dir()
+    ]
+    archived_count = max(existing_indices, default=0)
+    state_path = batch_dir / "batch.json"
+    if not state_path.exists():
+        return archived_count
+    try:
+        state = read_json(state_path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return archived_count
+    if (
+        not isinstance(state, dict)
+        or state.get("status") != "failed"
+        or state.get("fingerprint") != fingerprint
+    ):
+        return archived_count
+
+    archived_count += 1
+    archive_dir = attempts_dir / f"attempt_{archived_count:04d}"
+    archive_dir.mkdir(parents=True, exist_ok=False)
+    for name in ("prompt.json", "response.json", "parsed.json", "error.json", "batch.json"):
+        source = batch_dir / name
+        if source.exists():
+            shutil.copy2(source, archive_dir / name)
+            if name in {"response.json", "parsed.json", "error.json"}:
+                source.unlink()
+    write_json(
+        archive_dir / "archive.json",
+        {
+            "attempt_index": state.get("attempt_index") or archived_count,
+            "fingerprint": fingerprint,
+            "status": "failed",
+        },
+    )
+    write_json(
+        state_path,
+        {
+            **state,
+            "status": "retry_pending",
+            "archived_attempt_index": archived_count,
+        },
+    )
+    return archived_count
+
+
+def clear_pass1_attempt_artifacts(batch_dir: Path) -> None:
+    for name in ("response.json", "parsed.json", "error.json"):
+        path = batch_dir / name
+        if path.exists():
+            path.unlink()
+
+
+def load_cached_pass1_batch(
+    *,
+    batch_dir: Path,
+    fingerprint: str,
+    candidates: list[BatchCandidate],
+    config: Pass1BatchConfig,
+    prompt_path: Path,
+    partition_index: int,
+    batch_index: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    state_path = batch_dir / "batch.json"
+    raw_response_path = batch_dir / "response.json"
+    parsed_response_path = batch_dir / "parsed.json"
+    if not state_path.exists() or not raw_response_path.exists() or not parsed_response_path.exists():
+        return None
+    try:
+        state = read_json(state_path)
+        if (
+            not isinstance(state, dict)
+            or state.get("status") != "ok"
+            or state.get("fingerprint") != fingerprint
+        ):
+            return None
+        parsed = read_json(parsed_response_path)
+        if not isinstance(parsed, dict):
+            return None
+        rows = batch_response_to_rows(
+            parsed,
+            candidates=candidates,
+            config=config,
+            prompt_path=prompt_path,
+            raw_response_path=raw_response_path,
+            parsed_response_path=parsed_response_path,
+            usage=state.get("usage") if isinstance(state.get("usage"), dict) else {},
+        )
+        annotate_suite_rows(rows, partition_index=partition_index, batch_index=batch_index)
+        for row in rows:
+            row["served_model"] = state.get("served_model")
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return rows, {**state, "resumed": True}
+
+
+def recover_saved_pass1_batch(
+    *,
+    batch_dir: Path,
+    fingerprint: str,
+    candidates: list[BatchCandidate],
+    config: Pass1BatchConfig,
+    prompt_path: Path,
+    partition_index: int,
+    batch_index: int,
+    effective_reasoning_effort: str | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    state_path = batch_dir / "batch.json"
+    raw_response_path = batch_dir / "response.json"
+    parsed_response_path = batch_dir / "parsed.json"
+    if not state_path.exists() or not raw_response_path.exists():
+        return None
+    try:
+        state = read_json(state_path)
+        if not isinstance(state, dict) or state.get("fingerprint") != fingerprint:
+            return None
+        response = read_json(raw_response_path)
+        if not isinstance(response, dict):
+            return None
+        parsed = parse_batch_json_response(extract_content(response), candidates=candidates)
+        write_json(parsed_response_path, parsed)
+        usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+        rows = batch_response_to_rows(
+            parsed,
+            candidates=candidates,
+            config=config,
+            prompt_path=prompt_path,
+            raw_response_path=raw_response_path,
+            parsed_response_path=parsed_response_path,
+            usage=usage,
+        )
+        annotate_suite_rows(rows, partition_index=partition_index, batch_index=batch_index)
+        served_model = response_model(response)
+        for row in rows:
+            row["served_model"] = served_model
+        recovered_state = {
+            "status": "ok",
+            "partition_index": partition_index,
+            "batch_index": batch_index,
+            "candidate_count": len(candidates),
+            "fingerprint": fingerprint,
+            "prompt_path": str(prompt_path),
+            "raw_response_path": str(raw_response_path),
+            "parsed_response_path": str(parsed_response_path),
+            "usage": usage,
+            "served_model": served_model,
+            "effective_reasoning": (
+                {"effort": effective_reasoning_effort, "exclude": True}
+                if effective_reasoning_effort
+                else None
+            ),
+            "provider_elapsed_seconds": state.get("provider_elapsed_seconds"),
+            "resumed": True,
+            "recovered_from_raw_response": True,
+        }
+        write_json(state_path, recovered_state)
+        return rows, recovered_state
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def select_batch_candidates(
@@ -355,6 +605,37 @@ def select_batch_candidates(
         if limit is not None and len(candidates) >= limit:
             break
     return candidates
+
+
+def parse_batch_json_response(text: str, *, candidates: list[BatchCandidate]) -> dict[str, Any]:
+    try:
+        return parse_json_response(text)
+    except json.JSONDecodeError as original_error:
+        repaired = repair_candidate_title_lines(text, candidates=candidates)
+        if repaired == text:
+            raise original_error
+        return parse_json_response(repaired)
+
+
+def repair_candidate_title_lines(text: str, *, candidates: list[BatchCandidate]) -> str:
+    repaired = text
+    for candidate in candidates:
+        paper_id = re.escape(candidate.record.paper_id)
+        title = candidate.record.title
+        if not title:
+            continue
+        pattern = re.compile(
+            rf'("paper_id"\s*:\s*"{paper_id}"\s*,[ \t]*\r?\n)'
+            r'([ \t]*)"title"\s*:[^\r\n]*(\r?\n)'
+        )
+        repaired = pattern.sub(
+            lambda match: (
+                f'{match.group(1)}{match.group(2)}"title": '
+                f"{json.dumps(title, ensure_ascii=False)},{match.group(3)}"
+            ),
+            repaired,
+        )
+    return repaired
 
 
 def read_class_map(path: Path | None) -> dict[str, str]:
@@ -442,6 +723,7 @@ def build_pass1_batch_messages(candidates: list[BatchCandidate], *, config: Pass
     system = """You are a first-pass triage judge for a machine learning conference paper study.
 
 Use only the provided paper text. Do not use web search, retrieval, citation memory, author identity, venue prestige, institution, or outside knowledge.
+No reviews, reviewer scores, area-chair comments, decisions, presentation tiers, or awards are provided. Do not infer paper quality from possible venue or outcome cues in the document.
 
 Your job is recall-oriented comparative triage: rank papers so the best broad-impact candidates move to a stronger OpenAI model. Your ranking is not final; missing a plausible high-impact candidate is worse than advancing a few extra papers. Do not give every paper the same score. Return only valid JSON."""
     user = f"""Rank these {n} papers by evidence-grounded priority for strong-model review.
@@ -566,6 +848,7 @@ def batch_response_to_rows(
         raise ValueError("batch response missing ranked_papers array")
     ranked_objects = [item for item in ranked if isinstance(item, dict) and item.get("paper_id")]
     canonicalize_ranked_ids(ranked_objects, expected_ids=set(candidates_by_id))
+    repair_duplicate_ids_from_titles(ranked_objects, candidates_by_id=candidates_by_id)
     validate_ranked_items(ranked_objects, expected_ids=set(candidates_by_id), expected_count=len(candidates))
     rows: list[dict[str, Any]] = []
     for item in ranked_objects:
@@ -577,6 +860,45 @@ def batch_response_to_rows(
                                     raw_response_path=raw_response_path, parsed_response_path=parsed_response_path,
                                     usage=usage))
     return rows
+
+
+def repair_duplicate_ids_from_titles(
+    ranked: list[dict[str, Any]],
+    *,
+    candidates_by_id: dict[str, BatchCandidate],
+) -> None:
+    output_ids = [str(item.get("paper_id") or "") for item in ranked]
+    missing_ids = set(candidates_by_id) - set(output_ids)
+    duplicate_ids = {paper_id for paper_id in output_ids if output_ids.count(paper_id) > 1}
+    if not missing_ids or not duplicate_ids:
+        return
+
+    missing_by_title: dict[str, list[str]] = {}
+    for paper_id in missing_ids:
+        title = normalize_title(candidates_by_id[paper_id].record.title)
+        if title:
+            missing_by_title.setdefault(title, []).append(paper_id)
+
+    for item in ranked:
+        paper_id = str(item.get("paper_id") or "")
+        if paper_id not in duplicate_ids:
+            continue
+        matching_missing = missing_by_title.get(normalize_title(item.get("title")), [])
+        if len(matching_missing) != 1:
+            continue
+        repaired_id = matching_missing[0]
+        item["paper_id_original_model_output"] = paper_id
+        item["paper_id"] = repaired_id
+        missing_ids.remove(repaired_id)
+        missing_by_title.pop(normalize_title(item.get("title")), None)
+        if output_ids.count(paper_id) - sum(
+            str(row.get("paper_id") or "") == paper_id for row in ranked
+        ) >= 1:
+            duplicate_ids.discard(paper_id)
+
+
+def normalize_title(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
 
 
 def canonicalize_ranked_ids(ranked: list[Any], *, expected_ids: set[str]) -> None:
@@ -725,12 +1047,15 @@ def build_score_row(
             "unsupported_inferences_to_avoid": [],
         },
     }
+    if item.get("paper_id_original_model_output"):
+        scores["ranking_signals"]["paper_id_original_model_output"] = item[
+            "paper_id_original_model_output"
+        ]
     return {
         "status": "ok",
         "paper_id": candidate.record.paper_id,
         "title": candidate.record.title,
         "source": candidate.record.source,
-        "decision_label": candidate.record.decision_label,
         "provider": config.provider,
         "model": config.model,
         "prompt_version": config.prompt_version,

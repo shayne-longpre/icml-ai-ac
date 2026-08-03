@@ -44,6 +44,10 @@ CONTRIBUTION_CLASSES = [
     "analysis_position",
     "other",
 ]
+INVALID_JSON_ESCAPE_PATTERN = re.compile(r'\\(?!["\\/bfnrtu])')
+UNQUOTED_OBJECT_KEY_PATTERN = re.compile(
+    r'(?m)^([ \t]*)([A-Za-z_$][A-Za-z0-9_$ -]*?)"?[ \t]*:'
+)
 
 TOP_LEVEL_REQUIRED = [
     "paper_id",
@@ -168,15 +172,72 @@ def parse_json_response(text: str) -> dict[str, Any]:
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
     try:
-        parsed = json.loads(text)
+        parsed = load_json_with_invalid_escape_repair(text)
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", text, flags=re.DOTALL)
         if not match:
             raise
-        parsed = json.loads(match.group(0))
+        parsed = load_json_with_invalid_escape_repair(match.group(0))
     if not isinstance(parsed, dict):
         raise ValueError("model response JSON must be an object")
     return parsed
+
+
+def load_json_with_invalid_escape_repair(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as original_error:
+        candidates = [INVALID_JSON_ESCAPE_PATTERN.sub(r"\\\\", text)]
+        candidates.append(quote_unquoted_object_keys(text))
+        candidates.append(quote_unquoted_object_keys(candidates[0]))
+        candidates.extend(remove_trailing_json_commas(candidate) for candidate in list(candidates))
+        candidates.append(remove_trailing_json_commas(text))
+        for candidate in [text, *candidates]:
+            if candidate != text:
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
+            try:
+                return json.loads(candidate, strict=False)
+            except json.JSONDecodeError:
+                pass
+        raise original_error
+
+
+def quote_unquoted_object_keys(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        return f"{match.group(1)}{json.dumps(match.group(2).rstrip())}:"
+
+    return UNQUOTED_OBJECT_KEY_PATTERN.sub(replace, text)
+
+
+def remove_trailing_json_commas(text: str) -> str:
+    output: list[str] = []
+    in_string = False
+    escaped = False
+    for index, character in enumerate(text):
+        if in_string:
+            output.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+            output.append(character)
+            continue
+        if character == ",":
+            next_index = index + 1
+            while next_index < len(text) and text[next_index].isspace():
+                next_index += 1
+            if next_index < len(text) and text[next_index] in "}]":
+                continue
+        output.append(character)
+    return "".join(output)
 
 
 def validate_scoring_output(payload: dict[str, Any]) -> list[str]:

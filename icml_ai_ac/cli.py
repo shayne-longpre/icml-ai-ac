@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import json
 import sys
 import time
 import traceback
@@ -11,12 +13,42 @@ from typing import Any
 from icml_ai_ac.cheap_models import CHEAP_MODEL_PRESETS, DEFAULT_CHEAP_MODEL, resolve_cheap_models
 from icml_ai_ac.env import load_dotenv
 from icml_ai_ac.eval import evaluate_ranking
+from icml_ai_ac.analysis.human_comparison import (
+    build_divergence_report,
+    load_comparison_dataset,
+    render_markdown,
+)
+from icml_ai_ac.analysis.taxonomy import (
+    TaxonomyConfig,
+    run_taxonomy_classification,
+    run_taxonomy_induction,
+)
+from icml_ai_ac.analysis.tournament_simulation import simulate_hybrid_tournament
+from icml_ai_ac.analysis.agreement import build_agreement_report, build_axis_decomposition_report
+from icml_ai_ac.analysis.semifinal_audit import audit_semifinal_rankings
 from icml_ai_ac.finalists import FinalistSelectionConfig, read_ranked_rows, select_finalists
 from icml_ai_ac.http import AccessChallengeError, HttpClient, is_pdf_file, sha256_file
 from icml_ai_ac.metadata import enrich_metadata_rows, summarize_openreview_scores
-from icml_ai_ac.model_presets import DEFAULT_FRONTIER_MODEL, DEFAULT_STRONG_MODEL
+from icml_ai_ac.model_presets import (
+    DEFAULT_CLASSIFICATION_MODEL,
+    DEFAULT_FRONTIER_MODEL,
+    DEFAULT_STRONG_MODEL,
+)
+from icml_ai_ac.position_sensitivity import build_position_robust_shortlist
 from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.ranking_ensemble import ensemble_semifinal_rankings
+from icml_ai_ac.ranking_query import (
+    DEFAULT_CHEAP_RANKING_PATH,
+    DEFAULT_FINAL_RANKING_PATH,
+    DEFAULT_METADATA_PATH,
+    QUERY_PRESETS,
+    QUERY_SCOPES,
+    RankingQuery,
+    available_ranking_categories,
+    query_ranked_papers,
+    top_ranked_papers,
+    write_query_results,
+)
 from icml_ai_ac.scraper.arxiv import ArxivClient, ArxivQueryBudgetExceeded, arxiv_pdf_filename, is_confident_enough
 from icml_ai_ac.scraper.arxiv_audit import ArxivAuditThresholds, audit_arxiv_resolution
 from icml_ai_ac.parser import parse_pdf_record, write_parse_report
@@ -59,23 +91,33 @@ from icml_ai_ac.scoring.frontier_gold import (
     run_frontier_card_synthesis,
     run_frontier_pdf_cards,
 )
+from icml_ai_ac.scoring.bradley_terry import (
+    STAGE_MODES,
+    WEIGHT_MODES,
+    rank_bradley_terry,
+    ranked_meta_from_payload,
+    select_tournament_stage,
+)
 from icml_ai_ac.scoring.ranking import (
+    PASS2_BATCHED_PROMPT_VERSION,
     PASS2_PROMPT_VERSION,
     PASS2_FINAL_PROMPT_VERSION,
     PASS2_STAGE1_PROMPT_VERSION,
     REFERENCE_PROMPT_VERSION,
     REFERENCE_REPAIR_PROMPT_VERSION,
+    Pass2BatchedRankingConfig,
     Pass2RankingConfig,
     Pass2TwoStageConfig,
     ReferenceRepairConfig,
     ReferenceRankingConfig,
+    run_pass2_batched_ranking,
     run_pass2_ranking,
     run_pass2_two_stage,
     run_reference_repair,
     run_reference_ranking,
 )
 from icml_ai_ac.scoring.runner import ScoreRunConfig, prepare_run_dir, score_record, write_run_metadata
-from icml_ai_ac.storage import append_jsonl, read_jsonl, read_jsonl_if_exists, read_paper_records, write_json, write_jsonl
+from icml_ai_ac.storage import append_jsonl, read_json, read_jsonl, read_jsonl_if_exists, read_paper_records, write_json, write_jsonl
 from icml_ai_ac.shortlist import build_shortlist
 
 
@@ -360,8 +402,22 @@ def build_parser() -> argparse.ArgumentParser:
     parse.add_argument("--keep-references", action="store_true")
     parse.set_defaults(func=cmd_parse_pdfs)
 
+    anonymize = subparsers.add_parser(
+        "anonymize-papers",
+        help="Create validated, identity-redacted PDF and text derivatives for model scoring.",
+    )
+    anonymize.add_argument("--manifest", type=Path, required=True)
+    anonymize.add_argument("--out", type=Path, required=True)
+    anonymize.add_argument("--pdf-dir", type=Path, required=True)
+    anonymize.add_argument("--text-dir", type=Path, required=True)
+    anonymize.add_argument("--report", type=Path, default=None)
+    anonymize.add_argument("--max-pages", type=int, default=9)
+    anonymize.add_argument("--limit", type=int, default=None)
+    anonymize.add_argument("--overwrite", action="store_true")
+    anonymize.set_defaults(func=cmd_anonymize_papers)
+
     score = subparsers.add_parser("score-pass1", help="Run or dry-run first-pass executive AC scoring.")
-    add_http_args(score)
+    add_http_args(score, default_timeout=180.0)
     score.add_argument("--manifest", type=Path, required=True)
     score.add_argument("--out", type=Path, required=True)
     score.add_argument("--run-dir", type=Path, required=True)
@@ -384,7 +440,7 @@ def build_parser() -> argparse.ArgumentParser:
         "score-pass1-batch",
         help="Run or dry-run listwise first-pass cheap-model triage with forced ranks and buckets.",
     )
-    add_http_args(score_batch)
+    add_http_args(score_batch, default_timeout=180.0)
     score_batch.add_argument("--manifest", type=Path, required=True)
     score_batch.add_argument("--out", type=Path, required=True)
     score_batch.add_argument("--run-dir", type=Path, required=True)
@@ -405,7 +461,7 @@ def build_parser() -> argparse.ArgumentParser:
         "score-pass1-batches",
         help="Run first-pass cheap-model ranking across a full paper set in multiple small batches.",
     )
-    add_http_args(score_batches)
+    add_http_args(score_batches, default_timeout=180.0)
     score_batches.add_argument("--manifest", type=Path, required=True)
     score_batches.add_argument("--out", type=Path, required=True)
     score_batches.add_argument("--run-dir", type=Path, required=True)
@@ -439,7 +495,7 @@ def build_parser() -> argparse.ArgumentParser:
         "score-pass1-ensemble",
         help="Run first-pass listwise ranking across a reproducible cheap-model ensemble.",
     )
-    add_http_args(score_ensemble)
+    add_http_args(score_ensemble, default_timeout=180.0)
     score_ensemble.add_argument("--manifest", type=Path, required=True)
     score_ensemble.add_argument("--out-dir", type=Path, required=True)
     score_ensemble.add_argument("--provider", choices=["openrouter", "openai"], default="openrouter")
@@ -451,6 +507,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     score_ensemble.add_argument("--no-preset", action="store_true")
     score_ensemble.add_argument("--model", action="append", default=None, help="Model to include. Can be repeated.")
+    score_ensemble.add_argument(
+        "--model-workers",
+        type=int,
+        default=1,
+        help="Concurrent model streams. Use 4 only after a bounded provider preflight.",
+    )
     score_ensemble.add_argument("--prompt-version", default=PASS1_BATCH_PROMPT_VERSION)
     score_ensemble.add_argument("--text-source", choices=["scoring", "full", "compact"], default="scoring")
     score_ensemble.add_argument("--limit", type=int, default=None)
@@ -483,17 +545,18 @@ def build_parser() -> argparse.ArgumentParser:
         "classify-contributions",
         help="Classify papers by contribution route using compact title/abstract/intro/conclusion text.",
     )
-    add_http_args(classify)
+    add_http_args(classify, default_timeout=180.0)
     classify.add_argument("--manifest", type=Path, required=True)
     classify.add_argument("--out", type=Path, required=True)
     classify.add_argument("--run-dir", type=Path, required=True)
     classify.add_argument("--provider", choices=["openrouter", "openai"], default="openrouter")
-    classify.add_argument("--model", default=DEFAULT_CHEAP_MODEL)
+    classify.add_argument("--model", default=DEFAULT_CLASSIFICATION_MODEL)
     classify.add_argument("--prompt-version", default=CLASSIFY_PROMPT_VERSION)
     classify.add_argument("--text-source", choices=["compact", "scoring", "full"], default="compact")
     classify.add_argument("--limit", type=int, default=None)
     classify.add_argument("--paper-id", action="append", default=None)
     classify.add_argument("--per-paper-char-budget", type=int, default=12_000)
+    classify.add_argument("--batch-size", type=int, default=16)
     classify.add_argument("--temperature", type=float, default=0.0)
     classify.add_argument("--max-output-tokens", type=int, default=4000)
     classify.add_argument("--seed", type=int, default=None)
@@ -501,7 +564,7 @@ def build_parser() -> argparse.ArgumentParser:
     classify.set_defaults(func=cmd_classify_contributions)
 
     rank = subparsers.add_parser("rank-pass2", help="Run or dry-run strong-model ranking over top first-pass papers.")
-    add_http_args(rank)
+    add_http_args(rank, default_timeout=600.0)
     rank.add_argument("--manifest", type=Path, required=True)
     rank.add_argument("--pass1", type=Path, required=True)
     rank.add_argument("--out", type=Path, required=True)
@@ -520,11 +583,48 @@ def build_parser() -> argparse.ArgumentParser:
     rank.add_argument("--dry-run", action="store_true")
     rank.set_defaults(func=cmd_rank_pass2)
 
+    rank_batches = subparsers.add_parser(
+        "rank-pass2-batches",
+        help="Run a strong semifinal judge in deterministic, resumable listwise batches.",
+    )
+    add_http_args(rank_batches, default_timeout=600.0)
+    rank_batches.add_argument("--manifest", type=Path, required=True)
+    rank_batches.add_argument("--pass1", type=Path, required=True)
+    rank_batches.add_argument("--out", type=Path, required=True)
+    rank_batches.add_argument("--run-dir", type=Path, required=True)
+    rank_batches.add_argument("--provider", choices=["openai", "openrouter"], default="openai")
+    rank_batches.add_argument("--model", default=DEFAULT_STRONG_MODEL)
+    rank_batches.add_argument(
+        "--openrouter-provider-only",
+        action="append",
+        default=None,
+        help="Restrict an OpenRouter retry to these provider endpoint slugs.",
+    )
+    rank_batches.add_argument("--reasoning-effort", default="high")
+    rank_batches.add_argument("--prompt-version", default=PASS2_BATCHED_PROMPT_VERSION)
+    rank_batches.add_argument("--text-source", choices=["scoring", "full", "compact"], default="scoring")
+    rank_batches.add_argument("--top-fraction", type=float, default=0.25)
+    rank_batches.add_argument("--limit", type=int, default=None)
+    rank_batches.add_argument("--per-paper-char-budget", type=int, default=24_000)
+    rank_batches.add_argument("--batch-size", type=int, default=8)
+    rank_batches.add_argument("--partitions", type=int, default=2)
+    rank_batches.add_argument(
+        "--strategy",
+        choices=["sequential", "shuffled", "class_round_robin"],
+        default="class_round_robin",
+    )
+    rank_batches.add_argument("--class-path", type=Path, default=None)
+    rank_batches.add_argument("--temperature", type=float, default=0.1)
+    rank_batches.add_argument("--max-output-tokens", type=int, default=12_000)
+    rank_batches.add_argument("--seed", type=int, default=17)
+    rank_batches.add_argument("--dry-run", action="store_true")
+    rank_batches.set_defaults(func=cmd_rank_pass2_batches)
+
     rank_two_stage = subparsers.add_parser(
         "rank-pass2-two-stage",
         help="Run a strong-model semifinal rank followed by a smaller final ranking.",
     )
-    add_http_args(rank_two_stage)
+    add_http_args(rank_two_stage, default_timeout=600.0)
     rank_two_stage.add_argument("--manifest", type=Path, required=True)
     rank_two_stage.add_argument("--pass1", type=Path, required=True)
     rank_two_stage.add_argument("--out", type=Path, required=True)
@@ -550,7 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
         "rank-reference",
         help="Run or dry-run an independent strong-model reference ranking over a paper set.",
     )
-    add_http_args(reference)
+    add_http_args(reference, default_timeout=600.0)
     reference.add_argument("--manifest", type=Path, required=True)
     reference.add_argument("--out", type=Path, required=True)
     reference.add_argument("--run-dir", type=Path, required=True)
@@ -573,7 +673,7 @@ def build_parser() -> argparse.ArgumentParser:
         "repair-reference",
         help="Repair a structurally invalid strong-model reference ranking.",
     )
-    add_http_args(reference_repair)
+    add_http_args(reference_repair, default_timeout=600.0)
     reference_repair.add_argument("--manifest", type=Path, required=True)
     reference_repair.add_argument("--reference", type=Path, required=True)
     reference_repair.add_argument("--out", type=Path, required=True)
@@ -595,7 +695,7 @@ def build_parser() -> argparse.ArgumentParser:
         "rank-frontier-pdf-cards",
         help="Run PDF-aware frontier judge cards over a paper set, one paper per resumable call.",
     )
-    add_http_args(frontier_cards)
+    add_http_args(frontier_cards, default_timeout=600.0)
     frontier_cards.add_argument("--manifest", type=Path, required=True)
     frontier_cards.add_argument("--out", type=Path, required=True)
     frontier_cards.add_argument("--run-dir", type=Path, required=True)
@@ -623,7 +723,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     frontier_cards.add_argument("--pdf-settings", default="/ebook", help="Ghostscript PDFSETTINGS value for oversized excerpts.")
     frontier_cards.add_argument("--temperature", type=float, default=0.0)
-    frontier_cards.add_argument("--max-output-tokens", type=int, default=6000)
+    frontier_cards.add_argument("--max-output-tokens", type=int, default=12_000)
     frontier_cards.add_argument("--seed", type=int, default=None)
     frontier_cards.add_argument("--dry-run", action="store_true")
     frontier_cards.add_argument("--overwrite", action="store_true")
@@ -632,6 +732,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="native",
         help="OpenRouter file-parser PDF engine. Use native for models with file input.",
     )
+    frontier_cards.add_argument(
+        "--fallback-model",
+        default=None,
+        help="Optional model used only when the primary card fails or is structurally invalid.",
+    )
+    frontier_cards.add_argument("--fallback-reasoning-effort", default=None)
     frontier_cards.set_defaults(func=cmd_rank_frontier_pdf_cards)
 
     frontier_ensemble = subparsers.add_parser(
@@ -639,6 +745,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Aggregate multiple PDF-aware frontier card JSONL files into a reference ranking prior.",
     )
     frontier_ensemble.add_argument("--cards", type=Path, required=True, action="append")
+    frontier_ensemble.add_argument(
+        "--label",
+        action="append",
+        default=None,
+        help="Stable judge-stream label. Supply once per --cards path in the same order.",
+    )
     frontier_ensemble.add_argument("--out", type=Path, required=True)
     frontier_ensemble.add_argument("--paper-set-name", default="icml_2025_accepted_50")
     frontier_ensemble.add_argument("--prompt-version", default=FRONTIER_CARD_ENSEMBLE_VERSION)
@@ -648,7 +760,7 @@ def build_parser() -> argparse.ArgumentParser:
         "rank-frontier-card-synthesis",
         help="Synthesize multiple PDF-aware frontier card sets into a forced reference ranking with a strong model.",
     )
-    add_http_args(frontier_synthesis)
+    add_http_args(frontier_synthesis, default_timeout=600.0)
     frontier_synthesis.add_argument("--cards", type=Path, required=True, action="append")
     frontier_synthesis.add_argument("--out", type=Path, required=True)
     frontier_synthesis.add_argument("--run-dir", type=Path, required=True)
@@ -667,7 +779,7 @@ def build_parser() -> argparse.ArgumentParser:
         "rank-frontier-card-tournament",
         help="Run a resumable pairwise tournament over PDF-aware frontier cards.",
     )
-    add_http_args(frontier_tournament)
+    add_http_args(frontier_tournament, default_timeout=600.0)
     frontier_tournament.add_argument("--cards", type=Path, required=True, action="append")
     frontier_tournament.add_argument("--seed-ranking", type=Path, required=True)
     frontier_tournament.add_argument("--out", type=Path, required=True)
@@ -694,6 +806,49 @@ def build_parser() -> argparse.ArgumentParser:
     frontier_tournament.add_argument("--overwrite", action="store_true")
     frontier_tournament.set_defaults(func=cmd_rank_frontier_card_tournament)
 
+    bradley_terry = subparsers.add_parser(
+        "rank-bradley-terry",
+        help="Fit a Bradley-Terry model over a frontier tournament's pairwise matches.",
+    )
+    bradley_terry.add_argument(
+        "--tournament",
+        type=Path,
+        required=True,
+        help="Tournament output JSON with a `matches` array (from rank-frontier-card-tournament).",
+    )
+    bradley_terry.add_argument("--out", type=Path, required=True)
+    bradley_terry.add_argument(
+        "--weight",
+        choices=list(WEIGHT_MODES),
+        default="none",
+        help="Comparison weighting: `none` (unit votes) or `confidence` (judge confidence per match).",
+    )
+    bradley_terry.add_argument(
+        "--prior-strength",
+        type=float,
+        default=1.0,
+        help="Positive virtual wins/losses vs a reference paper; keeps undefeated/winless estimates finite.",
+    )
+    bradley_terry.add_argument(
+        "--stage",
+        choices=list(STAGE_MODES),
+        default="auto",
+        help="Match stage to fit. Auto uses playoff for hybrid tournaments, Swiss for Swiss-only, and all otherwise.",
+    )
+    bradley_terry.add_argument("--max-iter", type=int, default=5000)
+    bradley_terry.add_argument("--tol", type=float, default=1e-9)
+    bradley_terry.set_defaults(func=cmd_rank_bradley_terry)
+
+    tournament_simulation = subparsers.add_parser(
+        "simulate-hybrid-tournament",
+        help="Replay a Swiss-plus-playoff schedule from a complete all-pairs artifact.",
+    )
+    tournament_simulation.add_argument("--tournament", type=Path, required=True)
+    tournament_simulation.add_argument("--out", type=Path, required=True)
+    tournament_simulation.add_argument("--swiss-rounds", type=int, default=10)
+    tournament_simulation.add_argument("--playoff-top-n", type=int, required=True)
+    tournament_simulation.set_defaults(func=cmd_simulate_hybrid_tournament)
+
     shortlist = subparsers.add_parser("build-shortlist", help="Aggregate score rows into a unique ranked shortlist JSONL.")
     shortlist.add_argument("--scores", type=Path, required=True, action="append")
     shortlist.add_argument("--out", type=Path, required=True)
@@ -702,6 +857,19 @@ def build_parser() -> argparse.ArgumentParser:
     shortlist.add_argument("--min-per-class", type=int, default=0)
     shortlist.add_argument("--class-path", type=Path, default=None)
     shortlist.set_defaults(func=cmd_build_shortlist)
+
+    position_shortlist = subparsers.add_parser(
+        "build-position-robust-shortlist",
+        help="Union raw and within-paper position-adjusted first-pass leaders.",
+    )
+    position_shortlist.add_argument("--scores", type=Path, required=True, action="append")
+    position_shortlist.add_argument("--raw-ranking", type=Path, required=True)
+    position_shortlist.add_argument("--class-path", type=Path, default=None)
+    position_shortlist.add_argument("--cutoff", type=int, required=True)
+    position_shortlist.add_argument("--adjusted-out", type=Path, required=True)
+    position_shortlist.add_argument("--out", type=Path, required=True)
+    position_shortlist.add_argument("--report", type=Path, required=True)
+    position_shortlist.set_defaults(func=cmd_build_position_robust_shortlist)
 
     semifinal_ensemble = subparsers.add_parser(
         "ensemble-semifinal-rankings",
@@ -717,6 +885,18 @@ def build_parser() -> argparse.ArgumentParser:
     semifinal_ensemble.add_argument("--out", type=Path, required=True)
     semifinal_ensemble.add_argument("--report", type=Path, default=None)
     semifinal_ensemble.set_defaults(func=cmd_ensemble_semifinal_rankings)
+
+    semifinal_audit = subparsers.add_parser(
+        "audit-semifinal-rankings",
+        help="Audit complete strong-semifinal ranking streams before local aggregation.",
+    )
+    semifinal_audit.add_argument("--ranking", type=Path, required=True, action="append")
+    semifinal_audit.add_argument("--label", required=True, action="append")
+    semifinal_audit.add_argument("--expected-model", required=True, action="append")
+    semifinal_audit.add_argument("--shortlist", type=Path, required=True)
+    semifinal_audit.add_argument("--manifest", type=Path, required=True)
+    semifinal_audit.add_argument("--out", type=Path, required=True)
+    semifinal_audit.set_defaults(func=cmd_audit_semifinal_rankings)
 
     finalists = subparsers.add_parser(
         "select-finalists",
@@ -751,16 +931,175 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--k", type=int, action="append", default=None, help="Top-k value to evaluate. Can be repeated.")
     evaluate.set_defaults(func=cmd_eval_ranking)
 
+    divergence = subparsers.add_parser(
+        "human-divergence-report",
+        help="Build an AI-vs-human divergence gallery (overlooked gems and AI blind spots).",
+    )
+    divergence.add_argument("--manifest", type=Path, required=True, help="Enriched paper manifest JSONL (human tier/ratings/awards in extra).")
+    divergence.add_argument("--ai-scores", type=Path, required=True, help="First-pass AI score JSONL (per-paper `scores` schema).")
+    divergence.add_argument(
+        "--strong-ranking",
+        type=Path,
+        default=None,
+        help="Optional tournament/Bradley-Terry ranking JSON for finalist strong ranks.",
+    )
+    divergence.add_argument("--out", type=Path, required=True)
+    divergence.add_argument("--markdown", type=Path, default=None, help="Optional path for a human-readable gallery.")
+    divergence.add_argument("--human-axis", choices=["tier", "reviewer", "decision"], default="tier")
+    divergence.add_argument("--top-frac", type=float, default=0.10)
+    divergence.add_argument("--cases-per-direction", type=int, default=20)
+    divergence.add_argument("--min-reviews", type=int, default=0)
+    divergence.add_argument(
+        "--min-coverage",
+        type=float,
+        default=1.0,
+        help="Minimum manifest/AI join fraction; defaults to complete coverage.",
+    )
+    divergence.set_defaults(func=cmd_human_divergence_report)
+
+    taxonomy_induce = subparsers.add_parser(
+        "divergence-taxonomy-induce",
+        help="Propose a codebook of AI-vs-human divergence reason codes from the gallery (QL-B stage 1).",
+    )
+    add_http_args(taxonomy_induce, default_timeout=600.0)
+    taxonomy_induce.add_argument("--report", type=Path, required=True, help="human-divergence-report JSON.")
+    taxonomy_induce.add_argument("--out", type=Path, required=True, help="Candidate codebook JSON (review/edit before classify).")
+    taxonomy_induce.add_argument("--run-dir", type=Path, default=None)
+    taxonomy_induce.add_argument("--provider", choices=["openai", "openrouter"], default="openrouter")
+    taxonomy_induce.add_argument("--model", default=DEFAULT_FRONTIER_MODEL)
+    taxonomy_induce.add_argument("--reasoning-effort", default="high")
+    taxonomy_induce.add_argument("--sample-size", type=int, default=40)
+    taxonomy_induce.add_argument("--max-codes", type=int, default=12)
+    taxonomy_induce.add_argument("--temperature", type=float, default=0.2)
+    taxonomy_induce.add_argument("--max-output-tokens", type=int, default=6000)
+    taxonomy_induce.add_argument("--seed", type=int, default=None)
+    taxonomy_induce.add_argument("--dry-run", action="store_true")
+    taxonomy_induce.set_defaults(func=cmd_divergence_taxonomy_induce)
+
+    taxonomy_classify = subparsers.add_parser(
+        "divergence-taxonomy-classify",
+        help="Classify divergence cases against a frozen codebook and aggregate (QL-B stage 2).",
+    )
+    add_http_args(taxonomy_classify, default_timeout=600.0)
+    taxonomy_classify.add_argument("--report", type=Path, required=True)
+    taxonomy_classify.add_argument("--codebook", type=Path, required=True)
+    taxonomy_classify.add_argument("--out", type=Path, required=True)
+    taxonomy_classify.add_argument("--run-dir", type=Path, default=None)
+    taxonomy_classify.add_argument("--provider", choices=["openai", "openrouter"], default="openrouter")
+    taxonomy_classify.add_argument("--model", default=DEFAULT_FRONTIER_MODEL)
+    taxonomy_classify.add_argument("--reasoning-effort", default="high")
+    taxonomy_classify.add_argument("--batch-size", type=int, default=20)
+    taxonomy_classify.add_argument("--max-codes-per-case", type=int, default=3)
+    taxonomy_classify.add_argument("--temperature", type=float, default=0.0)
+    taxonomy_classify.add_argument("--max-output-tokens", type=int, default=8000)
+    taxonomy_classify.add_argument("--seed", type=int, default=None)
+    taxonomy_classify.add_argument("--second-provider", choices=["openai", "openrouter"], default=None)
+    taxonomy_classify.add_argument(
+        "--second-model",
+        default=None,
+        help="Optional independent coder (different family) for per-code Cohen's kappa reliability.",
+    )
+    taxonomy_classify.add_argument("--second-reasoning-effort", default="high")
+    taxonomy_classify.add_argument("--dry-run", action="store_true")
+    taxonomy_classify.set_defaults(func=cmd_divergence_taxonomy_classify)
+
+    agreement = subparsers.add_parser(
+        "human-agreement-report",
+        help="AI-vs-human agreement: recall@k / ROC-AUC for surfacing orals+spotlights, Kendall tau-b, per-tier distributions.",
+    )
+    agreement.add_argument("--manifest", type=Path, required=True, help="Enriched paper manifest JSONL.")
+    agreement.add_argument("--ai-scores", type=Path, required=True, help="First-pass AI score JSONL.")
+    agreement.add_argument(
+        "--strong-ranking",
+        type=Path,
+        default=None,
+        help="Optional strong ranking JSON for the finalist-subset (layered) view.",
+    )
+    agreement.add_argument("--out", type=Path, required=True)
+    agreement.add_argument("--k", type=int, action="append", default=None, help="Top-k for recall/precision. Repeatable (default 10 20 50 100).")
+    agreement.add_argument("--honored-includes-award", action="store_true", help="Count award papers as honored alongside orals/spotlights.")
+    agreement.add_argument("--min-coverage", type=float, default=1.0)
+    agreement.add_argument("--bootstrap-samples", type=int, default=500)
+    agreement.add_argument("--bootstrap-seed", type=int, default=20260725)
+    agreement.set_defaults(func=cmd_human_agreement_report)
+
+    axis_decomp = subparsers.add_parser(
+        "ai-axis-decomposition",
+        help="Rank AI axes by how well they predict human honors (impact-vs-polish decomposition).",
+    )
+    axis_decomp.add_argument("--manifest", type=Path, required=True)
+    axis_decomp.add_argument("--ai-scores", type=Path, required=True)
+    axis_decomp.add_argument("--out", type=Path, required=True)
+    axis_decomp.add_argument("--honored-includes-award", action="store_true")
+    axis_decomp.add_argument("--min-coverage", type=float, default=1.0)
+    axis_decomp.set_defaults(func=cmd_ai_axis_decomposition)
+
+    query_papers = subparsers.add_parser(
+        "query-ranked-papers",
+        help="Search paper metadata and join matches to the frozen ICML 2026 rankings.",
+    )
+    query_papers.add_argument(
+        "--metadata",
+        type=Path,
+        default=DEFAULT_METADATA_PATH,
+    )
+    query_papers.add_argument(
+        "--cheap-ranking",
+        type=Path,
+        default=DEFAULT_CHEAP_RANKING_PATH,
+    )
+    query_papers.add_argument(
+        "--final-ranking",
+        type=Path,
+        default=DEFAULT_FINAL_RANKING_PATH,
+    )
+    query_papers.add_argument("--preset", choices=QUERY_PRESETS)
+    query_papers.add_argument("--query", help="Case-insensitive substring across title, abstract, topic, and contribution class.")
+    query_papers.add_argument("--topic", help="Case-insensitive official-topic glob, such as 'Deep Learning->*'.")
+    query_papers.add_argument("--contribution-class")
+    query_papers.add_argument("--scope", choices=QUERY_SCOPES, default="all")
+    query_papers.add_argument("--limit", type=int)
+    query_papers.add_argument("--include-abstract", action="store_true")
+    query_papers.add_argument("--out", type=Path, help="Optional .csv, .jsonl, or .tsv output path. Defaults to TSV on stdout.")
+    query_papers.add_argument("--format", choices=["csv", "jsonl", "tsv"], default=None)
+    query_papers.set_defaults(func=cmd_query_ranked_papers)
+
+    top_papers = subparsers.add_parser(
+        "top-ranked-papers",
+        help="Return the top frozen-ranking papers in a named topic, contribution class, or preset.",
+    )
+    top_papers.add_argument(
+        "--category",
+        required=True,
+        help="For example: data-pretraining, theory, benchmark_dataset, or 'Deep Learning'.",
+    )
+    top_papers.add_argument("--top", type=int, default=20)
+    top_papers.add_argument("--scope", choices=QUERY_SCOPES, default="finalists")
+    top_papers.add_argument("--include-abstract", action="store_true")
+    top_papers.add_argument("--metadata", type=Path, default=DEFAULT_METADATA_PATH)
+    top_papers.add_argument("--cheap-ranking", type=Path, default=DEFAULT_CHEAP_RANKING_PATH)
+    top_papers.add_argument("--final-ranking", type=Path, default=DEFAULT_FINAL_RANKING_PATH)
+    top_papers.add_argument("--out", type=Path)
+    top_papers.add_argument("--format", choices=["csv", "jsonl", "tsv"], default="jsonl")
+    top_papers.set_defaults(func=cmd_top_ranked_papers)
+
+    list_categories = subparsers.add_parser(
+        "list-ranking-categories",
+        help="List categories accepted by top-ranked-papers.",
+    )
+    list_categories.set_defaults(func=cmd_list_ranking_categories)
+
     return parser
 
 
 def add_http_args(
     parser: argparse.ArgumentParser,
     *,
+    default_timeout: float = 30.0,
     default_delay: float = 0.0,
     default_backoff: float = 1.5,
 ) -> None:
-    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--timeout", type=float, default=default_timeout)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--backoff", type=float, default=default_backoff)
     parser.add_argument("--delay", type=float, default=default_delay, help="Polite delay between HTTP requests in seconds.")
@@ -2022,6 +2361,54 @@ def cmd_parse_pdfs(args: argparse.Namespace) -> int:
     return 0 if failed == 0 else 2
 
 
+def cmd_anonymize_papers(args: argparse.Namespace) -> int:
+    from icml_ai_ac.anonymize import AnonymizationConfig, anonymize_manifest
+
+    started = time.monotonic()
+    report_path = args.report or args.out.with_suffix(args.out.suffix + ".report.json")
+    report = anonymize_manifest(
+        records=list(read_paper_records(args.manifest)),
+        out=args.out,
+        report_path=report_path,
+        config=AnonymizationConfig(
+            pdf_dir=args.pdf_dir,
+            text_dir=args.text_dir,
+            max_pages=args.max_pages,
+            limit=args.limit,
+            overwrite=args.overwrite,
+        ),
+    )
+    report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    write_json(report_path, report)
+    write_json(
+        args.out.with_suffix(args.out.suffix + ".run.json"),
+        {
+            "command": "anonymize-papers",
+            "manifest": str(args.manifest),
+            "out": str(args.out),
+            "report": str(report_path),
+            **{
+                key: report[key]
+                for key in (
+                    "anonymization_version",
+                    "input_records",
+                    "output_records",
+                    "excluded_records",
+                    "resumed_records",
+                    "max_pages",
+                    "elapsed_seconds",
+                    "status_counts",
+                )
+            },
+        },
+    )
+    print(
+        f"Anonymized {report['output_records']}/{report['input_records']} papers; "
+        f"excluded={report['excluded_records']} resumed={report['resumed_records']}"
+    )
+    return 0 if report["excluded_records"] == 0 else 2
+
+
 def cmd_score_pass1(args: argparse.Namespace) -> int:
     started = time.monotonic()
     prepare_run_dir(args.run_dir)
@@ -2168,11 +2555,12 @@ def cmd_score_pass1_ensemble(args: argparse.Namespace) -> int:
     models = resolve_cheap_models(preset=preset_name, explicit_models=args.model)
     if not models:
         raise ValueError("No cheap models selected. Use --model-preset or at least one --model.")
+    if args.model_workers < 1:
+        raise ValueError("--model-workers must be positive")
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    score_paths: list[Path] = []
-    results: list[dict[str, Any]] = []
-    failures = 0
-    for model_index, model in enumerate(models):
+
+    def run_model(job: tuple[int, str]) -> tuple[Path, dict[str, Any]]:
+        model_index, model = job
         safe_name = safe_model_name(model)
         score_path = args.out_dir / f"{model_index:02d}_{safe_name}.jsonl"
         run_dir = args.out_dir / "runs" / f"{model_index:02d}_{safe_name}"
@@ -2211,11 +2599,21 @@ def cmd_score_pass1_ensemble(args: argparse.Namespace) -> int:
             config=config,
             client=client,
         )
-        score_paths.append(score_path)
-        results.append(result)
-        if result["status"] not in {"ok", "dry_run"}:
-            failures += 1
         print(f"[cheap-ensemble] {model} {result['status']} rows={result.get('rows')}", file=sys.stderr)
+        return score_path, result
+
+    jobs = list(enumerate(models))
+    if args.model_workers == 1:
+        completed = [run_model(job) for job in jobs]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(args.model_workers, len(jobs)),
+            thread_name_prefix="cheap-model",
+        ) as executor:
+            completed = list(executor.map(run_model, jobs))
+    score_paths = [score_path for score_path, _ in completed]
+    results = [result for _, result in completed]
+    failures = sum(result["status"] not in {"ok", "dry_run"} for result in results)
 
     aggregate_payload = None
     if args.aggregate_out is not None:
@@ -2236,6 +2634,7 @@ def cmd_score_pass1_ensemble(args: argparse.Namespace) -> int:
         "model_preset": preset_name,
         "preset_notes": CHEAP_MODEL_PRESETS[preset_name].notes if preset_name else None,
         "models": models,
+        "model_workers": args.model_workers,
         "score_paths": [str(path) for path in score_paths],
         "results": results,
         "aggregate_out": str(args.aggregate_out) if args.aggregate_out else None,
@@ -2259,6 +2658,8 @@ def cmd_classify_contributions(args: argparse.Namespace) -> int:
         limit=args.limit,
         paper_ids=set(args.paper_id or []),
         per_paper_char_budget=args.per_paper_char_budget,
+        batch_size=args.batch_size,
+        request_delay_seconds=args.delay,
         temperature=args.temperature,
         max_output_tokens=args.max_output_tokens,
         seed=args.seed,
@@ -2314,6 +2715,60 @@ def cmd_rank_pass2(args: argparse.Namespace) -> int:
         client=client,
     )
     print(f"Ranked {result['candidate_count']} candidates: {result['status']}")
+    return 0 if result["status"] in {"ok", "dry_run"} else 2
+
+
+def cmd_rank_pass2_batches(args: argparse.Namespace) -> int:
+    config = Pass2BatchedRankingConfig(
+        provider=args.provider,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        prompt_version=args.prompt_version,
+        text_source=args.text_source,
+        top_fraction=args.top_fraction,
+        limit=args.limit,
+        per_paper_char_budget=args.per_paper_char_budget,
+        batch_size=args.batch_size,
+        partitions=args.partitions,
+        strategy=args.strategy,
+        class_path=args.class_path,
+        request_delay_seconds=args.delay,
+        temperature=args.temperature,
+        max_output_tokens=args.max_output_tokens,
+        seed=args.seed,
+        dry_run=args.dry_run,
+        openrouter_provider_only=tuple(args.openrouter_provider_only or ()),
+    )
+    provider_preferences = None
+    if args.openrouter_provider_only:
+        if args.provider != "openrouter":
+            raise ValueError("--openrouter-provider-only requires --provider openrouter")
+        provider_preferences = {
+            "only": list(args.openrouter_provider_only),
+            "allow_fallbacks": False,
+        }
+    client = None if args.dry_run else ChatCompletionClient(
+        provider=args.provider,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        openrouter_provider_preferences=provider_preferences,
+        timeout_seconds=args.timeout,
+        retries=args.retries,
+        backoff_seconds=args.backoff,
+    )
+    result = run_pass2_batched_ranking(
+        manifest=args.manifest,
+        pass1_path=args.pass1,
+        out=args.out,
+        run_dir=args.run_dir,
+        config=config,
+        client=client,
+    )
+    print(
+        f"Batched strong ranking {result['status']}: candidates={result['candidate_count']} "
+        f"batches={result['attempted_batch_count']}/{result['batch_count']} "
+        f"resumed={result['resumed_batch_count']}"
+    )
     return 0 if result["status"] in {"ok", "dry_run"} else 2
 
 
@@ -2455,6 +2910,8 @@ def cmd_rank_frontier_pdf_cards(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         overwrite=args.overwrite,
         openrouter_pdf_engine=args.openrouter_pdf_engine,
+        fallback_model=args.fallback_model,
+        fallback_reasoning_effort=args.fallback_reasoning_effort,
     )
     client = None if args.dry_run else ChatCompletionClient(
         provider=args.provider,
@@ -2465,12 +2922,24 @@ def cmd_rank_frontier_pdf_cards(args: argparse.Namespace) -> int:
         retries=args.retries,
         backoff_seconds=args.backoff,
     )
+    fallback_client = None
+    if not args.dry_run and args.fallback_model:
+        fallback_client = ChatCompletionClient(
+            provider=args.provider,
+            model=args.fallback_model,
+            reasoning_effort=args.fallback_reasoning_effort,
+            openrouter_pdf_engine=args.openrouter_pdf_engine if args.provider == "openrouter" else None,
+            timeout_seconds=args.timeout,
+            retries=args.retries,
+            backoff_seconds=args.backoff,
+        )
     result = run_frontier_pdf_cards(
         manifest=args.manifest,
         out=args.out,
         run_dir=args.run_dir,
         config=config,
         client=client,
+        fallback_client=fallback_client,
     )
     print(
         f"Frontier PDF cards {result['ok_count']}/{result['candidate_count']} ok "
@@ -2482,6 +2951,7 @@ def cmd_rank_frontier_pdf_cards(args: argparse.Namespace) -> int:
 def cmd_rank_frontier_card_ensemble(args: argparse.Namespace) -> int:
     result = build_frontier_card_ensemble(
         card_paths=args.cards,
+        labels=args.label,
         out=args.out,
         paper_set_name=args.paper_set_name,
         prompt_version=args.prompt_version,
@@ -2564,6 +3034,67 @@ def cmd_rank_frontier_card_tournament(args: argparse.Namespace) -> int:
     return 0 if result["status"] in {"ok", "dry_run"} else 2
 
 
+def cmd_rank_bradley_terry(args: argparse.Namespace) -> int:
+    payload = read_json(args.tournament)
+    if not isinstance(payload, dict):
+        print(f"Tournament payload must be a JSON object: {args.tournament}")
+        return 2
+    matches = payload.get("matches")
+    if not isinstance(matches, list):
+        print(f"Tournament payload has no `matches` array: {args.tournament}")
+        return 2
+    try:
+        selected_matches, restrict, stage_meta = select_tournament_stage(payload, stage=args.stage)
+        result = rank_bradley_terry(
+            selected_matches,
+            ranked_meta=ranked_meta_from_payload(payload),
+            restrict_to=restrict,
+            weight_mode=args.weight,
+            prior_strength=args.prior_strength,
+            max_iter=args.max_iter,
+            tol=args.tol,
+        )
+    except ValueError as exc:
+        print(f"Bradley-Terry configuration error: {exc}")
+        return 2
+    result["source_tournament"] = str(args.tournament)
+    result["stage_selection"] = stage_meta
+    write_json(args.out, result)
+    diagnostics = result["diagnostics"]
+    top = result["ranked_papers"][0]["paper_id"] if result["ranked_papers"] else "-"
+    print(
+        f"Bradley-Terry ranked {diagnostics['player_count']} papers "
+        f"(converged={diagnostics['converged']} in {diagnostics['iterations']} iters, "
+        f"connected={diagnostics['comparison_graph_connected']}); top={top}"
+    )
+    return 0 if diagnostics["converged"] else 2
+
+
+def cmd_simulate_hybrid_tournament(args: argparse.Namespace) -> int:
+    payload = read_json(args.tournament)
+    if not isinstance(payload, dict):
+        print(f"Tournament payload must be a JSON object: {args.tournament}")
+        return 2
+    try:
+        result = simulate_hybrid_tournament(
+            payload,
+            swiss_rounds=args.swiss_rounds,
+            playoff_top_n=args.playoff_top_n,
+        )
+    except ValueError as exc:
+        print(f"Tournament simulation error: {exc}")
+        return 2
+    result["source_tournament"] = str(args.tournament)
+    write_json(args.out, result)
+    metrics = result["metrics_vs_all_pairs"]
+    print(
+        f"Simulated {result['simulated_pair_count']}/{result['all_pairs_count']} pairs: "
+        f"spearman={metrics['spearman']} "
+        f"top10_recall={metrics['top_10']['recall_at_k']}"
+    )
+    return 0
+
+
 def cmd_build_shortlist(args: argparse.Namespace) -> int:
     report = build_shortlist(
         scores_path=args.scores,
@@ -2580,6 +3111,24 @@ def cmd_build_shortlist(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_build_position_robust_shortlist(args: argparse.Namespace) -> int:
+    report = build_position_robust_shortlist(
+        scores_paths=args.scores,
+        raw_ranking_path=args.raw_ranking,
+        class_path=args.class_path,
+        cutoff=args.cutoff,
+        adjusted_out=args.adjusted_out,
+        shortlist_out=args.out,
+        report_out=args.report,
+    )
+    print(
+        f"Built position-robust Stage 3 shortlist: {report['union_count']} papers "
+        f"from raw/adjusted top {report['cutoff']} "
+        f"(overlap={report['overlap_count']})"
+    )
+    return 0
+
+
 def cmd_ensemble_semifinal_rankings(args: argparse.Namespace) -> int:
     payload = ensemble_semifinal_rankings(
         ranking_paths=args.ranking,
@@ -2592,6 +3141,22 @@ def cmd_ensemble_semifinal_rankings(args: argparse.Namespace) -> int:
         f"{payload['paper_count']} papers"
     )
     return 0
+
+
+def cmd_audit_semifinal_rankings(args: argparse.Namespace) -> int:
+    payload = audit_semifinal_rankings(
+        ranking_paths=args.ranking,
+        labels=args.label,
+        expected_models=args.expected_model,
+        shortlist_path=args.shortlist,
+        manifest_path=args.manifest,
+        out=args.out,
+    )
+    print(
+        f"Stage 3 audit {payload['status']}: papers={payload['paper_count']} "
+        f"blocking={len(payload['blocking_issues'])} warnings={len(payload['warnings'])}"
+    )
+    return 1 if payload["blocking_issues"] else 0
 
 
 def cmd_select_finalists(args: argparse.Namespace) -> int:
@@ -2627,6 +3192,271 @@ def cmd_eval_ranking(args: argparse.Namespace) -> int:
         f"Evaluated ranking: overlap={metrics['overlap_count']}/{metrics['gold_count']} "
         f"spearman={metrics['rank_correlation']['spearman']}"
     )
+    return 0
+
+
+def cmd_human_divergence_report(args: argparse.Namespace) -> int:
+    try:
+        dataset = load_comparison_dataset(
+            manifest=args.manifest,
+            ai_scores=args.ai_scores,
+            strong_ranking=args.strong_ranking,
+            min_coverage=args.min_coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build human comparison: {exc}")
+        return 2
+    if not dataset.rows:
+        print("No papers joined between manifest and AI scores.")
+        return 2
+    try:
+        report = build_divergence_report(
+            dataset.rows,
+            human_axis=args.human_axis,
+            top_frac=args.top_frac,
+            cases_per_direction=args.cases_per_direction,
+            min_reviews=args.min_reviews,
+            coverage=dataset.coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build divergence report: {exc}")
+        return 2
+    write_json(args.out, report)
+    if args.markdown is not None:
+        args.markdown.parent.mkdir(parents=True, exist_ok=True)
+        args.markdown.write_text(render_markdown(report), encoding="utf-8")
+    print(
+        f"Divergence report: {report['counts']['papers']} papers; "
+        f"{report['overlooked_gems']['shown']}/{report['overlooked_gems']['total_matching']} gems, "
+        f"{report['blind_spots']['shown']}/{report['blind_spots']['total_matching']} blind spots"
+    )
+    return 0
+
+
+def cmd_divergence_taxonomy_induce(args: argparse.Namespace) -> int:
+    config = TaxonomyConfig(
+        provider=args.provider,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        temperature=args.temperature,
+        max_output_tokens=args.max_output_tokens,
+        seed=args.seed,
+        dry_run=args.dry_run,
+    )
+    client = None if args.dry_run else ChatCompletionClient(
+        provider=args.provider,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        timeout_seconds=args.timeout,
+        retries=args.retries,
+        backoff_seconds=args.backoff,
+    )
+    result = run_taxonomy_induction(
+        report_path=args.report,
+        out=args.out,
+        run_dir=args.run_dir,
+        config=config,
+        client=client,
+        sample_size=args.sample_size,
+        max_codes=args.max_codes,
+    )
+    codes = result.get("codes") or []
+    print(f"Taxonomy induction: {result['status']}; {len(codes)} codes over {result.get('sampled_case_count', 0)} sampled cases")
+    return 0 if result["status"] in {"ok", "dry_run"} else 2
+
+
+def cmd_divergence_taxonomy_classify(args: argparse.Namespace) -> int:
+    config = TaxonomyConfig(
+        provider=args.provider,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        temperature=args.temperature,
+        max_output_tokens=args.max_output_tokens,
+        seed=args.seed,
+        dry_run=args.dry_run,
+    )
+    client = None if args.dry_run else ChatCompletionClient(
+        provider=args.provider,
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        timeout_seconds=args.timeout,
+        retries=args.retries,
+        backoff_seconds=args.backoff,
+    )
+    second_client = None
+    second_config = None
+    if args.second_model and not args.dry_run:
+        second_config = TaxonomyConfig(
+            provider=args.second_provider or args.provider,
+            model=args.second_model,
+            reasoning_effort=args.second_reasoning_effort,
+            temperature=args.temperature,
+            max_output_tokens=args.max_output_tokens,
+            seed=args.seed,
+            dry_run=False,
+        )
+        second_client = ChatCompletionClient(
+            provider=args.second_provider or args.provider,
+            model=args.second_model,
+            reasoning_effort=args.second_reasoning_effort,
+            timeout_seconds=args.timeout,
+            retries=args.retries,
+            backoff_seconds=args.backoff,
+        )
+    result = run_taxonomy_classification(
+        report_path=args.report,
+        codebook_path=args.codebook,
+        out=args.out,
+        run_dir=args.run_dir,
+        config=config,
+        client=client,
+        batch_size=args.batch_size,
+        max_codes_per_case=args.max_codes_per_case,
+        second_client=second_client,
+        second_label=args.second_model,
+        second_config=second_config,
+    )
+    aggregate = result.get("aggregate", {})
+    print(f"Taxonomy classify: {result['status']}; coded {aggregate.get('cases_coded', 0)} cases")
+    return 0 if result["status"] in {"ok", "dry_run"} else 2
+
+
+def cmd_human_agreement_report(args: argparse.Namespace) -> int:
+    try:
+        dataset = load_comparison_dataset(
+            manifest=args.manifest,
+            ai_scores=args.ai_scores,
+            strong_ranking=args.strong_ranking,
+            min_coverage=args.min_coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build human comparison: {exc}")
+        return 2
+    if not dataset.rows:
+        print("No papers joined between manifest and AI scores.")
+        return 2
+    try:
+        report = build_agreement_report(
+            dataset.rows,
+            k_values=args.k or [10, 20, 50, 100],
+            include_award=args.honored_includes_award,
+            coverage=dataset.coverage,
+            bootstrap_samples=args.bootstrap_samples,
+            bootstrap_seed=args.bootstrap_seed,
+        )
+    except ValueError as exc:
+        print(f"Cannot build agreement report: {exc}")
+        return 2
+    write_json(args.out, report)
+    full = report["full_coverage"]
+    if full is not None:
+        print(
+            f"Agreement: n={full['n']} tau_b(tier)={full['kendall_tau_b']['vs_tier']} "
+            f"auc(honored_vs_poster)={full['roc_auc']['honored_vs_poster']}"
+        )
+    else:
+        decision = report["acceptance_outcome"]
+        print(
+            f"Agreement: n={decision['n']} "
+            f"auc(accepted_vs_rejected)={decision['roc_auc_accepted_vs_rejected']}"
+        )
+    return 0
+
+
+def cmd_ai_axis_decomposition(args: argparse.Namespace) -> int:
+    try:
+        dataset = load_comparison_dataset(
+            manifest=args.manifest,
+            ai_scores=args.ai_scores,
+            min_coverage=args.min_coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build human comparison: {exc}")
+        return 2
+    if not dataset.rows:
+        print("No papers joined between manifest and AI scores.")
+        return 2
+    try:
+        report = build_axis_decomposition_report(
+            dataset.rows,
+            include_award=args.honored_includes_award,
+            coverage=dataset.coverage,
+        )
+    except ValueError as exc:
+        print(f"Cannot build axis decomposition: {exc}")
+        return 2
+    write_json(args.out, report)
+    ivp = report["impact_vs_polish"]
+    print(
+        f"Axis decomposition: {len(report['axes'])} axes; "
+        f"conventional-minus-executive tau_b(tier) delta={ivp['delta_conventional_minus_executive']}"
+    )
+    return 0
+
+
+def cmd_query_ranked_papers(args: argparse.Namespace) -> int:
+    try:
+        rows = query_ranked_papers(
+            metadata_path=args.metadata,
+            cheap_ranking_path=args.cheap_ranking,
+            final_ranking_path=args.final_ranking,
+            query=RankingQuery(
+                preset=args.preset,
+                query=args.query,
+                topic=args.topic,
+                contribution_class=args.contribution_class,
+                scope=args.scope,
+                limit=args.limit,
+                include_abstract=args.include_abstract,
+            ),
+        )
+    except (OSError, ValueError) as exc:
+        print(f"Cannot query ranked papers: {exc}", file=sys.stderr)
+        return 2
+
+    output_format = args.format
+    if output_format is None:
+        suffix = args.out.suffix.lower() if args.out else ""
+        output_format = {".csv": "csv", ".jsonl": "jsonl"}.get(suffix, "tsv")
+    write_query_results(rows, path=args.out, output_format=output_format)
+    finalist_count = sum(row.get("final_rank") is not None for row in rows)
+    playoff_count = sum(row.get("final_stage") == "playoff_all_pairs" for row in rows)
+    destination = str(args.out) if args.out else "stdout"
+    print(
+        f"Matched {len(rows)} papers: {finalist_count} frontier finalists, "
+        f"{playoff_count} all-pairs playoff papers; wrote {destination}.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def cmd_top_ranked_papers(args: argparse.Namespace) -> int:
+    try:
+        rows = top_ranked_papers(
+            args.category,
+            top_n=args.top,
+            scope=args.scope,
+            metadata_path=args.metadata,
+            cheap_ranking_path=args.cheap_ranking,
+            final_ranking_path=args.final_ranking,
+            include_abstract=args.include_abstract,
+        )
+        write_query_results(rows, path=args.out, output_format=args.format)
+    except (OSError, ValueError) as exc:
+        print(f"Cannot retrieve top-ranked papers: {exc}", file=sys.stderr)
+        return 2
+    destination = str(args.out) if args.out else "stdout"
+    print(
+        f"Returned {len(rows)} papers for category {args.category!r} "
+        f"from scope {args.scope!r}; wrote {destination}.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def cmd_list_ranking_categories(args: argparse.Namespace) -> int:
+    del args
+    print(json.dumps(available_ranking_categories(), indent=2, sort_keys=True))
     return 0
 
 

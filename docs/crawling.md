@@ -167,6 +167,64 @@ main-body cap, 6,611 parsed `ok`, three usable extractions were marked
 `needs_review`, and none
 failed.
 
+## Identity-Redacted Scoring Artifacts
+
+Keep canonical PDFs and parsed text immutable. Before any model call, create a
+separate fingerprinted scoring manifest whose PDF and text paths resolve to
+identity-redacted derivatives:
+
+```bash
+python3 -m icml_ai_ac.cli anonymize-papers \
+  --manifest data/metadata/icml_2026_scoring_manifest.jsonl \
+  --out data/metadata/icml_2026_scoring_anonymized.jsonl \
+  --pdf-dir data/pdfs/icml_2026_anonymized \
+  --text-dir data/extracted_text/icml_2026_anonymized \
+  --report data/metadata/icml_2026_scoring_anonymized.report.json \
+  --max-pages 9
+```
+
+The command removes a first-page identity band established from the title,
+abstract boundary, and author/email/affiliation/anonymous-byline signals, plus
+known author-name occurrences, correspondence lines, emails, acknowledgements,
+mail links, source/reviewer footers, and PDF author/XML metadata. It tolerates
+inserted middle names and fragmented superscript text, while ignoring
+implausibly short uppercase metadata identities that would over-redact notation.
+It validates every derivative and omits
+non-passing rows from the output manifest. Its append-only journal supports
+exact resume; rerunning the unchanged 103-paper production-layout probe reused
+103/103 rows in under half a second.
+
+That probe passed 103/103 PDFs in about two minutes. It included the first 100
+scoring records plus three unusual layouts without an `Abstract` heading. Twelve
+metadata author strings differed from the camera-ready byline; the complete
+author bands were still detected and removed, and the drift remains in the
+audit. Two malformed source PDFs emitted six repair diagnostics, but their
+saved derivatives passed page-count, identity, email, and metadata validation.
+A separate 50-paper ICML 2025 run also passed 50/50. This is direct identity
+redaction, not guaranteed anonymity: titles, self-citations, project names, and
+model memory can still identify papers.
+
+The final production gate completed on 2026-07-27 with 6,617/6,617 records,
+zero exclusions, 6,617 validated PDFs, and 19,851 validated text artifacts.
+The v25 base avoided a blanket rerun by promoting checksum-verified derivatives
+and regenerating only incomplete or anomalous rows. No later text correction
+rewrote a PDF. Selective v26-v33 passes removed hyphen-wrapped names,
+correspondence lines, institution blocks displaced below the Abstract by
+two-column extraction, accented and acronym-only affiliations, and wrapped
+employment/contribution notes. The final version counts are 4,236 v25, 153
+v26, 1,265 v27, 492 v28, 362 v29, 27 v30, 14 v31, 60 v32, and eight v33.
+
+The final audit is
+`data/model_runs/icml_2026_full_launch/stage00_v33_final_audit.json`; it reports
+zero errors after checking exact coverage, blind record structure, text
+idempotence, source and derivative checksums, signatures, page counts,
+residual identities/contact cues, links, and PDF metadata. A separate broad
+layout diagnostic leaves only ten inspected equation/introduction cases and no
+affiliation-like fragment. The title-region audit retained all 6,049 metadata
+titles actually present above the source Abstract; 568 metadata titles differ
+from the camera-ready PDF and remain recorded as provenance drift. Every
+failed gate and selective checkpoint is preserved.
+
 If a manifest already contains explicit PDF URLs, download them directly:
 
 ```bash

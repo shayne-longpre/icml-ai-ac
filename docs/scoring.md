@@ -1,9 +1,10 @@
 # Scoring Pipeline
 
-The first scoring pass evaluates `scoring_repr.txt` artifacts with a cheap model
-and writes fully auditable model-run artifacts. `scoring_repr.txt` is the main
-paper body extracted from the PDF with references removed and appendix or
-supplement stripped when detected. For ICML 2026 camera-ready PDFs, the default
+The first scoring pass evaluates identity-redacted `scoring_repr.txt`
+derivatives with cheap models and writes fully auditable model-run artifacts.
+`scoring_repr.txt` is the main paper body extracted from the PDF with references
+removed and appendix or supplement stripped when detected. For ICML 2026
+camera-ready PDFs, the default
 uses the first 9 PDF pages as the main-paper prior before reference/appendix
 cleanup, matching the camera-ready main-body limit. For originally submitted
 versions, use `parse-pdfs --main-paper-max-pages 8`. `compact_repr.txt` remains
@@ -25,7 +26,7 @@ bakeoff:
 ```text
 production_2026_v2:
 - nvidia/nemotron-3-ultra-550b-a55b
-- google/gemini-3.1-flash-lite
+- google/gemini-3.5-flash-lite
 - openai/gpt-5.6-luna
 - x-ai/grok-4.3
 ```
@@ -41,6 +42,7 @@ broad_2026_probe:
 - qwen/qwen3.7-plus
 - nvidia/nemotron-3-ultra-550b-a55b
 - google/gemini-3.1-flash-lite
+- google/gemini-3.5-flash-lite
 - stepfun/step-3.7-flash
 - inclusionai/ring-2.6-1t
 ```
@@ -51,13 +53,24 @@ recall. The historical `qwen/qwen3-32b`, `qwen/qwen3.6-35b-a3b`, and
 reproducibility.
 
 Do not use web search or retrieval during scoring. The prompt explicitly asks
-for paper-only judgment and tells the model to ignore author identity.
+for paper-only judgment and tells the model to ignore author identity. Scoring
+manifests route to validated derivatives with bylines, affiliations, emails,
+acknowledgements, and PDF author metadata removed; canonical files remain
+unchanged. The stage fails closed when a derivative does not validate. This
+does not prevent identification from titles, self-citations, project names, or
+model memory. Reviews, reviewer ratings, area-chair comments, decisions,
+presentation tiers, and awards are never serialized into model-facing prompts.
 
 OpenRouter structured calls default to `reasoning: {"effort": "none",
 "exclude": true}`. This avoids paying for returned reasoning tokens and reduces
 the risk that reasoning output consumes the JSON budget. To intentionally test a
 reasoning cheap pass, set `OPENROUTER_REASONING_EFFORT` to `minimal`, `low`,
 `medium`, `high`, or another OpenRouter-supported value.
+
+Gemini 3.5 Flash Lite is the narrow exception: OpenRouter requires at least
+`minimal` reasoning for that model. The client upgrades only this model from
+`none` to `minimal`, keeps `exclude: true`, and stores the effective request in
+the batch audit.
 
 ## Historical Accepted-50 Cheap-Model Probe
 
@@ -97,24 +110,58 @@ strong four-model subset was cheaper or faster. More models did not
 monotonically improve recall.
 
 The selected panel cost $0.784 for 50 papers and completed in 8.2 minutes of
-summed model runtime. Under the same representation and batching, that projects
-to about $104 and 18 hours if run sequentially over 6,628 papers. Individual
-models may be run concurrently when provider limits permit.
+summed model runtime. The longer 48-paper, two-partition production preflight
+cost $1.53. Together these imply roughly $100-$215 for 6,617 papers, depending
+mainly on representation length and partition count. After the bounded
+concurrency preflight, use four concurrent model streams; observed throughput
+projects to about 14-15 hours at the slowest model's rate.
+
+An additional matched test compared Flash Lite versions on the same 50 papers
+and prompt. Gemini 3.5 completed 50/50 for $0.101 including one locally
+recoverable malformed-escape response; Gemini 3.1 completed 50/50 for $0.069.
+With Nemotron, Luna, and Grok held fixed, 3.5 increased ensemble Spearman from
+0.646 to 0.662, top-10 recall at rank 10 from 6/10 to 7/10, and top-20 recall at
+rank 20 from 15/20 to 16/20. Both variants retained 10/10 gold top-10 papers by
+rank 20 and 18/20 gold top-20 papers by rank 30. The expected full-run cost
+increase is under $10 for two partitions.
+
+The same matched contribution-routing test favored Gemini 3.1: primary-class
+accuracy was 0.80 versus 0.72, and macro-F1 was 0.764 versus 0.602. Production
+therefore uses 3.1 for routing and 3.5 for ranking.
 
 ## Ensemble First Pass and Conservative Finalists
+
+First classify provisional contribution routes in small resumable batches. The
+production input is deterministically hash-randomized so prompt position is
+independent of the source manifest order:
+
+```bash
+python3 -m icml_ai_ac.cli classify-contributions \
+  --manifest data/model_runs/icml_2026_full_launch/stage01_randomized_routing_manifest.jsonl \
+  --model google/gemini-3.1-flash-lite \
+  --batch-size 16 \
+  --out data/metadata/icml_2026_contribution_classes_randomized.jsonl \
+  --run-dir data/model_runs/icml_2026_contribution_classes_randomized
+```
+
+These labels route ranking batches; they are not treated as final scientific
+categories. The four-model cheap ranking aggregate stores each model's class
+votes, agreement rate, the provisional routing class, and a resolved ensemble
+class for downstream category analysis.
 
 The easiest production entrypoint is `score-pass1-ensemble`, which runs a
 configured cheap-model preset and can immediately write the aggregate signal:
 
 ```bash
 python3 -m icml_ai_ac.cli score-pass1-ensemble \
-  --manifest data/metadata/icml_2026_accepted_parsed.jsonl \
+  --manifest data/metadata/icml_2026_scoring_anonymized.jsonl \
   --out-dir data/model_runs/icml_2026_pass1_cheap_ensemble \
   --model-preset production_2026_v2 \
-  --class-path data/metadata/icml_2026_contribution_classes.jsonl \
+  --model-workers 4 \
+  --class-path data/metadata/icml_2026_contribution_classes_randomized.jsonl \
   --strategy class_round_robin \
   --batch-size 8 \
-  --partitions 1 \
+  --partitions 2 \
   --aggregate-out data/scores/icml_2026_pass1_cheap_ensemble_signal.jsonl \
   --aggregate-report data/scores/icml_2026_pass1_cheap_ensemble_signal.report.json
 ```
@@ -123,6 +170,14 @@ The aggregate JSONL stores `shortlist_metrics.aggregate_priority`,
 `source_model_priorities`, `source_model_count`, source paths, advance votes,
 and per-source rows. Later ranking layers can use this as a prior or audit
 signal without rerunning the cheap calls.
+
+All production model runs use stable run directories and content/configuration
+fingerprints. Exact reruns reuse validated batches or cards and retry only
+failed or missing units. HTTP 402 insufficient-credit responses stop the
+remaining model stream, as do authentication, permission, incompatible-request,
+and exhausted rate-limit responses. Replenish credits and invoke the identical
+command without `--overwrite` to continue. See `docs/final_run_plan.md` for the
+full operational and artifact contract.
 
 The lower-level shortlist builder still accepts multiple score files directly.
 It normalizes priority by source model so a model with more partitions does not
@@ -140,16 +195,20 @@ python3 -m icml_ai_ac.cli build-shortlist \
 ```
 
 Run two independent strong semifinal rankings over the same complete paper set.
-Avoid using either judge to make an aggressive final cut; the accepted-50
-tournament gold shows that the old stage-2 top-35 cut dropped two tournament
-top-10 papers.
+The accepted-50 commands below use the single-response diagnostic because the
+set is small. Production uses `rank-pass2-batches` with identical
+class-balanced batches, two partitions, exact coverage, a connected comparison
+graph, and resumable state for both judges. Avoid using either judge to make an
+aggressive final cut; the
+accepted-50 tournament gold shows that the old stage-2 top-35 cut dropped two
+tournament top-10 papers.
 
 ```bash
 python3 -m icml_ai_ac.cli rank-pass2 \
   --manifest data/metadata/icml_2025_accepted_50_parsed.jsonl \
   --pass1 data/scores/icml_2025_pass1_ensemble_v2_3models_shortlist45_classbalanced3.jsonl \
-  --provider openai \
-  --model gpt-5.6-terra \
+  --provider openrouter \
+  --model openai/gpt-5.6-terra \
   --reasoning-effort high \
   --limit 45 \
   --text-source scoring \
@@ -204,10 +263,11 @@ python3 -m icml_ai_ac.cli select-finalists \
   --report data/scores/icml_2025_finalists_selector_limit45.report.json
 ```
 
-Under the tournament gold, the cheap ensemble top-45 captured all gold top-10
-papers and 19/20 gold top-20 papers. The old GPT stage-2 top-35 cut missed two
-gold top-10 papers, so production should use `select-finalists` to preserve a
-wider pool for PDF-aware cards and tournament adjudication.
+Under randomized v3, the current cheap ensemble top-45 captured every gold
+top-10 paper by rank 20 and 18/20 gold top-20 papers by rank 30. The old GPT
+stage-2 top-35 cut retained only 8/10 and 15/20 by rank 30, respectively.
+Production should therefore use `select-finalists` to preserve a wider pool for
+PDF-aware cards and tournament adjudication.
 
 The union of configured top, class, and disagreement preservation sets must fit
 within `--limit`. The selector fails rather than silently dropping a requested
@@ -219,9 +279,9 @@ arguments:
 
 - Cheap semifinal pool: `build-shortlist --limit`, initially 15%-20% of parsed
   papers.
-- Strong semifinal pool: `rank-pass2 --limit`, usually the full cheap
-  shortlist, run once per judge; `ensemble-semifinal-rankings` requires exact
-  matching coverage.
+- Strong semifinal pool: `rank-pass2-batches --limit`, usually the full cheap
+  shortlist, run once per judge with matching batch and partition settings;
+  `ensemble-semifinal-rankings` requires exact matching coverage.
 - Conservative finalist pool: `select-finalists --limit`, initially 150-300
   papers, plus `--semifinal-top`, `--cheap-top`, `--min-per-class`, and
   both disagreement-save controls.
@@ -234,7 +294,8 @@ Recommended first production defaults:
 
 ```text
 cheap shortlist: top 20%
-strong semifinal: Terra and Sonnet over all cheap-shortlisted papers
+strong semifinal: Terra and Sonnet over all cheap-shortlisted papers,
+                    size-8 batches, 2 class-stratified partitions
 PDF-aware finalists: 250
 Swiss pool: 150
 Swiss rounds: 10
@@ -269,12 +330,30 @@ For ICML 2026 production, the updated PDF-card panel is:
 - OpenRouter `google/gemini-3.1-pro-preview` with `--reasoning-effort high`
 
 Use `openai/gpt-5.6-sol` xhigh for card synthesis and tournament adjudication.
-Store the provider-returned model ID as `served_model`; safeguarded Fable
-requests can be routed to another Claude model and must remain distinguishable.
+Run Fable with `--fallback-model anthropic/claude-opus-4.8
+--fallback-reasoning-effort high`. Store both requested and served model IDs,
+the primary failure, fallback reason, and cumulative usage.
+Use a 12,000-token output ceiling for frontier cards. The production run showed
+that 6,000 tokens can be exhausted by hidden reasoning before the structured
+card is complete.
 The refreshed panel passed a 3/3 one-paper live PDF/JSON smoke test. Sol, Fable,
 and Gemini reported their requested model IDs and cost $0.258, $0.608, and
-$0.065 respectively. Treat this as provider-interface validation; the unchanged
-historical tournament gold remains the benchmark for pipeline evaluation.
+$0.065 respectively. In the 12-paper preflight, one Fable card required the
+explicit Opus fallback; all 36 cards completed.
+
+The 250-paper production pass completed 750/750 valid cards. Four Sol cards
+required same-model 12,000-token repairs, and 29 Fable requests used the
+explicit Opus fallback. Gemini's overall-priority scores were materially more
+compressed and lenient than Sol or Fable, so downstream aggregation must use
+within-judge ranks or calibrated percentiles rather than raw score means.
+
+The production `rank-frontier-card-ensemble` output uses equal-weight,
+tie-aware within-judge rank percentiles. Overall gold priority is primary;
+broad impact, ML impact, technical soundness, evidence confidence, and novelty
+break exact score ties. It requires complete matching paper coverage in every
+stream and retains raw scores, source ranks, served models, fallbacks, and
+judge disagreement. The focused 250-paper audit found 0.927-0.936 Spearman
+correlation between the full ensemble and each leave-one-judge-out result.
 
 Artifacts:
 
@@ -290,24 +369,42 @@ OpenRouter was about $33.82 total: $12.64 for GPT-5.5, $6.18 for GPT-5.4, and
 $15.00 for Opus 4.7. This excludes failed transient attempts that returned no
 usage and small smoke tests.
 
-The tournament ranking is the current accepted-50 gold reference for pipeline
-evaluation. It ran 435 pairwise comparisons in 18 resumable GPT-5.5 xhigh
-batches over the synthesis top 30, cost about $8.10 in OpenRouter usage, and
-took about 57.5 minutes. Ranks 31-50 remain from the synthesis seed and should
-not be overinterpreted as pairwise-adjudicated.
+The corrected accepted-50 tournament ran 435 pairwise comparisons in 18
+resumable GPT-5.5 xhigh batches over the synthesis top 30. It randomizes pair
+assignment, A/B presentation, and evidence order; outcomes were 221 A wins and
+214 B wins. Valid batches cost $8.52 and used 38 minutes of provider time. One
+malformed response was rejected and retried for about $0.41. Ranks 31-50 remain
+from the synthesis seed and should not be overinterpreted as
+pairwise-adjudicated. The earlier seed-ordered artifact is retained only as a
+legacy diagnostic.
 
-The older text-only GPT-5.4 reference is now a historical baseline, not the
-gold set. Against the tournament gold, the old text-only reference has Spearman
-0.2875; the PDF-aware synthesis has Spearman 0.9769 and the deterministic
-card ensemble has Spearman 0.9608.
+Against randomized v3, the PDF card synthesis has Spearman 0.984 and 10/10
+same-k top-10 recall. The current four-model cheap ensemble captures 10/10 gold
+top-10 papers by rank 20 and 18/20 gold top-20 papers by rank 30. The old
+strong-model top-35 cut captures only 8/10 and 15/20 by rank 30, respectively.
+This confirms that conservative advancement, rather than aggressive
+intermediate reranking, is the important recall safeguard.
 
 For larger production finalist pools, a hybrid sparse tournament is the current
-cost-control candidate. On the accepted-50 top-30 tournament, a simulated
-10-round Swiss pass plus all-pairs among the provisional top 20 used 256 pair
-comparisons instead of 435, recovered 9/10 of the exact all-pairs top 10,
-placed all 10 all-pairs top-10 papers within its top 15, and reached Spearman
-0.9764 against all-pairs. Pure seed-neighborhood round robins were much weaker
-and should not be used as the only adjudication step.
+cost-control candidate. Re-evaluate it from each current all-pairs artifact
+rather than carrying forward legacy schedule metrics:
+
+```bash
+python3 -m icml_ai_ac.cli simulate-hybrid-tournament \
+  --tournament data/reference/icml_2025_accepted_50_frontier_pdf_tournament_gold_randomized_v3.json \
+  --out data/evals/icml_2025_randomized_v3_swiss10_playoff20.json \
+  --swiss-rounds 10 \
+  --playoff-top-n 20
+```
+
+The simulator replays the production Swiss pairing and playoff logic using
+already-paid all-pairs outcomes. On randomized v3, 10 Swiss rounds plus a
+top-20 dense playoff used 255/435 comparisons, achieved Spearman 0.996, retained
+10/10 top-10 and 19/20 top-20 papers, and put every all-pairs top-10 paper in
+its top 15. It estimates schedule loss without new model calls, but assumes a
+pair judgment would not change under different batch context. Pure
+seed-neighborhood round robins were much weaker and should not be used as the
+only adjudication step.
 
 Production hybrid tournament template:
 
@@ -332,6 +429,10 @@ python3 -m icml_ai_ac.cli rank-frontier-card-tournament \
 Use `--strategy all_pairs --top-n 50` or `--strategy all_pairs --top-n 60` when
 the final candidate set is small enough that the cleaner all-pairs design is
 affordable.
+
+Tournament v3 deterministically randomizes pair-to-batch assignment, A/B
+presentation, and paper evidence-block order. Do not reuse a v1/v2 run
+directory for a v3 tournament.
 
 ## Rubric Shape
 
@@ -473,8 +574,8 @@ for Sonnet as shown above; this smaller command is useful for diagnostics:
 python3 -m icml_ai_ac.cli rank-pass2 \
   --manifest data/metadata/icml_2025_accepted_50_parsed.jsonl \
   --pass1 data/scores/icml_2025_pass1_20_qwen3_32b_v3_scoring_with_retries.jsonl \
-  --provider openai \
-  --model gpt-5.6-terra \
+  --provider openrouter \
+  --model openai/gpt-5.6-terra \
   --reasoning-effort high \
   --limit 10 \
   --text-source scoring \

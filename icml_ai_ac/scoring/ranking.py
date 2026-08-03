@@ -1,23 +1,29 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import random
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from icml_ai_ac.models import PaperRecord
-from icml_ai_ac.scoring.providers import ChatCompletionClient
+from icml_ai_ac.scoring.providers import ChatCompletionClient, is_batch_blocking_provider_error
 from icml_ai_ac.scoring.runner import estimate_tokens, read_text_path, resolve_record_text_path
 from icml_ai_ac.scoring.schema import CONTRIBUTION_CLASSES, parse_json_response
-from icml_ai_ac.storage import ensure_parent, read_paper_records, write_json, write_jsonl
+from icml_ai_ac.scoring.usage import sum_usage
+from icml_ai_ac.storage import ensure_parent, read_json, read_paper_records, write_json, write_jsonl
 
 
-PASS2_PROMPT_VERSION = "pass2_strong_batch_rank_v3"
-PASS2_STAGE1_PROMPT_VERSION = "pass2_stage1_strong_semifinal_v1"
-PASS2_FINAL_PROMPT_VERSION = "pass2_stage2_strong_final_v1"
-REFERENCE_PROMPT_VERSION = "reference_gold_rank_v1"
-REFERENCE_REPAIR_PROMPT_VERSION = "reference_gold_rank_repair_v1"
+PASS2_PROMPT_VERSION = "pass2_strong_batch_rank_v4"
+PASS2_BATCHED_PROMPT_VERSION = "pass2_strong_resumable_batches_v2"
+PASS2_BATCHED_AGGREGATION_VERSION = "pass2_batch_rank_with_calibrated_priority_v2"
+PASS2_STAGE1_PROMPT_VERSION = "pass2_stage1_strong_semifinal_v2"
+PASS2_FINAL_PROMPT_VERSION = "pass2_stage2_strong_final_v2"
+REFERENCE_PROMPT_VERSION = "reference_gold_rank_v2"
+REFERENCE_REPAIR_PROMPT_VERSION = "reference_gold_rank_repair_v2"
 
 
 @dataclass(slots=True)
@@ -51,6 +57,28 @@ class Pass2RankingConfig:
     max_output_tokens: int
     seed: int | None
     dry_run: bool
+
+
+@dataclass(slots=True)
+class Pass2BatchedRankingConfig:
+    provider: str
+    model: str
+    reasoning_effort: str | None
+    prompt_version: str
+    text_source: str
+    top_fraction: float
+    limit: int | None
+    per_paper_char_budget: int
+    batch_size: int
+    partitions: int
+    strategy: str
+    class_path: Path | None
+    request_delay_seconds: float
+    temperature: float
+    max_output_tokens: int
+    seed: int | None
+    dry_run: bool
+    openrouter_provider_only: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -205,6 +233,854 @@ def run_pass2_ranking(
     write_json(out, result)
     write_json(run_dir / "run.json", result)
     return result
+
+
+def run_pass2_batched_ranking(
+    *,
+    manifest: Path,
+    pass1_path: Path,
+    out: Path,
+    run_dir: Path,
+    config: Pass2BatchedRankingConfig,
+    client: ChatCompletionClient | None,
+) -> dict[str, Any]:
+    """Rank a large semifinal pool through resumable, repeated listwise batches."""
+    started = time.monotonic()
+    prepare_ranking_run_dir(run_dir)
+    if config.batch_size < 2:
+        raise ValueError("batch_size must be at least 2")
+    if config.partitions <= 0:
+        raise ValueError("partitions must be positive")
+    candidates = select_candidates(
+        manifest=manifest,
+        pass1_path=pass1_path,
+        text_source=config.text_source,
+        top_fraction=config.top_fraction,
+        limit=config.limit,
+        per_paper_char_budget=config.per_paper_char_budget,
+    )
+    class_by_id = read_contribution_class_map(config.class_path)
+    partitions = make_pass2_partitions(
+        candidates,
+        batch_size=config.batch_size,
+        partition_count=config.partitions,
+        strategy=config.strategy,
+        class_by_id=class_by_id,
+        seed=config.seed or 0,
+    )
+    planned_connectivity_errors = validate_pass2_comparison_connectivity(
+        [
+            {
+                "paper_id": candidate.record.paper_id,
+                "partition_index": partition_index,
+                "batch_index": batch_index,
+            }
+            for partition_index, batches in enumerate(partitions)
+            for batch_index, batch_candidates in enumerate(batches)
+            for candidate in batch_candidates
+        ],
+        candidate_ids=[candidate.record.paper_id for candidate in candidates],
+    )
+    if planned_connectivity_errors:
+        raise ValueError("; ".join(planned_connectivity_errors))
+    planned_batch_count = sum(len(partition) for partition in partitions)
+    base_result: dict[str, Any] = {
+        "status": "dry_run" if config.dry_run else "pending",
+        "provider": config.provider,
+        "model": config.model,
+        "reasoning_effort": config.reasoning_effort,
+        "prompt_version": config.prompt_version,
+        "manifest": str(manifest),
+        "pass1_path": str(pass1_path),
+        "out": str(out),
+        "run_dir": str(run_dir),
+        "candidate_count": len(candidates),
+        "candidate_ids": [candidate.record.paper_id for candidate in candidates],
+        "candidate_titles": {candidate.record.paper_id: candidate.record.title for candidate in candidates},
+        "batch_size": config.batch_size,
+        "partition_count": config.partitions,
+        "strategy": config.strategy,
+        "class_path": str(config.class_path) if config.class_path else None,
+        "openrouter_provider_only": list(config.openrouter_provider_only),
+        "batch_count": planned_batch_count,
+    }
+    if not config.dry_run and client is None:
+        raise ValueError("client is required unless dry_run=True")
+
+    single_config = Pass2RankingConfig(
+        provider=config.provider,
+        model=config.model,
+        reasoning_effort=config.reasoning_effort,
+        prompt_version=config.prompt_version,
+        text_source=config.text_source,
+        top_fraction=1.0,
+        limit=None,
+        per_paper_char_budget=config.per_paper_char_budget,
+        temperature=config.temperature,
+        max_output_tokens=config.max_output_tokens,
+        seed=config.seed,
+        dry_run=config.dry_run,
+    )
+    judgments: list[dict[str, Any]] = []
+    batch_results: list[dict[str, Any]] = []
+    failure_count = 0
+    resumed_batch_count = 0
+    blocked_reason: str | None = None
+    for partition_index, batches in enumerate(partitions):
+        if blocked_reason:
+            break
+        for batch_index, batch_candidates in enumerate(batches):
+            batch_dir = (
+                run_dir
+                / "batches"
+                / f"partition_{partition_index:02d}_batch_{batch_index:04d}"
+            )
+            batch_dir.mkdir(parents=True, exist_ok=True)
+            messages = build_pass2_ranking_messages(batch_candidates, config=single_config)
+            prompt_path = batch_dir / "prompt.json"
+            prompt_payload = {
+                "prompt_version": config.prompt_version,
+                "provider": config.provider,
+                "model": config.model,
+                "reasoning_effort": config.reasoning_effort,
+                "partition_index": partition_index,
+                "batch_index": batch_index,
+                "candidate_count": len(batch_candidates),
+                "candidate_ids": [candidate.record.paper_id for candidate in batch_candidates],
+                "text_source": config.text_source,
+                "temperature": config.temperature,
+                "max_output_tokens": config.max_output_tokens,
+                "seed": config.seed,
+                "messages": messages,
+                "prompt_tokens_estimate": sum(estimate_tokens(message["content"]) for message in messages),
+            }
+            fingerprint = ranking_prompt_fingerprint(prompt_payload)
+            prompt_payload["fingerprint"] = fingerprint
+            write_json(prompt_path, prompt_payload)
+
+            if config.dry_run:
+                batch_results.append(
+                    {
+                        "status": "dry_run",
+                        "partition_index": partition_index,
+                        "batch_index": batch_index,
+                        "candidate_count": len(batch_candidates),
+                        "candidate_ids": prompt_payload["candidate_ids"],
+                        "fingerprint": fingerprint,
+                        "prompt_path": str(prompt_path),
+                    }
+                )
+                continue
+
+            cached = load_cached_pass2_batch(
+                batch_dir=batch_dir,
+                fingerprint=fingerprint,
+                candidates=batch_candidates,
+                prompt_path=prompt_path,
+                partition_index=partition_index,
+                batch_index=batch_index,
+            )
+            if cached is not None:
+                batch_judgments, batch_result = cached
+                judgments.extend(batch_judgments)
+                batch_results.append(batch_result)
+                resumed_batch_count += 1
+                continue
+
+            recovered = recover_saved_pass2_batch(
+                batch_dir=batch_dir,
+                fingerprint=fingerprint,
+                candidates=batch_candidates,
+                prompt_path=prompt_path,
+                partition_index=partition_index,
+                batch_index=batch_index,
+            )
+            if recovered is not None:
+                batch_judgments, batch_result = recovered
+                judgments.extend(batch_judgments)
+                batch_results.append(batch_result)
+                resumed_batch_count += 1
+                continue
+
+            archived_attempt_count = archive_failed_pass2_attempt(batch_dir)
+            clear_failed_pass2_attempt(batch_dir)
+            provider_attempt_index = archived_attempt_count + 1
+            chat = None
+            try:
+                if client is None:
+                    raise RuntimeError("live pass-2 batches require a provider client")
+                chat = client.complete(
+                    messages=messages,
+                    temperature=config.temperature,
+                    max_output_tokens=config.max_output_tokens,
+                    seed=config.seed,
+                    response_format={"type": "json_object"},
+                )
+                raw_response_path = batch_dir / "response.json"
+                write_json(raw_response_path, chat.response)
+                parsed = parse_json_response(chat.content)
+                expected_ids = [candidate.record.paper_id for candidate in batch_candidates]
+                canonicalize_ranked_paper_ids(parsed, expected_ids)
+                validation_errors = validate_ranked_paper_coverage(parsed, expected_ids)
+                if validation_errors:
+                    raise ValueError("; ".join(validation_errors))
+                parsed_response_path = batch_dir / "parsed.json"
+                write_json(parsed_response_path, parsed)
+                batch_judgments = pass2_payload_to_judgments(
+                    parsed,
+                    partition_index=partition_index,
+                    batch_index=batch_index,
+                    batch_size=len(batch_candidates),
+                    prompt_path=prompt_path,
+                    raw_response_path=raw_response_path,
+                    parsed_response_path=parsed_response_path,
+                )
+                batch_result = {
+                    "status": "ok",
+                    "partition_index": partition_index,
+                    "batch_index": batch_index,
+                    "candidate_count": len(batch_candidates),
+                    "candidate_ids": expected_ids,
+                    "fingerprint": fingerprint,
+                    "prompt_path": str(prompt_path),
+                    "raw_response_path": str(raw_response_path),
+                    "parsed_response_path": str(parsed_response_path),
+                    "served_model": chat.served_model,
+                    "usage": chat.usage,
+                    "provider_elapsed_seconds": round(chat.elapsed_seconds, 3),
+                    "provider_attempt_index": provider_attempt_index,
+                    "provider_preferences": getattr(chat, "request", {}).get("provider"),
+                    "resumed": False,
+                }
+                write_json(batch_dir / "batch.json", batch_result)
+                judgments.extend(batch_judgments)
+                batch_results.append(batch_result)
+            except Exception as exc:  # noqa: BLE001 - persist and retry only this batch later.
+                failure_count += 1
+                response = getattr(exc, "response", None)
+                raw_response_path = batch_dir / "response.json"
+                if isinstance(response, dict) and not raw_response_path.exists():
+                    write_json(raw_response_path, response)
+                usage = chat.usage if chat is not None else getattr(exc, "usage", {})
+                served_model = chat.served_model if chat is not None else getattr(exc, "served_model", None)
+                error_path = batch_dir / "error.json"
+                write_json(error_path, {"error": repr(exc)})
+                batch_result = {
+                    "status": "failed",
+                    "partition_index": partition_index,
+                    "batch_index": batch_index,
+                    "candidate_count": len(batch_candidates),
+                    "candidate_ids": prompt_payload["candidate_ids"],
+                    "fingerprint": fingerprint,
+                    "prompt_path": str(prompt_path),
+                    "error_path": str(error_path),
+                    "error": repr(exc),
+                    "provider_attempt_index": provider_attempt_index,
+                }
+                if raw_response_path.exists():
+                    batch_result["raw_response_path"] = str(raw_response_path)
+                if isinstance(usage, dict) and usage:
+                    batch_result["usage"] = usage
+                if served_model:
+                    batch_result["served_model"] = served_model
+                provider_preferences = getattr(client, "openrouter_provider_preferences", None)
+                if provider_preferences:
+                    batch_result["provider_preferences"] = provider_preferences
+                write_json(batch_dir / "batch.json", batch_result)
+                batch_results.append(batch_result)
+                if is_batch_blocking_provider_error(exc):
+                    blocked_reason = repr(exc)
+            if config.request_delay_seconds:
+                time.sleep(config.request_delay_seconds)
+            if blocked_reason:
+                break
+
+    coverage_errors = validate_pass2_judgment_coverage(
+        judgments,
+        candidate_ids=[candidate.record.paper_id for candidate in candidates],
+        partition_count=config.partitions,
+    )
+    coverage_errors.extend(
+        validate_pass2_comparison_connectivity(
+            judgments,
+            candidate_ids=[candidate.record.paper_id for candidate in candidates],
+        )
+    )
+    complete = (
+        not config.dry_run
+        and failure_count == 0
+        and len(batch_results) == planned_batch_count
+        and not coverage_errors
+    )
+    ranking = aggregate_pass2_judgments(candidates, judgments) if complete else None
+    served_models = sorted(
+        {
+            str(result["served_model"])
+            for result in batch_results
+            if result.get("status") == "ok" and result.get("served_model")
+        }
+    )
+    result = {
+        **base_result,
+        "status": "dry_run" if config.dry_run else ("ok" if complete else "partial_failed"),
+        "ranking": ranking,
+        "served_model": served_models[0] if len(served_models) == 1 else None,
+        "served_models": served_models,
+        "usage": sum_usage(result.get("usage") for result in batch_results),
+        "judgment_count": len(judgments),
+        "expected_judgment_count": len(candidates) * config.partitions,
+        "coverage_errors": coverage_errors,
+        "attempted_batch_count": len(batch_results),
+        "skipped_batch_count": planned_batch_count - len(batch_results),
+        "failure_count": failure_count,
+        "resumed_batch_count": resumed_batch_count,
+        "blocked_reason": blocked_reason,
+        "batch_results": batch_results,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+    }
+    write_json(out, result)
+    write_json(run_dir / "run.json", result)
+    return result
+
+
+def archive_failed_pass2_attempt(batch_dir: Path) -> int:
+    state_path = batch_dir / "batch.json"
+    if not state_path.exists():
+        return existing_attempt_count(batch_dir)
+    try:
+        state = read_json(state_path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        state = None
+    if not isinstance(state, dict) or state.get("status") != "failed":
+        return existing_attempt_count(batch_dir)
+    attempts_dir = batch_dir / "attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    attempt_index = existing_attempt_count(batch_dir) + 1
+    attempt_dir = attempts_dir / f"attempt_{attempt_index:04d}"
+    attempt_dir.mkdir(parents=True, exist_ok=False)
+    for name in ("prompt.json", "response.json", "parsed.json", "error.json", "batch.json"):
+        source = batch_dir / name
+        if source.exists():
+            shutil.copy2(source, attempt_dir / name)
+    return attempt_index
+
+
+def existing_attempt_count(batch_dir: Path) -> int:
+    attempts_dir = batch_dir / "attempts"
+    if not attempts_dir.exists():
+        return 0
+    return sum(1 for path in attempts_dir.glob("attempt_*") if path.is_dir())
+
+
+def clear_failed_pass2_attempt(batch_dir: Path) -> None:
+    state_path = batch_dir / "batch.json"
+    if not state_path.exists():
+        return
+    try:
+        state = read_json(state_path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        state = None
+    if not isinstance(state, dict) or state.get("status") != "failed":
+        return
+    for name in ("response.json", "parsed.json", "error.json", "batch.json"):
+        path = batch_dir / name
+        if path.exists():
+            path.unlink()
+
+
+def ranking_prompt_fingerprint(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_cached_pass2_batch(
+    *,
+    batch_dir: Path,
+    fingerprint: str,
+    candidates: list[RankingCandidate],
+    prompt_path: Path,
+    partition_index: int,
+    batch_index: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    state_path = batch_dir / "batch.json"
+    raw_response_path = batch_dir / "response.json"
+    parsed_response_path = batch_dir / "parsed.json"
+    if not state_path.exists() or not raw_response_path.exists() or not parsed_response_path.exists():
+        return None
+    try:
+        state = read_json(state_path)
+        if (
+            not isinstance(state, dict)
+            or state.get("status") != "ok"
+            or state.get("fingerprint") != fingerprint
+        ):
+            return None
+        parsed = read_json(parsed_response_path)
+        if not isinstance(parsed, dict):
+            return None
+        expected_ids = [candidate.record.paper_id for candidate in candidates]
+        canonicalize_ranked_paper_ids(parsed, expected_ids)
+        errors = validate_ranked_paper_coverage(parsed, expected_ids)
+        if errors:
+            return None
+        effective_prompt_path = Path(str(state.get("effective_prompt_path") or prompt_path))
+        judgments = pass2_payload_to_judgments(
+            parsed,
+            partition_index=partition_index,
+            batch_index=batch_index,
+            batch_size=len(candidates),
+            prompt_path=effective_prompt_path,
+            raw_response_path=raw_response_path,
+            parsed_response_path=parsed_response_path,
+        )
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return judgments, {**state, "resumed": True}
+
+
+def recover_saved_pass2_batch(
+    *,
+    batch_dir: Path,
+    fingerprint: str,
+    candidates: list[RankingCandidate],
+    prompt_path: Path,
+    partition_index: int,
+    batch_index: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    state_path = batch_dir / "batch.json"
+    raw_response_path = batch_dir / "response.json"
+    if not state_path.exists() or not raw_response_path.exists():
+        return None
+    try:
+        state = read_json(state_path)
+        if (
+            not isinstance(state, dict)
+            or state.get("status") != "failed"
+            or state.get("fingerprint") != fingerprint
+        ):
+            return None
+        response = read_json(raw_response_path)
+        content = response["choices"][0]["message"]["content"]
+        if not isinstance(content, str):
+            return None
+        parsed = parse_json_response(content)
+        expected_ids = [candidate.record.paper_id for candidate in candidates]
+        canonicalize_ranked_paper_ids(parsed, expected_ids)
+        errors = validate_ranked_paper_coverage(parsed, expected_ids)
+        if errors:
+            return None
+        archived_attempt_count = archive_failed_pass2_attempt(batch_dir)
+        parsed_response_path = batch_dir / "parsed.json"
+        write_json(parsed_response_path, parsed)
+        judgments = pass2_payload_to_judgments(
+            parsed,
+            partition_index=partition_index,
+            batch_index=batch_index,
+            batch_size=len(candidates),
+            prompt_path=prompt_path,
+            raw_response_path=raw_response_path,
+            parsed_response_path=parsed_response_path,
+        )
+        recovered_state = {
+            **state,
+            "status": "ok",
+            "validation_errors": [],
+            "raw_response_path": str(raw_response_path),
+            "parsed_response_path": str(parsed_response_path),
+            "recovered_from_saved_response": True,
+            "archived_attempt_count": archived_attempt_count,
+            "resumed": True,
+        }
+        recovered_state.pop("error", None)
+        recovered_state.pop("error_path", None)
+        write_json(state_path, recovered_state)
+        error_path = batch_dir / "error.json"
+        if error_path.exists():
+            error_path.unlink()
+    except (IndexError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return judgments, recovered_state
+
+
+def pass2_payload_to_judgments(
+    payload: dict[str, Any],
+    *,
+    partition_index: int,
+    batch_index: int,
+    batch_size: int,
+    prompt_path: Path,
+    raw_response_path: Path,
+    parsed_response_path: Path,
+) -> list[dict[str, Any]]:
+    rows = payload.get("ranked_papers")
+    if not isinstance(rows, list):
+        raise ValueError("ranking payload missing ranked_papers")
+    judgments: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("ranked_papers contains a non-object item")
+        local_rank = int(row["rank"])
+        normalized_rank = (local_rank - 1) / max(1, batch_size - 1)
+        judgments.append(
+            {
+                "paper_id": str(row["paper_id"]),
+                "partition_index": partition_index,
+                "batch_index": batch_index,
+                "batch_size": batch_size,
+                "local_rank": local_rank,
+                "normalized_local_rank": normalized_rank,
+                "prompt_path": str(prompt_path),
+                "raw_response_path": str(raw_response_path),
+                "parsed_response_path": str(parsed_response_path),
+                "judgment": row,
+            }
+        )
+    return judgments
+
+
+def validate_pass2_judgment_coverage(
+    judgments: list[dict[str, Any]],
+    *,
+    candidate_ids: list[str],
+    partition_count: int,
+) -> list[str]:
+    errors: list[str] = []
+    expected = set(candidate_ids)
+    observed = {str(row.get("paper_id") or "") for row in judgments}
+    missing = sorted(expected - observed)
+    extra = sorted(observed - expected)
+    if missing:
+        errors.append(f"missing judgments for {len(missing)} papers: {missing[:10]}")
+    if extra:
+        errors.append(f"unexpected judgments for {len(extra)} papers: {extra[:10]}")
+    for paper_id in candidate_ids:
+        rows = [row for row in judgments if row.get("paper_id") == paper_id]
+        partitions = [int(row.get("partition_index", -1)) for row in rows]
+        if len(rows) != partition_count or sorted(partitions) != list(range(partition_count)):
+            errors.append(
+                f"paper_id={paper_id} expected one judgment in each of {partition_count} partitions; "
+                f"observed={partitions}"
+            )
+    return errors
+
+
+def validate_pass2_comparison_connectivity(
+    judgments: list[dict[str, Any]],
+    *,
+    candidate_ids: list[str],
+) -> list[str]:
+    """Require overlapping batches to connect every paper to one comparison graph."""
+    if len(candidate_ids) <= 1:
+        return []
+    expected = set(candidate_ids)
+    adjacency = {paper_id: set() for paper_id in candidate_ids}
+    by_batch: dict[tuple[int, int], list[str]] = {}
+    for row in judgments:
+        paper_id = str(row.get("paper_id") or "")
+        if paper_id not in expected:
+            continue
+        key = (
+            int(row.get("partition_index", -1)),
+            int(row.get("batch_index", -1)),
+        )
+        by_batch.setdefault(key, []).append(paper_id)
+    for paper_ids in by_batch.values():
+        for paper_id in paper_ids:
+            adjacency[paper_id].update(other for other in paper_ids if other != paper_id)
+    visited: set[str] = set()
+    stack = [candidate_ids[0]]
+    while stack:
+        paper_id = stack.pop()
+        if paper_id in visited:
+            continue
+        visited.add(paper_id)
+        stack.extend(adjacency[paper_id] - visited)
+    missing = sorted(expected - visited)
+    if missing:
+        return [
+            "listwise comparison graph is disconnected; "
+            f"{len(missing)} papers are outside the first component: {missing[:10]}"
+        ]
+    return []
+
+
+def aggregate_pass2_judgments(
+    candidates: list[RankingCandidate],
+    judgments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    input_rank = {
+        candidate.record.paper_id: rank
+        for rank, candidate in enumerate(candidates, start=1)
+    }
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    for judgment in judgments:
+        by_id.setdefault(str(judgment["paper_id"]), []).append(judgment)
+    priority_metrics = calibrate_pass2_batch_priority_scores(judgments)
+    rows: list[dict[str, Any]] = []
+    for candidate in candidates:
+        paper_id = candidate.record.paper_id
+        source_judgments = sorted(
+            by_id[paper_id],
+            key=lambda row: (row["partition_index"], row["batch_index"]),
+        )
+        normalized_ranks = [float(row["normalized_local_rank"]) for row in source_judgments]
+        mean_normalized_rank = sum(normalized_ranks) / len(normalized_ranks)
+        representative = min(
+            source_judgments,
+            key=lambda row: (
+                abs(float(row["normalized_local_rank"]) - mean_normalized_rank),
+                row["partition_index"],
+                row["batch_index"],
+            ),
+        )
+        row = dict(representative["judgment"])
+        for field in (
+            "broad_scientific_impact_score",
+            "ml_field_impact_score",
+            "technical_soundness_score",
+        ):
+            values = [number(source["judgment"].get(field)) for source in source_judgments]
+            row[field] = round(sum(values) / len(values), 4)
+        paper_priority_metrics = [
+            priority_metrics[
+                (
+                    int(source["partition_index"]),
+                    int(source["batch_index"]),
+                    paper_id,
+                )
+            ]
+            for source in source_judgments
+        ]
+        canonical_priority_scores = [
+            float(metric["canonical_score"]) for metric in paper_priority_metrics
+        ]
+        normalized_priority_scores = [
+            float(metric["within_batch_normalized_score"]) for metric in paper_priority_metrics
+        ]
+        row.update(
+            {
+                "paper_id": paper_id,
+                "title": candidate.record.title,
+                "input_cheap_rank": input_rank[paper_id],
+                "mean_normalized_local_rank": round(mean_normalized_rank, 6),
+                "overall_priority_score": round(
+                    sum(canonical_priority_scores) / len(canonical_priority_scores),
+                    4,
+                ),
+                "mean_batch_normalized_priority_score": round(
+                    sum(normalized_priority_scores) / len(normalized_priority_scores),
+                    6,
+                ),
+                "raw_overall_priority_scores": [
+                    number(source["judgment"].get("overall_priority_score"))
+                    for source in source_judgments
+                ],
+                "overall_priority_score_source_scales": [
+                    str(metric["source_scale"]) for metric in paper_priority_metrics
+                ],
+                "local_rank_range": round(max(normalized_ranks) - min(normalized_ranks), 6),
+                "batch_judgment_count": len(source_judgments),
+                "source_batch_judgments": source_judgments,
+                "advance_to_final_review": any(
+                    bool(source["judgment"].get("advance_to_final_review"))
+                    for source in source_judgments
+                ),
+            }
+        )
+        rows.append(row)
+    rows.sort(
+        key=lambda row: (
+            row["mean_normalized_local_rank"],
+            -number(row.get("overall_priority_score")),
+            -number(row.get("mean_batch_normalized_priority_score")),
+            row["input_cheap_rank"],
+            row["paper_id"],
+        )
+    )
+    for rank, row in enumerate(rows, start=1):
+        row["rank"] = rank
+    return {
+        "evaluation_mode": "pass2_strong_resumable_batch_ranking",
+        "aggregation": PASS2_BATCHED_AGGREGATION_VERSION,
+        "tie_breaking": [
+            "higher_calibrated_overall_priority_score",
+            "higher_mean_batch_normalized_priority_score",
+            "better_input_cheap_rank",
+            "paper_id",
+        ],
+        "priority_score_calibration": {
+            "reported_score": "canonical 0-10 score; 0-100 batches are divided by 10",
+            "ranking_tie_break": (
+                "mean canonical score, then per-batch min-max normalized canonical score"
+            ),
+            "raw_scores_preserved": True,
+        },
+        "ranked_papers": rows,
+        "category_rankings": build_pass2_category_rankings(rows),
+    }
+
+
+def calibrate_pass2_batch_priority_scores(
+    judgments: list[dict[str, Any]],
+) -> dict[tuple[int, int, str], dict[str, float | str]]:
+    by_batch: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for judgment in judgments:
+        batch_key = (int(judgment["partition_index"]), int(judgment["batch_index"]))
+        by_batch.setdefault(batch_key, []).append(judgment)
+
+    calibrated: dict[tuple[int, int, str], dict[str, float | str]] = {}
+    for (partition_index, batch_index), batch_judgments in by_batch.items():
+        raw_scores = [
+            number(judgment["judgment"].get("overall_priority_score"))
+            for judgment in batch_judgments
+        ]
+        minimum = min(raw_scores)
+        maximum = max(raw_scores)
+        if 0.0 <= minimum and maximum <= 10.0:
+            source_scale = "0_10"
+            canonical_scores = raw_scores
+        elif 10.0 < minimum and maximum <= 100.0:
+            source_scale = "0_100"
+            canonical_scores = [score / 10.0 for score in raw_scores]
+        else:
+            source_scale = "batch_minmax_fallback"
+            span = maximum - minimum
+            canonical_scores = [
+                5.0 if span == 0.0 else 10.0 * (score - minimum) / span
+                for score in raw_scores
+            ]
+
+        canonical_minimum = min(canonical_scores)
+        canonical_maximum = max(canonical_scores)
+        canonical_span = canonical_maximum - canonical_minimum
+        for judgment, raw_score, canonical_score in zip(
+            batch_judgments,
+            raw_scores,
+            canonical_scores,
+            strict=True,
+        ):
+            normalized_score = (
+                0.5
+                if canonical_span == 0.0
+                else (canonical_score - canonical_minimum) / canonical_span
+            )
+            key = (
+                partition_index,
+                batch_index,
+                str(judgment["paper_id"]),
+            )
+            calibrated[key] = {
+                "raw_score": raw_score,
+                "canonical_score": canonical_score,
+                "within_batch_normalized_score": normalized_score,
+                "source_scale": source_scale,
+            }
+    return calibrated
+
+
+def build_pass2_category_rankings(rows: list[dict[str, Any]]) -> dict[str, list[str]]:
+    rankings = {contribution_class: [] for contribution_class in CONTRIBUTION_CLASSES}
+    for row in rows:
+        contribution_class = str(row.get("primary_contribution_class") or "other")
+        if contribution_class not in rankings:
+            contribution_class = "other"
+        rankings[contribution_class].append(str(row["paper_id"]))
+    return rankings
+
+
+def read_contribution_class_map(path: Path | None) -> dict[str, str]:
+    if path is None:
+        return {}
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return {
+        str(row["paper_id"]): str(row.get("primary_contribution_class") or "other")
+        for row in rows
+        if row.get("paper_id")
+    }
+
+
+def make_pass2_partitions(
+    candidates: list[RankingCandidate],
+    *,
+    batch_size: int,
+    partition_count: int,
+    strategy: str,
+    class_by_id: dict[str, str],
+    seed: int,
+) -> list[list[list[RankingCandidate]]]:
+    partitions: list[list[list[RankingCandidate]]] = []
+    for partition_index in range(partition_count):
+        ordered = order_pass2_candidates(
+            candidates,
+            strategy=strategy,
+            class_by_id=class_by_id,
+            seed=seed + partition_index,
+            force_shuffle=partition_index > 0,
+        )
+        partitions.append(balance_pass2_batches(ordered, batch_size))
+    return partitions
+
+
+def order_pass2_candidates(
+    candidates: list[RankingCandidate],
+    *,
+    strategy: str,
+    class_by_id: dict[str, str],
+    seed: int,
+    force_shuffle: bool,
+) -> list[RankingCandidate]:
+    rng = random.Random(seed)
+    ordered = list(candidates)
+    if strategy == "sequential" and not force_shuffle:
+        return ordered
+    if strategy in {"sequential", "shuffled"}:
+        rng.shuffle(ordered)
+        return ordered
+    if strategy != "class_round_robin":
+        raise ValueError(f"unsupported batch strategy: {strategy}")
+    by_class: dict[str, list[RankingCandidate]] = {}
+    for candidate in ordered:
+        contribution_class = class_by_id.get(
+            candidate.record.paper_id,
+            contribution_class_from_pass1(candidate.pass1_row),
+        )
+        by_class.setdefault(contribution_class, []).append(candidate)
+    for rows in by_class.values():
+        rng.shuffle(rows)
+    class_names = sorted(by_class)
+    rng.shuffle(class_names)
+    result: list[RankingCandidate] = []
+    while any(by_class.values()):
+        for class_name in class_names:
+            rows = by_class[class_name]
+            if rows:
+                result.append(rows.pop())
+    return result
+
+
+def contribution_class_from_pass1(row: dict[str, Any]) -> str:
+    scores = row.get("scores") if isinstance(row.get("scores"), dict) else {}
+    profile = scores.get("contribution_profile") if isinstance(scores.get("contribution_profile"), dict) else {}
+    return str(profile.get("primary_contribution_class") or row.get("primary_contribution_class") or "other")
+
+
+def balance_pass2_batches(
+    candidates: list[RankingCandidate],
+    batch_size: int,
+) -> list[list[RankingCandidate]]:
+    if not candidates:
+        return []
+    batch_count = max(1, (len(candidates) + batch_size - 1) // batch_size)
+    if batch_count > 1 and len(candidates) // batch_count < 2:
+        batch_count -= 1
+    base_size, larger_count = divmod(len(candidates), batch_count)
+    batches: list[list[RankingCandidate]] = []
+    offset = 0
+    for batch_index in range(batch_count):
+        size = base_size + (1 if batch_index < larger_count else 0)
+        batches.append(candidates[offset : offset + size])
+        offset += size
+    return batches
 
 
 def run_pass2_two_stage(
@@ -745,6 +1621,7 @@ def build_pass2_ranking_messages(
     system = """You are the strong-model second-stage judge for a machine learning conference paper study.
 
 Rank candidate papers by likely broad scientific and machine-learning impact. Use only the supplied paper text and first-pass outputs. Ignore author identity, institution, venue prestige, and outside knowledge.
+No reviews, reviewer scores, area-chair comments, decisions, presentation tiers, or awards are provided. Do not infer paper quality from possible venue or outcome cues in the document.
 
 This run is text-only and retrieval-free: you do not have PDF page images, figure images, table images, file search, web search, vector stores, or external tools. Treat missing visual/table detail as an uncertainty, not as a factual flaw.
 
@@ -829,6 +1706,7 @@ def build_reference_ranking_messages(
     system = """You are the strongest available reference judge for a machine learning conference paper study.
 
 Create an independent reference ranking for evaluation of a cheaper first-pass -> strong-model pipeline. Use only the supplied extracted paper text. Do not use web search, retrieval, citation memory, author identity, institution, venue prestige, or outside knowledge.
+No reviews, reviewer scores, area-chair comments, decisions, presentation tiers, or awards are provided. Do not infer paper quality from possible venue or outcome cues in the document.
 
 This run is text-only and retrieval-free: you do not have PDF page images, figure images, table images, file search, vector stores, or external tools. Treat missing visual/table detail as an uncertainty, not as a factual flaw.
 
@@ -1007,7 +1885,6 @@ def format_candidate(candidate: RankingCandidate) -> str:
     first_pass = compact_first_pass(candidate.pass1_row)
     return f"""<CANDIDATE paper_id="{candidate.record.paper_id}">
 Title: {candidate.record.title or ""}
-Decision label: {candidate.record.decision_label or ""}
 Text source: {candidate.resolved_text_source}
 Text path: {candidate.text_path}
 
@@ -1028,7 +1905,6 @@ def format_reference_candidates(candidates: list[ReferenceCandidate]) -> str:
 def format_reference_candidate(candidate: ReferenceCandidate) -> str:
     return f"""<PAPER paper_id="{candidate.record.paper_id}">
 Title: {candidate.record.title or ""}
-Decision label: {candidate.record.decision_label or ""}
 Text source: {candidate.resolved_text_source}
 Text path: {candidate.text_path}
 
