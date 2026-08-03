@@ -36,6 +36,13 @@ from icml_ai_ac.model_presets import (
 from icml_ai_ac.position_sensitivity import build_position_robust_shortlist
 from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.ranking_ensemble import ensemble_semifinal_rankings
+from icml_ai_ac.ranking_query import (
+    QUERY_PRESETS,
+    QUERY_SCOPES,
+    RankingQuery,
+    query_ranked_papers,
+    write_query_results,
+)
 from icml_ai_ac.scraper.arxiv import ArxivClient, ArxivQueryBudgetExceeded, arxiv_pdf_filename, is_confident_enough
 from icml_ai_ac.scraper.arxiv_audit import ArxivAuditThresholds, audit_arxiv_resolution
 from icml_ai_ac.parser import parse_pdf_record, write_parse_report
@@ -1020,6 +1027,36 @@ def build_parser() -> argparse.ArgumentParser:
     axis_decomp.add_argument("--honored-includes-award", action="store_true")
     axis_decomp.add_argument("--min-coverage", type=float, default=1.0)
     axis_decomp.set_defaults(func=cmd_ai_axis_decomposition)
+
+    query_papers = subparsers.add_parser(
+        "query-ranked-papers",
+        help="Search paper metadata and join matches to the frozen ICML 2026 rankings.",
+    )
+    query_papers.add_argument(
+        "--metadata",
+        type=Path,
+        default=Path("data/metadata/icml_2026_scoring_manifest.jsonl"),
+    )
+    query_papers.add_argument(
+        "--cheap-ranking",
+        type=Path,
+        default=Path("data/scores/icml_2026_pass1_cheap_ensemble_signal.jsonl"),
+    )
+    query_papers.add_argument(
+        "--final-ranking",
+        type=Path,
+        default=Path("data/scores/icml_2026_stage7_strong_finalists250.json"),
+    )
+    query_papers.add_argument("--preset", choices=QUERY_PRESETS)
+    query_papers.add_argument("--query", help="Case-insensitive substring across title, abstract, topic, and contribution class.")
+    query_papers.add_argument("--topic", help="Case-insensitive official-topic glob, such as 'Deep Learning->*'.")
+    query_papers.add_argument("--contribution-class")
+    query_papers.add_argument("--scope", choices=QUERY_SCOPES, default="all")
+    query_papers.add_argument("--limit", type=int)
+    query_papers.add_argument("--include-abstract", action="store_true")
+    query_papers.add_argument("--out", type=Path, help="Optional .csv, .jsonl, or .tsv output path. Defaults to TSV on stdout.")
+    query_papers.add_argument("--format", choices=["csv", "jsonl", "tsv"], default=None)
+    query_papers.set_defaults(func=cmd_query_ranked_papers)
 
     return parser
 
@@ -3322,6 +3359,42 @@ def cmd_ai_axis_decomposition(args: argparse.Namespace) -> int:
     print(
         f"Axis decomposition: {len(report['axes'])} axes; "
         f"conventional-minus-executive tau_b(tier) delta={ivp['delta_conventional_minus_executive']}"
+    )
+    return 0
+
+
+def cmd_query_ranked_papers(args: argparse.Namespace) -> int:
+    try:
+        rows = query_ranked_papers(
+            metadata_path=args.metadata,
+            cheap_ranking_path=args.cheap_ranking,
+            final_ranking_path=args.final_ranking,
+            query=RankingQuery(
+                preset=args.preset,
+                query=args.query,
+                topic=args.topic,
+                contribution_class=args.contribution_class,
+                scope=args.scope,
+                limit=args.limit,
+                include_abstract=args.include_abstract,
+            ),
+        )
+    except (OSError, ValueError) as exc:
+        print(f"Cannot query ranked papers: {exc}", file=sys.stderr)
+        return 2
+
+    output_format = args.format
+    if output_format is None:
+        suffix = args.out.suffix.lower() if args.out else ""
+        output_format = {".csv": "csv", ".jsonl": "jsonl"}.get(suffix, "tsv")
+    write_query_results(rows, path=args.out, output_format=output_format)
+    finalist_count = sum(row.get("final_rank") is not None for row in rows)
+    playoff_count = sum(row.get("final_stage") == "playoff_all_pairs" for row in rows)
+    destination = str(args.out) if args.out else "stdout"
+    print(
+        f"Matched {len(rows)} papers: {finalist_count} frontier finalists, "
+        f"{playoff_count} all-pairs playoff papers; wrote {destination}.",
+        file=sys.stderr,
     )
     return 0
 

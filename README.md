@@ -181,6 +181,45 @@ report which human-honored papers survived selection. Divergence case studies
 use fixed rank tails, and an independently coded, frozen taxonomy reports
 recurring reasons with held-out summaries and inter-model agreement.
 
+### Querying Ranked Papers
+
+The frozen ranking can be joined to titles, abstracts, official ICML topics,
+and contribution classes without rerunning any model:
+
+```bash
+python3 -m icml_ai_ac.cli query-ranked-papers \
+  --preset data-pretraining \
+  --out data/analysis/icml_2026_data_pretraining_ranked.csv
+```
+
+The transparent `data-pretraining` preset matches the official
+`General Machine Learning->Data` topic, the `benchmark_dataset` contribution
+class, specific data-practice language such as data curation or training data,
+or explicit pretraining terms in the title or abstract. Every result includes
+`match_reasons`, its full-corpus `cheap_rank`, and, when applicable, its frozen
+`final_rank` and ranking stage. Papers outside the 250 frontier finalists have
+no `final_rank`; this is distinct from receiving a low final rank.
+
+Filters can also be composed directly:
+
+```bash
+# Only data/pretraining papers among the 250 frontier finalists.
+python3 -m icml_ai_ac.cli query-ranked-papers \
+  --preset data-pretraining --scope finalists
+
+# Exact official-topic family, using a case-insensitive glob.
+python3 -m icml_ai_ac.cli query-ranked-papers \
+  --topic 'Deep Learning->*' --contribution-class benchmark_dataset
+
+# Explicit pretraining papers that reached the 60-paper all-pairs playoff.
+python3 -m icml_ai_ac.cli query-ranked-papers \
+  --preset pretraining --scope playoff
+```
+
+Use `--query` for a case-insensitive title/abstract/topic search, `--scope` for
+`all`, `finalists`, `tournament`, or `playoff`, and `--format` for CSV, JSONL,
+or TSV output. The input paths are configurable for rebuilt or alternate runs.
+
 ## Gold-Set Validation
 
 We validated the ranking design on a 50-paper ICML 2025 accepted-paper testbed.

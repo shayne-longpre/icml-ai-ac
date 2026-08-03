@@ -46,6 +46,24 @@ python -m icml_ai_ac.reproducibility verify \
 Verification checks the complete file inventory, byte sizes, and SHA-256
 digests. It fails on missing, modified, or unexpected payload files.
 
+## Query the Frozen Rankings
+
+The analysis bundle contains the inputs needed to search papers and join them
+to the frozen full-corpus and finalist rankings. From the bundle root, with this
+package installed:
+
+```bash
+icml-ai-ac query-ranked-papers \
+  --preset data-pretraining \
+  --scope finalists \
+  --out data_pretraining_finalists.csv
+```
+
+The output records why each paper matched, its full-corpus cheap rank, and its
+final rank and stage when it entered the 250-paper frontier set. Run
+`icml-ai-ac query-ranked-papers --help` for official-topic, contribution-class,
+free-text, scope, and output-format filters.
+
 ## Rebuild the Analysis
 
 ```bash
