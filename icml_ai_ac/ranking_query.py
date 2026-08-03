@@ -9,11 +9,45 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
+from icml_ai_ac.scoring.schema import CONTRIBUTION_CLASSES
 from icml_ai_ac.storage import ensure_parent, read_json, read_jsonl
 
 
+DEFAULT_METADATA_PATH = Path("data/metadata/icml_2026_scoring_manifest.jsonl")
+DEFAULT_CHEAP_RANKING_PATH = Path("data/scores/icml_2026_pass1_cheap_ensemble_signal.jsonl")
+DEFAULT_FINAL_RANKING_PATH = Path("data/scores/icml_2026_stage7_strong_finalists250.json")
 QUERY_PRESETS = ("data", "pretraining", "data-pretraining")
 QUERY_SCOPES = ("all", "finalists", "tournament", "playoff")
+OFFICIAL_TOPIC_FAMILIES = (
+    "Applications",
+    "Deep Learning",
+    "General Machine Learning",
+    "Optimization",
+    "Probabilistic Methods",
+    "Reinforcement Learning",
+    "Social Aspects",
+    "Theory",
+)
+
+CATEGORY_ALIASES = {
+    "benchmark": "benchmark_dataset",
+    "benchmarks": "benchmark_dataset",
+    "dataset": "benchmark_dataset",
+    "datasets": "benchmark_dataset",
+    "infrastructure": "infrastructure_systems",
+    "systems": "infrastructure_systems",
+    "scientific-tool": "scientific_modeling_tool",
+    "scientific-tools": "scientific_modeling_tool",
+    "safety": "safety_governance_eval",
+    "application": "application_method",
+    "applications": "application_method",
+    "analysis": "analysis_position",
+    "position": "analysis_position",
+}
+PRESET_ALIASES = {
+    "data-and-pretraining": "data-pretraining",
+    "pre-training": "pretraining",
+}
 
 PRETRAINING_PATTERN = re.compile(r"\bpre[\s-]?train(?:ed|ing)?\b", re.IGNORECASE)
 DATA_PRACTICE_PATTERN = re.compile(
@@ -53,6 +87,108 @@ class RankingQuery:
             raise ValueError(f"scope must be one of: {', '.join(QUERY_SCOPES)}")
         if self.limit is not None and self.limit <= 0:
             raise ValueError("limit must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedCategory:
+    kind: str
+    value: str
+
+
+def top_ranked_papers(
+    category: str,
+    *,
+    top_n: int = 20,
+    scope: str = "finalists",
+    metadata_path: Path = DEFAULT_METADATA_PATH,
+    cheap_ranking_path: Path = DEFAULT_CHEAP_RANKING_PATH,
+    final_ranking_path: Path = DEFAULT_FINAL_RANKING_PATH,
+    include_abstract: bool = False,
+) -> list[dict[str, Any]]:
+    """Return the highest frozen-ranking papers in a named category."""
+
+    resolved = resolve_ranking_category(category)
+    query_args: dict[str, Any] = {
+        "scope": scope,
+        "limit": top_n,
+        "include_abstract": include_abstract,
+    }
+    if resolved.kind == "preset":
+        query_args["preset"] = resolved.value
+    elif resolved.kind == "contribution":
+        query_args["contribution_class"] = resolved.value
+    else:
+        query_args["topic"] = resolved.value
+    return query_ranked_papers(
+        metadata_path=metadata_path,
+        cheap_ranking_path=cheap_ranking_path,
+        final_ranking_path=final_ranking_path,
+        query=RankingQuery(**query_args),
+    )
+
+
+def resolve_ranking_category(category: str) -> ResolvedCategory:
+    raw = category.strip()
+    if not raw:
+        raise ValueError("category cannot be empty")
+
+    prefix, separator, remainder = raw.partition(":")
+    if separator and prefix.casefold() in {"topic", "contribution", "preset"}:
+        kind = prefix.casefold()
+        raw = remainder.strip()
+        if not raw:
+            raise ValueError(f"{kind} category cannot be empty")
+        if kind == "preset":
+            preset = PRESET_ALIASES.get(normalized_category(raw), normalized_category(raw))
+            if preset not in QUERY_PRESETS:
+                raise ValueError(f"unknown preset {raw!r}")
+            return ResolvedCategory("preset", preset)
+        if kind == "contribution":
+            contribution = normalized_category(raw).replace("-", "_")
+            contribution = CATEGORY_ALIASES.get(normalized_category(raw), contribution)
+            if contribution not in CONTRIBUTION_CLASSES:
+                raise ValueError(f"unknown contribution class {raw!r}")
+            return ResolvedCategory("contribution", contribution)
+        return ResolvedCategory("topic", topic_pattern(raw))
+
+    normalized = normalized_category(raw)
+    preset = PRESET_ALIASES.get(normalized, normalized)
+    if preset in QUERY_PRESETS:
+        return ResolvedCategory("preset", preset)
+    contribution = CATEGORY_ALIASES.get(normalized, normalized.replace("-", "_"))
+    if contribution in CONTRIBUTION_CLASSES:
+        return ResolvedCategory("contribution", contribution)
+    family_by_name = {normalized_category(value): value for value in OFFICIAL_TOPIC_FAMILIES}
+    if normalized in family_by_name:
+        return ResolvedCategory("topic", f"{family_by_name[normalized]}->*")
+    if "->" in raw or "*" in raw:
+        return ResolvedCategory("topic", raw)
+    raise ValueError(
+        f"unknown category {category!r}; use list-ranking-categories to see supported names"
+    )
+
+
+def available_ranking_categories() -> dict[str, Any]:
+    return {
+        "presets": list(QUERY_PRESETS),
+        "contribution_classes": list(CONTRIBUTION_CLASSES),
+        "official_topic_families": list(OFFICIAL_TOPIC_FAMILIES),
+        "explicit_topic_syntax": "topic:Deep Learning->Large Language Models",
+        "notes": {
+            "default_scope": "finalists",
+            "data_pretraining": "High-recall metadata/content filter; inspect match_reasons.",
+        },
+    }
+
+
+def normalized_category(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
+
+
+def topic_pattern(value: str) -> str:
+    family_by_name = {normalized_category(item): item for item in OFFICIAL_TOPIC_FAMILIES}
+    normalized = normalized_category(value)
+    return f"{family_by_name[normalized]}->*" if normalized in family_by_name else value
 
 
 def query_ranked_papers(
@@ -242,30 +378,36 @@ def ranking_sort_key(row: dict[str, Any]) -> tuple[int, int, int, str]:
 
 
 def write_query_results(rows: list[dict[str, Any]], *, path: Path | None, output_format: str) -> None:
+    if output_format not in {"csv", "jsonl", "tsv"}:
+        raise ValueError("output_format must be csv, jsonl, or tsv")
     if path is None:
-        write_tsv(rows, handle=sys.stdout)
+        write_results(rows, handle=sys.stdout, output_format=output_format)
         return
     ensure_parent(path)
     with path.open("w", encoding="utf-8", newline="") as handle:
-        if output_format == "csv":
-            writer = csv.DictWriter(handle, fieldnames=output_fields(rows))
-            writer.writeheader()
-            for row in rows:
-                writer.writerow(csv_row(row))
-        elif output_format == "jsonl":
-            for row in rows:
-                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
-                handle.write("\n")
-        else:
-            write_tsv(rows, handle=handle)
+        write_results(rows, handle=handle, output_format=output_format)
 
 
-def write_tsv(rows: list[dict[str, Any]], *, handle: TextIO) -> None:
-    fields = output_fields(rows)
-    writer = csv.DictWriter(handle, fieldnames=fields, dialect="excel-tab", extrasaction="ignore")
+def write_results(rows: list[dict[str, Any]], *, handle: TextIO, output_format: str) -> None:
+    if output_format == "jsonl":
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            handle.write("\n")
+        return
+    dialect = "excel" if output_format == "csv" else "excel-tab"
+    writer = csv.DictWriter(
+        handle,
+        fieldnames=output_fields(rows),
+        dialect=dialect,
+        extrasaction="ignore",
+    )
     writer.writeheader()
     for row in rows:
         writer.writerow(csv_row(row))
+
+
+def write_tsv(rows: list[dict[str, Any]], *, handle: TextIO) -> None:
+    write_results(rows, handle=handle, output_format="tsv")
 
 
 def output_fields(rows: list[dict[str, Any]]) -> list[str]:

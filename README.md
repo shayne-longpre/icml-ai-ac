@@ -183,8 +183,33 @@ recurring reasons with held-out summaries and inter-model agreement.
 
 ### Querying Ranked Papers
 
-The frozen ranking can be joined to titles, abstracts, official ICML topics,
-and contribution classes without rerunning any model:
+For a fresh shell or LLM thread, the shortest interface returns machine-readable
+JSONL from the frozen 250-paper finalist ranking:
+
+```bash
+python3 -m icml_ai_ac.cli list-ranking-categories
+python3 -m icml_ai_ac.cli top-ranked-papers \
+  --category data-pretraining --top 20
+```
+
+`--category` accepts a preset (`data-pretraining`), contribution class
+(`theory`, `benchmark_dataset`, and so on), official topic family
+(`Deep Learning`), or explicit leaf topic prefixed with `topic:`. Use
+`--scope tournament`, `--scope playoff`, or `--scope all` to change the default
+finalist scope.
+
+The same operation is available as a Python API with production paths already
+configured:
+
+```python
+from icml_ai_ac.ranking_query import top_ranked_papers
+
+papers = top_ranked_papers("data and pretraining", top_n=20)
+```
+
+For arbitrary combinations, `query-ranked-papers` joins the frozen ranking to
+titles, abstracts, official ICML topics, and contribution classes without
+rerunning any model:
 
 ```bash
 python3 -m icml_ai_ac.cli query-ranked-papers \

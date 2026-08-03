@@ -53,16 +53,17 @@ to the frozen full-corpus and finalist rankings. From the bundle root, with this
 package installed:
 
 ```bash
-icml-ai-ac query-ranked-papers \
-  --preset data-pretraining \
-  --scope finalists \
-  --out data_pretraining_finalists.csv
+icml-ai-ac list-ranking-categories
+icml-ai-ac top-ranked-papers \
+  --category data-pretraining \
+  --top 20 \
+  --out data_pretraining_top20.jsonl
 ```
 
 The output records why each paper matched, its full-corpus cheap rank, and its
-final rank and stage when it entered the 250-paper frontier set. Run
-`icml-ai-ac query-ranked-papers --help` for official-topic, contribution-class,
-free-text, scope, and output-format filters.
+final rank and stage. `top-ranked-papers` defaults to the 250-paper frontier
+set; run `icml-ai-ac query-ranked-papers --help` for arbitrary combinations of
+official-topic, contribution-class, free-text, scope, and output-format filters.
 
 ## Rebuild the Analysis
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import sys
 import time
 import traceback
@@ -37,10 +38,15 @@ from icml_ai_ac.position_sensitivity import build_position_robust_shortlist
 from icml_ai_ac.models import PaperRecord
 from icml_ai_ac.ranking_ensemble import ensemble_semifinal_rankings
 from icml_ai_ac.ranking_query import (
+    DEFAULT_CHEAP_RANKING_PATH,
+    DEFAULT_FINAL_RANKING_PATH,
+    DEFAULT_METADATA_PATH,
     QUERY_PRESETS,
     QUERY_SCOPES,
     RankingQuery,
+    available_ranking_categories,
     query_ranked_papers,
+    top_ranked_papers,
     write_query_results,
 )
 from icml_ai_ac.scraper.arxiv import ArxivClient, ArxivQueryBudgetExceeded, arxiv_pdf_filename, is_confident_enough
@@ -1035,17 +1041,17 @@ def build_parser() -> argparse.ArgumentParser:
     query_papers.add_argument(
         "--metadata",
         type=Path,
-        default=Path("data/metadata/icml_2026_scoring_manifest.jsonl"),
+        default=DEFAULT_METADATA_PATH,
     )
     query_papers.add_argument(
         "--cheap-ranking",
         type=Path,
-        default=Path("data/scores/icml_2026_pass1_cheap_ensemble_signal.jsonl"),
+        default=DEFAULT_CHEAP_RANKING_PATH,
     )
     query_papers.add_argument(
         "--final-ranking",
         type=Path,
-        default=Path("data/scores/icml_2026_stage7_strong_finalists250.json"),
+        default=DEFAULT_FINAL_RANKING_PATH,
     )
     query_papers.add_argument("--preset", choices=QUERY_PRESETS)
     query_papers.add_argument("--query", help="Case-insensitive substring across title, abstract, topic, and contribution class.")
@@ -1057,6 +1063,31 @@ def build_parser() -> argparse.ArgumentParser:
     query_papers.add_argument("--out", type=Path, help="Optional .csv, .jsonl, or .tsv output path. Defaults to TSV on stdout.")
     query_papers.add_argument("--format", choices=["csv", "jsonl", "tsv"], default=None)
     query_papers.set_defaults(func=cmd_query_ranked_papers)
+
+    top_papers = subparsers.add_parser(
+        "top-ranked-papers",
+        help="Return the top frozen-ranking papers in a named topic, contribution class, or preset.",
+    )
+    top_papers.add_argument(
+        "--category",
+        required=True,
+        help="For example: data-pretraining, theory, benchmark_dataset, or 'Deep Learning'.",
+    )
+    top_papers.add_argument("--top", type=int, default=20)
+    top_papers.add_argument("--scope", choices=QUERY_SCOPES, default="finalists")
+    top_papers.add_argument("--include-abstract", action="store_true")
+    top_papers.add_argument("--metadata", type=Path, default=DEFAULT_METADATA_PATH)
+    top_papers.add_argument("--cheap-ranking", type=Path, default=DEFAULT_CHEAP_RANKING_PATH)
+    top_papers.add_argument("--final-ranking", type=Path, default=DEFAULT_FINAL_RANKING_PATH)
+    top_papers.add_argument("--out", type=Path)
+    top_papers.add_argument("--format", choices=["csv", "jsonl", "tsv"], default="jsonl")
+    top_papers.set_defaults(func=cmd_top_ranked_papers)
+
+    list_categories = subparsers.add_parser(
+        "list-ranking-categories",
+        help="List categories accepted by top-ranked-papers.",
+    )
+    list_categories.set_defaults(func=cmd_list_ranking_categories)
 
     return parser
 
@@ -3396,6 +3427,36 @@ def cmd_query_ranked_papers(args: argparse.Namespace) -> int:
         f"{playoff_count} all-pairs playoff papers; wrote {destination}.",
         file=sys.stderr,
     )
+    return 0
+
+
+def cmd_top_ranked_papers(args: argparse.Namespace) -> int:
+    try:
+        rows = top_ranked_papers(
+            args.category,
+            top_n=args.top,
+            scope=args.scope,
+            metadata_path=args.metadata,
+            cheap_ranking_path=args.cheap_ranking,
+            final_ranking_path=args.final_ranking,
+            include_abstract=args.include_abstract,
+        )
+        write_query_results(rows, path=args.out, output_format=args.format)
+    except (OSError, ValueError) as exc:
+        print(f"Cannot retrieve top-ranked papers: {exc}", file=sys.stderr)
+        return 2
+    destination = str(args.out) if args.out else "stdout"
+    print(
+        f"Returned {len(rows)} papers for category {args.category!r} "
+        f"from scope {args.scope!r}; wrote {destination}.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def cmd_list_ranking_categories(args: argparse.Namespace) -> int:
+    del args
+    print(json.dumps(available_ranking_categories(), indent=2, sort_keys=True))
     return 0
 
 

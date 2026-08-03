@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import csv
+import io
+import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
-from icml_ai_ac.ranking_query import RankingQuery, query_ranked_papers, write_query_results
+from icml_ai_ac.ranking_query import (
+    RankingQuery,
+    query_ranked_papers,
+    resolve_ranking_category,
+    top_ranked_papers,
+    write_query_results,
+)
 from icml_ai_ac.storage import write_json, write_jsonl
 
 
@@ -121,6 +130,37 @@ class RankingQueryTests(unittest.TestCase):
             parsed = list(csv.DictReader(handle))
         self.assertEqual(parsed[0]["paper_id"], "pretraining")
         self.assertEqual(parsed[0]["match_reasons"], "content:pretraining")
+
+    def test_top_ranked_api_accepts_human_category_name(self) -> None:
+        rows = top_ranked_papers(
+            "Data and Pretraining",
+            top_n=2,
+            metadata_path=self.metadata_path,
+            cheap_ranking_path=self.cheap_path,
+            final_ranking_path=self.final_path,
+        )
+
+        self.assertEqual([row["paper_id"] for row in rows], ["pretraining", "data-topic"])
+        self.assertTrue(all(row["final_rank"] is not None for row in rows))
+
+    def test_category_resolution_covers_contributions_and_topic_families(self) -> None:
+        self.assertEqual(
+            resolve_ranking_category("datasets").value,
+            "benchmark_dataset",
+        )
+        topic = resolve_ranking_category("Deep Learning")
+        self.assertEqual((topic.kind, topic.value), ("topic", "Deep Learning->*"))
+        explicit = resolve_ranking_category("topic:Theory")
+        self.assertEqual((explicit.kind, explicit.value), ("topic", "Theory->*"))
+
+    def test_jsonl_stdout_is_machine_readable(self) -> None:
+        rows = self.query(RankingQuery(query="convex"))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            write_query_results(rows, path=None, output_format="jsonl")
+
+        parsed = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(parsed[0]["paper_id"], "unrelated")
 
     def query(self, query: RankingQuery) -> list[dict]:
         return query_ranked_papers(
