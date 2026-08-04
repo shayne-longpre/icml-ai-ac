@@ -380,7 +380,8 @@ and potentially gets right.
 ## Internal Methodology Docs
 
 - Static blog and mock awards preview: [`site/index.html`](site/index.html)
-- Blog data rebuild and local preview: [`site/README.md`](site/README.md)
+- One-command blog build, ZIP packaging, data rebuild, and preview:
+  [`site/README.md`](site/README.md)
 - Results bundles and one-command deterministic rebuild: [`docs/reproducibility.md`](docs/reproducibility.md)
 - Detailed pipeline: [`docs/final_pipeline_methodology.md`](docs/final_pipeline_methodology.md)
 - Final run plan: [`docs/final_run_plan.md`](docs/final_run_plan.md)
