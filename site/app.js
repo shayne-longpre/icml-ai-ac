@@ -55,21 +55,18 @@
     return classLabels[value] || value.replaceAll("_", " ");
   }
 
+  function ordinal(value) {
+    const n = Math.round(value);
+    const rest = n % 100;
+    if (rest >= 11 && rest <= 13) return `${n}th`;
+    return `${n}${["th", "st", "nd", "rd"][n % 10] || "th"}`;
+  }
+
   function svgElement(tag, attributes = {}, text) {
     const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
     Object.entries(attributes).forEach(([name, value]) => node.setAttribute(name, String(value)));
     if (text !== undefined) node.textContent = text;
     return node;
-  }
-
-  function starPath(cx, cy, outerRadius = 7, innerRadius = 3.2) {
-    const points = [];
-    for (let index = 0; index < 10; index += 1) {
-      const radius = index % 2 === 0 ? outerRadius : innerRadius;
-      const angle = -Math.PI / 2 + (index * Math.PI) / 5;
-      points.push(`${cx + radius * Math.cos(angle)},${cy + radius * Math.sin(angle)}`);
-    }
-    return `M ${points.join(" L ")} Z`;
   }
 
   function renderMethodDiagram() {
@@ -99,213 +96,603 @@
     container.append(flow, phaseLabels);
   }
 
-  function renderRecognitionTrajectory() {
-    const stages = data.humanComparison.stages;
+  function renderCorrelationScale() {
+    const container = document.querySelector("#correlation-scale");
+    const coverage = data.results && data.results.main_track_full_coverage;
+    if (!container || !coverage) return;
+    const rows = [
+      ["How prominently the conference presented the paper", coverage.kendall_tau_b_vs_tier],
+      ["The average score the paper's reviewers gave it", coverage.kendall_tau_b_vs_reviewer_overall],
+    ];
     const width = 1120;
-    const height = 430;
-    const left = 130;
-    const right = 1070;
-    const top = 52;
-    const baseline = 255;
-    const maxRate = 0.45;
-    const x = (index) => left + (index * (right - left)) / (stages.length - 1);
-    const y = (rate) => baseline - (rate / maxRate) * (baseline - top);
+    const height = 210;
+    const left = 470;
+    const right = 1000;
+    const x = (value) => left + value * (right - left);
+
     const svg = svgElement("svg", {
-      class: "recognition-svg",
+      class: "evidence-svg",
       viewBox: `0 0 ${width} ${height}`,
       role: "img",
-      "aria-label": stages
-        .map(
-          (stage) =>
-            `${stage.label}: ${(stage.honoredRate * 100).toFixed(1)} percent human oral or spotlight, ${stage.awards} award papers retained`,
-        )
+      "aria-label": rows
+        .map(([label, value]) => `Against ${label}, the rank correlation is ${value.toFixed(2)} on a scale from 0 to 1`)
+        .join(". "),
+    });
+    svg.append(
+      svgElement("text", { class: "evidence-axis-title", x: 160, y: 30 }, "Rank correlation between the AI ranking and each human record"),
+    );
+
+    [0, 0.25, 0.5, 0.75, 1].forEach((value) => {
+      svg.append(
+        svgElement("line", { class: "evidence-grid", x1: x(value), x2: x(value), y1: 58, y2: 152 }),
+        svgElement("text", { class: "evidence-tick", x: x(value), y: 174, "text-anchor": "middle" }, value.toFixed(2)),
+      );
+    });
+    svg.append(
+      svgElement("text", { class: "evidence-scale-end", x: x(0), y: 50, "text-anchor": "middle" }, "no relationship"),
+      svgElement("text", { class: "evidence-scale-end", x: x(1), y: 50, "text-anchor": "middle" }, "identical orderings"),
+    );
+
+    rows.forEach(([label, value], index) => {
+      const y = 84 + index * 44;
+      svg.append(
+        svgElement("text", { class: "evidence-row-label", x: left - 24, y: y + 5, "text-anchor": "end" }, label),
+        svgElement("rect", { class: "evidence-track", x: x(0), y: y - 11, width: right - left, height: 22 }),
+        svgElement("rect", { class: "evidence-fill evidence-oral", x: x(0), y: y - 11, width: Math.max(2, x(value) - x(0)), height: 22 }),
+        svgElement("text", { class: "evidence-value", x: x(value) + 14, y: y + 6 }, value.toFixed(2)),
+      );
+    });
+    container.append(svg);
+  }
+
+  function renderRecallByTier() {
+    const evidence = data.preferenceEvidence;
+    const container = document.querySelector("#recall-by-tier");
+    if (!container || !evidence) return;
+    const tiers = [
+      ["oral", "Chosen as oral at ICML"],
+      ["spotlight", "Chosen as spotlight at ICML"],
+      ["poster", "Chosen as poster at ICML"],
+    ];
+    const width = 1120;
+    const height = 268;
+    const left = 300;
+    const right = 1060;
+    const rowHeight = 62;
+    const firstRow = 74;
+    const scale = (share) => left + share * (right - left);
+
+    const svg = svgElement("svg", {
+      class: "evidence-svg",
+      viewBox: `0 0 ${width} ${height}`,
+      role: "img",
+      "aria-label": tiers
+        .map(([key, label]) => {
+          const row = evidence.crosstab.tiers[key];
+          return `${label}: ${row.inTopDecile} of ${row.total}, ${((row.inTopDecile / row.total) * 100).toFixed(1)} percent, reached the AI top ten percent`;
+        })
         .join(". "),
     });
 
-    [0, 0.2, 0.4].forEach((rate) => {
-      const gridY = y(rate);
+    svg.append(
+      svgElement("text", { class: "evidence-axis-title", x: left, y: 30 }, "Share of each presentation tier that reached the top 10% of the AI ranking"),
+    );
+
+    const baseline = scale(0.1);
+    svg.append(
+      svgElement("line", { class: "evidence-reference", x1: baseline, x2: baseline, y1: firstRow - 24, y2: firstRow + rowHeight * 3 - 22 }),
+      svgElement("text", { class: "evidence-reference-label", x: baseline, y: firstRow + rowHeight * 3 - 2, "text-anchor": "middle" }, "10%, the share expected if the two orderings were unrelated"),
+    );
+
+    tiers.forEach(([key, label], index) => {
+      const row = evidence.crosstab.tiers[key];
+      const share = row.inTopDecile / row.total;
+      const y = firstRow + index * rowHeight;
       svg.append(
-        svgElement("line", { class: "recognition-grid", x1: left, x2: right, y1: gridY, y2: gridY }),
+        svgElement("text", { class: "evidence-row-label", x: left - 20, y: y + 5, "text-anchor": "end" }, label),
+        svgElement("rect", { class: "evidence-track", x: left, y: y - 13, width: right - left, height: 26 }),
+        svgElement("rect", { class: `evidence-fill evidence-${key}`, x: left, y: y - 13, width: scale(share) - left, height: 26 }),
+        svgElement("text", { class: "evidence-value", x: scale(share) + 12, y: y + 5 }, `${(share * 100).toFixed(1)}%`),
         svgElement(
           "text",
-          { class: "recognition-axis-label", x: left - 18, y: gridY + 4, "text-anchor": "end" },
-          `${Math.round(rate * 100)}%`,
+          { class: "evidence-count", x: right, y: y + 5, "text-anchor": "end" },
+          `${row.inTopDecile.toLocaleString()} of ${row.total.toLocaleString()}`,
         ),
       );
     });
-    svg.append(
-      svgElement("text", { class: "recognition-axis-title", x: left, y: 24 }, "Share designated oral or spotlight by ICML"),
-    );
-
-    const pointPairs = stages.map((stage, index) => [x(index), y(stage.honoredRate)]);
-    const area = [
-      `M ${pointPairs[0][0]} ${baseline}`,
-      ...pointPairs.map(([pointX, pointY]) => `L ${pointX} ${pointY}`),
-      `L ${pointPairs[pointPairs.length - 1][0]} ${baseline}`,
-      "Z",
-    ].join(" ");
-    const line = pointPairs
-      .map(([pointX, pointY], index) => `${index === 0 ? "M" : "L"} ${pointX} ${pointY}`)
-      .join(" ");
-    svg.append(
-      svgElement("path", { class: "recognition-area", d: area }),
-      svgElement("path", { class: "recognition-line", d: line }),
-    );
-
-    stages.forEach((stage, index) => {
-      const pointX = x(index);
-      const pointY = y(stage.honoredRate);
-      svg.append(
-        svgElement("circle", { class: "recognition-point", cx: pointX, cy: pointY, r: 7 }),
-        svgElement(
-          "text",
-          { class: "recognition-rate", x: pointX, y: pointY - 16, "text-anchor": "middle" },
-          `${(stage.honoredRate * 100).toFixed(1)}%`,
-        ),
-        svgElement(
-          "text",
-          { class: "recognition-stage-label", x: pointX, y: 286, "text-anchor": "middle" },
-          stage.label,
-        ),
-        svgElement(
-          "text",
-          { class: "recognition-paper-count", x: pointX, y: 307, "text-anchor": "middle" },
-          `${stage.papers.toLocaleString()} papers`,
-        ),
-      );
-
-      const starSpacing = 12;
-      const firstStarX = pointX - ((stage.awards - 1) * starSpacing) / 2;
-      for (let star = 0; star < stage.awards; star += 1) {
-        svg.append(
-          svgElement("path", {
-            class: "recognition-star",
-            d: starPath(firstStarX + star * starSpacing, 365),
-          }),
-        );
-      }
-      svg.append(
-        svgElement(
-          "text",
-          { class: "recognition-award-count", x: pointX, y: 397, "text-anchor": "middle" },
-          `${stage.awards} retained`,
-        ),
-      );
-    });
-    svg.append(
-      svgElement("line", { class: "recognition-award-rule", x1: left, x2: right, y1: 335, y2: 335 }),
-      svgElement(
-        "text",
-        { class: "recognition-award-label", x: left, y: 327 },
-        "Official awards",
-      ),
-    );
-    document.querySelector("#recognition-trajectory").append(svg);
+    container.append(svg);
   }
 
-  function renderPlayoffRankMap() {
-    const papers = data.humanComparison.playoffOutcomes;
+  function renderReviewerVsRank() {
+    const evidence = data.preferenceEvidence;
+    const container = document.querySelector("#reviewer-vs-rank");
+    if (!container || !evidence || !evidence.reviewerVsRank) return;
+    const points = evidence.reviewerVsRank;
     const width = 1120;
-    const height = 310;
-    const left = 150;
-    const right = 1080;
-    const rows = { award: 66, oral: 120, spotlight: 178, poster: 236 };
-    const x = (rank) => left + ((rank - 1) * (right - left)) / 59;
+    const height = 340;
+    const left = 300;
+    const right = 1040;
+    const top = 70;
+    const bottom = 268;
+    const minScore = Math.min(...points.map((p) => p.reviewerScore));
+    const maxScore = Math.max(...points.map((p) => p.reviewerScore));
+    const x = (score) => left + ((score - minScore) / (maxScore - minScore)) * (right - left);
+    const y = (percentile) => bottom - ((percentile - 30) / 45) * (bottom - top);
+    const biggest = Math.max(...points.map((p) => p.papers));
+
     const svg = svgElement("svg", {
-      class: "rank-map-svg",
+      class: "evidence-svg",
       viewBox: `0 0 ${width} ${height}`,
       role: "img",
-      "aria-label": "Human presentation outcomes positioned by AI rank from one to sixty",
+      "aria-label": points
+        .map((p) => `Papers scored ${p.reviewerScore} by reviewers sit on average at the ${p.meanAiPercentile.toFixed(0)}th percentile of the AI ranking`)
+        .join(". "),
     });
-    const topTenEnd = x(10) + (x(2) - x(1)) / 2;
     svg.append(
-      svgElement("rect", {
-        class: "rank-map-top-ten",
-        x: left - 7,
-        y: 32,
-        width: topTenEnd - left + 7,
-        height: 224,
-      }),
-      svgElement("text", { class: "rank-map-band-label", x: left, y: 23 }, "AI top 10"),
+      svgElement("text", { class: "evidence-axis-title", x: left, y: 30 }, "Average position in the AI ranking, by the score the paper's human reviewers gave it"),
     );
 
-    [
-      ["Official award", rows.award],
-      ["Human oral", rows.oral],
-      ["Human spotlight", rows.spotlight],
-      ["Human poster", rows.poster],
-    ].forEach(([label, rowY]) => {
+    [40, 50, 60, 70].forEach((value) => {
       svg.append(
-        svgElement("line", { class: "rank-map-row", x1: left, x2: right, y1: rowY, y2: rowY }),
-        svgElement("text", { class: "rank-map-row-label", x: left - 18, y: rowY + 4, "text-anchor": "end" }, label),
+        svgElement("line", { class: value === 50 ? "evidence-reference" : "evidence-grid", x1: left, x2: right, y1: y(value), y2: y(value) }),
+        svgElement("text", { class: "evidence-tick", x: left - 16, y: y(value) + 4, "text-anchor": "end" }, ordinal(value)),
       );
     });
+    svg.append(
+      svgElement("text", { class: "evidence-row-sub", x: left - 16, y: top - 6, "text-anchor": "end" }, "Rated higher by the AI"),
+      svgElement("text", { class: "evidence-row-sub", x: left - 16, y: bottom + 6, "text-anchor": "end" }, "Rated lower by the AI"),
+    );
 
-    for (let rank = 10; rank <= 60; rank += 10) {
-      const tickX = x(rank);
+    const path = points
+      .map((p, index) => `${index === 0 ? "M" : "L"} ${x(p.reviewerScore)} ${y(p.meanAiPercentile)}`)
+      .join(" ");
+    svg.append(svgElement("path", { class: "evidence-trend", d: path }));
+
+    points.forEach((p) => {
+      const radius = 5 + Math.sqrt(p.papers / biggest) * 13;
+      const dot = svgElement("g", { class: "evidence-dot" });
+      dot.append(svgElement("title", {}, `${p.papers.toLocaleString()} papers scored ${p.reviewerScore}; average AI position ${p.meanAiPercentile.toFixed(1)}th percentile`));
+      dot.append(svgElement("circle", { cx: x(p.reviewerScore), cy: y(p.meanAiPercentile), r: radius }));
+      svg.append(dot);
+    });
+
+    points.forEach((p, index) => {
+      const isFirst = index === 0;
+      const isLast = index === points.length - 1;
+      if (!isFirst && !isLast) return;
       svg.append(
-        svgElement("line", { class: "rank-map-tick", x1: tickX, x2: tickX, y1: 32, y2: 256 }),
-        svgElement("text", { class: "rank-map-tick-label", x: tickX, y: 282, "text-anchor": "middle" }, String(rank)),
-      );
-    }
-    svg.append(svgElement("text", { class: "rank-map-tick-label", x: x(1), y: 282, "text-anchor": "middle" }, "1"));
-
-    papers.forEach((paper) => {
-      const mark = svgElement("g", { class: `rank-mark rank-${paper.tier}` });
-      mark.append(
         svgElement(
-          "title",
-          {},
-          `AI #${paper.rank} · Human ${paper.tier}${paper.actualAward ? " · Official award" : ""} · ${paper.title}`,
+          "text",
+          {
+            class: "evidence-value",
+            x: x(p.reviewerScore) + (isFirst ? 16 : -8),
+            y: y(p.meanAiPercentile) + (isFirst ? 34 : -24),
+            "text-anchor": isFirst ? "start" : "end",
+          },
+          ordinal(p.meanAiPercentile),
         ),
       );
-      if (paper.tier === "spotlight") {
-        const pointX = x(paper.rank);
-        mark.append(
-          svgElement("rect", {
-            x: pointX - 4.5,
-            y: rows.spotlight - 4.5,
-            width: 9,
-            height: 9,
-            transform: `rotate(45 ${pointX} ${rows.spotlight})`,
-          }),
-        );
-      } else {
-        mark.append(
-          svgElement("circle", {
-            cx: x(paper.rank),
-            cy: rows[paper.tier],
-            r: paper.tier === "oral" ? 6 : 3.2,
-          }),
-        );
-      }
-      svg.append(mark);
-      if (paper.actualAward) {
-        svg.append(
-          svgElement("line", {
-            class: "rank-map-award-link",
-            x1: x(paper.rank),
-            x2: x(paper.rank),
-            y1: rows.award + 9,
-            y2: rows[paper.tier] - 9,
-          }),
-          svgElement("path", {
-            class: "rank-map-award-star",
-            d: starPath(x(paper.rank), rows.award, 10, 4.6),
-          }),
-        );
-      }
     });
-    document.querySelector("#playoff-rank-map").append(svg);
 
-    const oralRanks = papers.filter((paper) => paper.tier === "oral").map((paper) => paper.rank);
-    const spotlightRanks = papers
-      .filter((paper) => paper.tier === "spotlight")
-      .map((paper) => paper.rank);
-    const awardRanks = papers.filter((paper) => paper.actualAward).map((paper) => paper.rank);
-    document.querySelector("#playoff-rank-caption").textContent =
-      `Human orals landed at AI ranks ${oralRanks.join(", ")}; spotlights at ${spotlightRanks.join(", ")}. ` +
-      `The only official award paper in the playoff was AI #${awardRanks[0]}.`;
+    [minScore, 4.0, 4.5, maxScore].forEach((score) => {
+      svg.append(
+        svgElement("text", { class: "evidence-tick", x: x(score), y: bottom + 26, "text-anchor": "middle" }, score.toFixed(2)),
+      );
+    });
+    svg.append(
+      svgElement("text", { class: "evidence-axis-caption", x: (left + right) / 2, y: height - 14, "text-anchor": "middle" }, "Score given by the paper's human reviewers. Circle size shows how many papers received that score."),
+    );
+    container.append(svg);
+  }
+
+  function renderPreferenceComparison() {
+    const container = document.querySelector("#preference-comparison");
+    const comparison = data.preferenceComparison;
+    if (!container || !comparison) return;
+
+    const sets = comparison.sets;
+    const human = sets.find((set) => set.key === "human");
+    const ai = sets.find((set) => set.key === "ai");
+    // Order rows by how far AI's mix departs from the human mix.
+    const rows = Object.keys(comparison.classLabels)
+      .map((key) => ({
+        key,
+        label: comparison.classLabels[key],
+        shares: sets.map((set) => set.shares[key] || 0),
+        delta: (ai.shares[key] || 0) - (human.shares[key] || 0),
+      }))
+      .filter((row) => row.shares.some((share) => share > 0))
+      .sort((a, b) => b.delta - a.delta);
+
+    const widest = Math.max(...rows.map((row) => Math.abs(row.delta)), 0.01);
+    const table = element("table", "preference-table");
+    const headRow = element("tr");
+    headRow.append(element("th", "preference-corner", "Contribution type"));
+    sets.forEach((set) => {
+      const cell = element("th");
+      cell.append(element("span", "", set.label), element("small", "", `n = ${set.n.toLocaleString()}`));
+      headRow.append(cell);
+    });
+    headRow.append(element("th", "preference-delta-head", "AI minus human"));
+    const head = element("thead");
+    head.append(headRow);
+
+    const body = element("tbody");
+    rows.forEach((row) => {
+      const tr = element("tr");
+      tr.append(element("th", "preference-row-label", row.label));
+      row.shares.forEach((share) => {
+        tr.append(element("td", "", `${(share * 100).toFixed(1)}%`));
+      });
+      const deltaCell = element("td", "preference-delta");
+      const points = row.delta * 100;
+      const bar = element("span", `preference-bar ${points >= 0 ? "is-up" : "is-down"}`);
+      bar.style.width = `${Math.max(2, (Math.abs(row.delta) / widest) * 104)}px`;
+      const value = element("span", "preference-delta-value", `${points >= 0 ? "+" : ""}${points.toFixed(1)}`);
+      deltaCell.append(bar, value);
+      tr.append(deltaCell);
+      body.append(tr);
+    });
+    table.append(head, body);
+    container.append(table);
+  }
+
+  // Bars carry direction through colour, so the label shows size without a signed zero.
+  function magnitude(value) {
+    return Math.abs(value).toFixed(2);
+  }
+
+  // Push labels apart just enough to stay legible when two values nearly coincide.
+  function spreadLabels(positions, minimumGap) {
+    const order = positions.map((y, index) => ({ y, index })).sort((a, b) => a.y - b.y);
+    for (let i = 1; i < order.length; i += 1) {
+      const gap = order[i].y - order[i - 1].y;
+      if (gap < minimumGap) {
+        const shift = (minimumGap - gap) / 2;
+        order[i - 1].y -= shift;
+        order[i].y += shift;
+      }
+    }
+    const result = [];
+    order.forEach((entry) => {
+      result[entry.index] = entry.y;
+    });
+    return result;
+  }
+
+  function renderAxisWeights() {
+    const host = document.querySelector("#axis-weights");
+    const weights = data.judgmentBasis && data.judgmentBasis.axisWeights;
+    if (!host || !weights) return;
+
+    const width = 840;
+    const height = 470;
+    const labelEdge = 300;
+    const leftColumn = 400;
+    const rightColumn = 700;
+    const top = 96;
+    const bottom = 410;
+    const ceiling = 0.85;
+    const y = (value) => bottom - (Math.max(0, value) / ceiling) * (bottom - top);
+    // The two axes the section is about; the rest stay grey so the crossing reads.
+    const highlighted = { ml_field_impact: "is-ai", novelty: "is-human" };
+
+    const svg = svgElement("svg", {
+      class: "axis-slope",
+      viewBox: `0 0 ${width} ${height}`,
+      role: "img",
+      "aria-label":
+        "Each panel axis plotted twice: how much it drove the AI's ordering, and how much it drove the human reviewer score.",
+    });
+
+    svg.append(
+      svgElement(
+        "text",
+        { class: "evidence-axis-title", x: 24, y: 30 },
+        "How much each thing the AI panel scored moved each verdict",
+      ),
+      svgElement("text", { class: "axis-slope-head", x: leftColumn, y: 64, "text-anchor": "middle" }, "The AI's own ordering"),
+      svgElement("text", { class: "axis-slope-head", x: rightColumn, y: 64, "text-anchor": "middle" }, "The human reviewer score"),
+    );
+
+    [0, 0.2, 0.4, 0.6, 0.8].forEach((value) => {
+      svg.append(
+        svgElement("line", { class: value === 0 ? "evidence-reference" : "evidence-grid", x1: leftColumn - 34, x2: rightColumn + 34, y1: y(value), y2: y(value) }),
+        svgElement("text", { class: "evidence-tick", x: rightColumn + 92, y: y(value) + 4 }, value.toFixed(1)),
+      );
+    });
+    svg.append(
+      svgElement("text", { class: "evidence-row-sub", x: width - 8, y: y(0.85) - 6, "text-anchor": "end" }, "rank correlation"),
+    );
+
+    const labelY = spreadLabels(weights.axes.map((axis) => y(axis.ai) + 5), 19);
+    weights.axes.forEach((axis, index) => {
+      const tone = highlighted[axis.key] || "is-other";
+      const group = svgElement("g", { class: `axis-slope-row ${tone}` });
+      group.append(svgElement("title", {}, `${axis.label}: ${axis.ai.toFixed(3)} against the AI's ordering, ${axis.human.toFixed(3)} against the reviewer score`));
+      group.append(
+        svgElement("line", { class: "axis-slope-line", x1: leftColumn, x2: rightColumn, y1: y(axis.ai), y2: y(axis.human) }),
+        // Leader from the de-collided label back to the dot it belongs to.
+        svgElement("path", { class: "axis-slope-leader", d: `M ${labelEdge + 8} ${labelY[index] - 4} H ${leftColumn - 26} L ${leftColumn - 10} ${y(axis.ai)}` }),
+        svgElement("circle", { class: "axis-slope-dot", cx: leftColumn, cy: y(axis.ai), r: tone === "is-other" ? 4.5 : 6.5 }),
+        svgElement("circle", { class: "axis-slope-dot", cx: rightColumn, cy: y(axis.human), r: tone === "is-other" ? 4.5 : 6.5 }),
+        svgElement("text", { class: "axis-slope-name", x: labelEdge, y: labelY[index], "text-anchor": "end" }, axis.label),
+      );
+      if (tone !== "is-other") {
+        group.append(
+          svgElement("line", { class: "axis-slope-interval", x1: rightColumn, x2: rightColumn, y1: y(axis.humanInterval[0]), y2: y(axis.humanInterval[1]) }),
+          svgElement("text", { class: "axis-slope-endvalue", x: rightColumn + 18, y: y(axis.human) + 5 }, axis.human.toFixed(2)),
+        );
+      }
+      svg.append(group);
+    });
+
+    const impact = weights.axes.find((axis) => axis.key === "ml_field_impact");
+    const novelty = weights.axes.find((axis) => axis.key === "novelty");
+    svg.append(
+      // Above the dot, so the descending line does not strike through the text.
+      svgElement("text", { class: "axis-slope-callout is-ai", x: leftColumn + 14, y: y(impact.ai) - 12 }, `${impact.ai.toFixed(2)}, the AI's top criterion`),
+      svgElement("text", { class: "axis-slope-callout is-human", x: leftColumn + 14, y: y(novelty.ai) - 12 }, `${novelty.ai.toFixed(2)}, its fifth`),
+      svgElement(
+        "text",
+        { class: "evidence-axis-caption", x: 24, y: height - 34 },
+        `Six axes scored on every one of the ${weights.finalists} finalists that reached the frontier panel.`,
+      ),
+      svgElement(
+        "text",
+        { class: "evidence-axis-caption", x: 24, y: height - 14 },
+        "Predicted field impact is the AI's first criterion and the reviewers' last. Novelty is the reverse.",
+      ),
+    );
+    host.append(svg);
+  }
+
+  function renderReasonAxes() {
+    const host = document.querySelector("#reason-axes");
+    const reasons = data.judgmentBasis && data.judgmentBasis.reasonAxes;
+    if (!host || !reasons) return;
+
+    const rows = [...reasons.axes].sort((a, b) => Math.abs(b.ai) - Math.abs(a.ai));
+    const width = 840;
+    const rowHeight = 62;
+    const top = 106;
+    const height = top + rows.length * rowHeight + 76;
+    const left = 336;
+    const right = 744;
+    const ceiling = 0.36;
+    const length = (value) => (Math.abs(value) / ceiling) * (right - left);
+
+    const svg = svgElement("svg", {
+      class: "reason-axes",
+      viewBox: `0 0 ${width} ${height}`,
+      role: "img",
+      "aria-label": "Each recurring line of argument, plotted against how much it moves the AI ranking and the reviewer score.",
+    });
+    svg.append(
+      svgElement("text", { class: "evidence-axis-title", x: 24, y: 30 }, "How much each argument the AI makes moves each verdict"),
+      svgElement("rect", { class: "reason-key-swatch is-ai", x: 336, y: 50, width: 26, height: 11 }),
+      svgElement("text", { class: "reason-key-label", x: 370, y: 60 }, "the AI's ranking of all 6,341 papers"),
+      svgElement("rect", { class: "reason-key-swatch is-human", x: 336, y: 72, width: 26, height: 11 }),
+      svgElement("text", { class: "reason-key-label", x: 370, y: 82 }, "the human reviewer score"),
+    );
+
+    [0, 0.1, 0.2, 0.3].forEach((value) => {
+      const x = left + length(value);
+      svg.append(
+        svgElement("line", { class: value === 0 ? "evidence-reference" : "evidence-grid", x1: x, x2: x, y1: top - 12, y2: top + rows.length * rowHeight - 20 }),
+        svgElement("text", { class: "evidence-tick", x, y: top + rows.length * rowHeight + 2, "text-anchor": "middle" }, value.toFixed(1)),
+      );
+    });
+
+    rows.forEach((row, index) => {
+      const y = top + index * rowHeight;
+      const group = svgElement("g", { class: `reason-row ${row.kind === "reward" ? "is-reward" : "is-concern"}` });
+      group.append(svgElement("title", {}, `"${row.label}": ${row.ai.toFixed(3)} against the AI ranking, ${row.human.toFixed(3)} against the reviewer score`));
+      group.append(
+        svgElement("text", { class: "reason-row-label", x: left - 22, y: y + 4, "text-anchor": "end" }, row.label),
+        svgElement("text", { class: "reason-row-kind", x: left - 22, y: y + 22, "text-anchor": "end" }, row.kind === "reward" ? "raised in a paper's favour" : "raised against a paper"),
+        svgElement("rect", { class: "reason-bar is-ai", x: left, y: y - 9, width: Math.max(2, length(row.ai)), height: 14 }),
+        svgElement("text", { class: "reason-value is-ai", x: left + length(row.ai) + 12, y: y + 3 }, magnitude(row.ai)),
+        svgElement("rect", { class: "reason-bar is-human", x: left, y: y + 9, width: Math.max(2, length(row.human)), height: 14 }),
+        svgElement("text", { class: "reason-value is-human", x: left + length(row.human) + 12, y: y + 21 }, magnitude(row.human)),
+      );
+      svg.append(group);
+    });
+
+    svg.append(
+      svgElement("text", { class: "evidence-axis-caption", x: 24, y: height - 38 }, "Strength of the association, counting how many of the four models reached for that argument on each paper."),
+      svgElement("text", { class: "evidence-axis-caption", x: 24, y: height - 18 }, "Teal lifts a paper in the AI's ranking and red lowers it. Every argument that moves the AI leaves the reviewer score almost untouched."),
+    );
+    host.append(svg);
+  }
+
+  function renderWithinBatch() {
+    const host = document.querySelector("#within-batch");
+    const block = data.judgmentBasis && data.judgmentBasis.withinBatch;
+    if (!host || !block) return;
+
+    const rows = [
+      { key: "models", label: "Another company's model", stat: block.modelToModel, tone: "is-model" },
+      { key: "humans", label: "The human reviewers", stat: block.modelToHuman, tone: "is-human" },
+    ];
+    const width = 840;
+    const height = 300;
+    const left = 330;
+    const right = 720;
+    const ceiling = 0.5;
+    const x = (value) => left + (Math.max(0, value) / ceiling) * (right - left);
+
+    const svg = svgElement("svg", {
+      class: "within-batch",
+      viewBox: `0 0 ${width} ${height}`,
+      role: "img",
+      "aria-label": "Agreement measured inside a single batch of eight papers that every model read together.",
+    });
+    svg.append(
+      svgElement("text", { class: "evidence-axis-title", x: 24, y: 30 }, "Reading the same eight papers, who does a model order them like?"),
+      svgElement("text", { class: "evidence-axis-caption", x: 24, y: 54 }, `Averaged over ${block.batches.toLocaleString()} batches. Every model saw the same batches, so this holds the context identical on both sides.`),
+    );
+
+    [0, 0.1, 0.2, 0.3, 0.4, 0.5].forEach((value) => {
+      svg.append(
+        svgElement("line", { class: value === 0 ? "evidence-reference" : "evidence-grid", x1: x(value), x2: x(value), y1: 96, y2: 224 }),
+        svgElement("text", { class: "evidence-tick", x: x(value), y: 246, "text-anchor": "middle" }, value.toFixed(1)),
+      );
+    });
+
+    rows.forEach((row, index) => {
+      const y = 130 + index * 62;
+      const group = svgElement("g", { class: `within-row ${row.tone}` });
+      group.append(svgElement("title", {}, `${row.label}: rank agreement ${row.stat.mean.toFixed(3)} over ${row.stat.comparisons.toLocaleString()} comparisons`));
+      group.append(
+        svgElement("text", { class: "within-row-label", x: left - 22, y: y + 1, "text-anchor": "end" }, row.label),
+        svgElement("text", { class: "within-row-sub", x: left - 22, y: y + 19, "text-anchor": "end" }, `${row.stat.comparisons.toLocaleString()} comparisons`),
+        svgElement("rect", { class: "evidence-track", x: left, y: y - 15, width: right - left, height: 28 }),
+        svgElement("rect", { class: "within-bar", x: left, y: y - 15, width: Math.max(3, x(row.stat.mean) - left), height: 28 }),
+        svgElement("text", { class: "within-value", x: x(row.stat.mean) + 14, y: y + 6 }, row.stat.mean.toFixed(2)),
+      );
+      svg.append(group);
+    });
+
+    svg.append(
+      svgElement("text", { class: "evidence-axis-caption", x: 24, y: height - 14 }, "Rank agreement on the eight papers in front of it, so no ranking-wide effect can flatter either comparison."),
+    );
+    host.append(svg);
+  }
+
+  function renderModelAgreement() {
+    const host = document.querySelector("#model-agreement");
+    const agreement = data.judgmentBasis && data.judgmentBasis.modelAgreement;
+    if (!host || !agreement) return;
+
+    const lookup = new Map();
+    agreement.pairs.forEach((pair) => {
+      lookup.set(`${pair.a}|${pair.b}`, pair.rho);
+      lookup.set(`${pair.b}|${pair.a}`, pair.rho);
+    });
+    agreement.human.forEach((row) => {
+      lookup.set(`${row.model}|Human reviewers`, row.rho);
+      lookup.set(`Human reviewers|${row.model}`, row.rho);
+    });
+    const names = [...agreement.models, "Human reviewers"];
+
+    // The first judge never labels a row, because the lower triangle leaves it empty.
+    const rows = names.slice(1);
+    const columns = names.slice(0, -1);
+    const cell = 104;
+    const left = 300;
+    const top = 92;
+    const width = 840;
+    const height = top + rows.length * cell + 92;
+
+    const svg = svgElement("svg", {
+      class: "agreement-matrix",
+      viewBox: `0 0 ${width} ${height}`,
+      role: "img",
+      "aria-label": "Rank correlation between every pair of judges, including the human reviewers.",
+    });
+    svg.append(
+      svgElement("text", { class: "evidence-axis-title", x: 24, y: 30 }, "How much each judge agrees with each other judge"),
+      svgElement("text", { class: "evidence-axis-caption", x: 24, y: 54 }, `Rank correlation over the same ${agreement.papers.toLocaleString()} main-track papers.`),
+    );
+
+    rows.forEach((rowName, rowIndex) => {
+      const y = top + rowIndex * cell;
+      const isHumanRow = rowName === "Human reviewers";
+      svg.append(
+        svgElement(
+          "text",
+          { class: `agreement-name ${isHumanRow ? "is-human" : ""}`, x: left - 18, y: y + cell / 2 + 5, "text-anchor": "end" },
+          rowName,
+        ),
+      );
+      columns.forEach((columnName, columnIndex) => {
+        if (columnIndex > rowIndex) return;
+        const value = lookup.get(`${rowName}|${columnName}`);
+        if (value === undefined) return;
+        const x = left + columnIndex * cell;
+        const tone = isHumanRow || columnName === "Human reviewers" ? "is-human" : "is-model";
+        const group = svgElement("g", { class: `agreement-cell ${tone}` });
+        group.append(svgElement("title", {}, `${rowName} and ${columnName}: rank correlation ${value.toFixed(3)}`));
+        group.append(
+          svgElement("rect", { x: x + 4, y: y + 4, width: cell - 8, height: cell - 8, opacity: (0.16 + 0.84 * Math.min(1, value / 0.72)).toFixed(3) }),
+          svgElement("text", { class: "agreement-value", x: x + cell / 2, y: y + cell / 2 + 7, "text-anchor": "middle" }, value.toFixed(2)),
+        );
+        svg.append(group);
+      });
+    });
+
+    columns.forEach((name, index) => {
+      const x = left + index * cell + cell / 2;
+      svg.append(
+        svgElement("text", { class: "agreement-column", x, y: top + rows.length * cell + 26, "text-anchor": "middle" }, name.split(" ")[0]),
+      );
+    });
+
+    svg.append(
+      // A value, not an inequality: the floor is 0.5695, so "0.57 or above" would be false.
+      svgElement("text", { class: "evidence-axis-caption", x: 24, y: height - 34 }, `The weakest pair of models reaches ${agreement.weakestModelPair.toFixed(2)}.`),
+      svgElement("text", { class: "evidence-axis-caption", x: 24, y: height - 14 }, `The closest any model comes to the reviewers is ${agreement.strongestHumanPair.toFixed(2)}.`),
+    );
+    host.append(svg);
+  }
+
+  function renderDivergenceTable() {
+    const container = document.querySelector("#divergence-table");
+    const cases = data.preferenceEvidence && data.preferenceEvidence.divergenceCases;
+    if (!container || !cases) return;
+    const total = cases.corpusSize.toLocaleString();
+
+    const table = element("table", "divergence-table");
+    const colgroup = element("colgroup");
+    ["auto", "88px", "96px"].forEach((width) => {
+      const col = document.createElement("col");
+      col.style.width = width;
+      colgroup.append(col);
+    });
+    const head = element("thead");
+    const headRow = element("tr");
+    headRow.append(
+      element("th", "", "Paper, and what the AI said about it"),
+      element("th", "", "ICML"),
+      element("th", "", `AI rank of ${total}`),
+    );
+    head.append(headRow);
+
+    const body = element("tbody");
+    [
+      ["gems", `Papers the AI ranked near the top that ICML left as posters (${cases.gemPool} in total)`, "why it did not rank this lower"],
+      ["blindSpots", `Papers the AI ranked near the bottom that ICML chose as orals (${cases.blindSpotPool} in total)`, "why it did not rank this higher"],
+    ].forEach(([key, caption, prompt]) => {
+      const groupRow = element("tr", "divergence-group");
+      const groupCell = element("th", "", caption);
+      groupCell.colSpan = 3;
+      groupRow.append(groupCell);
+      body.append(groupRow);
+
+      cases[key].forEach((row) => {
+        const tr = element("tr");
+        const paper = element("th", "divergence-paper");
+        paper.append(element("span", "divergence-title", row.title));
+        if (row.statedReason) {
+          paper.append(element("span", "divergence-reason-cue", prompt));
+          paper.append(element("q", "divergence-reason", row.statedReason));
+        }
+        tr.append(paper);
+        const outcome = element("td", `divergence-tier tier-${row.tier}`);
+        outcome.append(element("span", "", humanTierLabel(row.tier).replace("Human ", "")));
+        if (row.reviewerScore !== null) {
+          outcome.append(element("small", "divergence-score", row.reviewerScore.toFixed(2)));
+        }
+        tr.append(outcome);
+        const rank = element("td", `divergence-rank ${key === "gems" ? "is-top" : "is-bottom"}`);
+        rank.append(element("strong", "", row.corpusRank.toLocaleString()));
+        tr.append(rank);
+        body.append(tr);
+      });
+    });
+    table.append(colgroup, head, body);
+    container.append(table);
   }
 
   function renderMosaic() {
@@ -490,8 +877,15 @@
   renderMosaic();
   renderMethodDiagram();
   renderTopTen();
-  renderRecognitionTrajectory();
-  renderPlayoffRankMap();
+  renderCorrelationScale();
+  renderRecallByTier();
+  renderReviewerVsRank();
+  renderPreferenceComparison();
+  renderAxisWeights();
+  renderReasonAxes();
+  renderModelAgreement();
+  renderWithinBatch();
+  renderDivergenceTable();
   renderAwards();
   populateFilters();
   renderOrals();

@@ -4,6 +4,29 @@ This document describes the current production pipeline for identifying
 high-impact ICML papers. It is written as a concise methods section: the running
 decision history remains in `docs/methodology_decisions.md`.
 
+## Stage Numbering
+
+The stage numbers below are the implementation's own, and they match the audit
+filenames (`docs/stage3_production_audit.md`,
+`docs/stage5_production_audit.md`, `docs/stage6_production_audit.md`) and the
+`stage3_*`, `stage5_*`, and `stage7_*` data artifacts. The public results site
+presents a simplified six-step version of the same pipeline, which merges the
+preparation and selection stages and splits the tournament into its two phases.
+The two numbering schemes correspond as follows:
+
+| Results site | This document |
+| --- | --- |
+| Stage 01, Blind and route | Paper Representation (identity redaction) and Stage 1 |
+| Stage 02, Cheap recall ensemble | Stage 2 |
+| Stage 03, Strong semifinal | Stages 3 and 4 |
+| Stage 04, Frontier PDF panel | Stage 5 |
+| Stage 05, Swiss pool | Stage 6, Swiss phase |
+| Stage 06, All-pairs playoff | Stage 6, all-pairs phase |
+| (reported as results, not a stage) | Stage 7 |
+
+Use this document's numbering when referring to code, commands, audits, or
+stored artifacts.
+
 ## Objective
 
 The pipeline ranks papers by expected broad scientific and machine-learning
