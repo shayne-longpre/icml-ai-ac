@@ -34,7 +34,7 @@ window.ICML_AI_AC_DATA = {
   "method": {
     "stages": [
       {
-        "stage": "00-01",
+        "stage": "01",
         "count": 6617,
         "title": "Blind and route",
         "models": "Gemini 3.1 Flash Lite",
@@ -45,39 +45,39 @@ window.ICML_AI_AC_DATA = {
         "stage": "02",
         "count": 6617,
         "title": "Cheap recall ensemble",
-        "models": "Nemotron · Gemini Lite · Luna · Grok",
+        "models": "Nemotron 3 Ultra · Gemini 3.5 Flash Lite · GPT-5.6 Luna · Grok 4.3",
         "detail": "Four judges, two contexts each",
         "tone": "cheap"
       },
       {
-        "stage": "03-04",
+        "stage": "03",
         "count": 1442,
         "title": "Strong semifinal",
-        "models": "Terra + Sonnet",
+        "models": "GPT-5.6 Terra + Claude Sonnet 5",
         "detail": "Two listwise partitions per judge",
         "tone": "strong"
       },
       {
-        "stage": "05",
+        "stage": "04",
         "count": 250,
         "title": "Frontier PDF panel",
-        "models": "Sol + Fable + Gemini Pro",
+        "models": "GPT-5.6 Sol + Claude Fable 5 + Gemini 3.1 Pro",
         "detail": "750 independent judgment cards",
         "tone": "frontier"
       },
       {
-        "stage": "06A",
+        "stage": "05",
         "count": 172,
         "title": "Swiss pool",
-        "models": "Sol pairwise judge",
+        "models": "GPT-5.6 Sol pairwise judge",
         "detail": "10 rounds · 860 pairs",
         "tone": "swiss"
       },
       {
-        "stage": "06B",
+        "stage": "06",
         "count": 60,
         "title": "All-pairs playoff",
-        "models": "Sol pairwise judge",
+        "models": "GPT-5.6 Sol pairwise judge",
         "detail": "1,770 complete pair graph",
         "tone": "playoff"
       }
@@ -2810,5 +2810,622 @@ window.ICML_AI_AC_DATA = {
         "openreview": "https://openreview.net/forum?id=SaJvQ26ZkR"
       }
     }
-  ]
+  ],
+  "preferenceComparison": {
+    "matchedN": 536,
+    "classLabels": {
+      "core_ml_algorithm": "Core ML algorithm",
+      "theory": "Theory",
+      "safety_governance_eval": "Safety / governance / eval",
+      "scientific_modeling_tool": "Scientific modeling tool",
+      "benchmark_dataset": "Benchmark / dataset",
+      "infrastructure_systems": "Infrastructure / systems",
+      "analysis_position": "Analysis / position",
+      "application_method": "Application method",
+      "other": "Other"
+    },
+    "sets": [
+      {
+        "key": "corpus",
+        "label": "All main-track papers",
+        "n": 6341,
+        "counts": {
+          "core_ml_algorithm": 1964,
+          "theory": 841,
+          "safety_governance_eval": 530,
+          "scientific_modeling_tool": 538,
+          "benchmark_dataset": 437,
+          "infrastructure_systems": 469,
+          "analysis_position": 349,
+          "application_method": 1213,
+          "other": 0
+        },
+        "shares": {
+          "core_ml_algorithm": 0.30973032644693266,
+          "theory": 0.13262892288282604,
+          "safety_governance_eval": 0.08358303106765494,
+          "scientific_modeling_tool": 0.08484466172527992,
+          "benchmark_dataset": 0.06891657467276455,
+          "infrastructure_systems": 0.07396309730326447,
+          "analysis_position": 0.055038637438889766,
+          "application_method": 0.19129474846238764,
+          "other": 0.0
+        }
+      },
+      {
+        "key": "human",
+        "label": "Human orals and spotlights",
+        "n": 536,
+        "counts": {
+          "core_ml_algorithm": 170,
+          "theory": 102,
+          "safety_governance_eval": 37,
+          "scientific_modeling_tool": 43,
+          "benchmark_dataset": 38,
+          "infrastructure_systems": 40,
+          "analysis_position": 46,
+          "application_method": 60,
+          "other": 0
+        },
+        "shares": {
+          "core_ml_algorithm": 0.31716417910447764,
+          "theory": 0.19029850746268656,
+          "safety_governance_eval": 0.06902985074626866,
+          "scientific_modeling_tool": 0.08022388059701492,
+          "benchmark_dataset": 0.0708955223880597,
+          "infrastructure_systems": 0.07462686567164178,
+          "analysis_position": 0.08582089552238806,
+          "application_method": 0.11194029850746269,
+          "other": 0.0
+        }
+      },
+      {
+        "key": "ai",
+        "label": "AI's top 536",
+        "n": 536,
+        "counts": {
+          "core_ml_algorithm": 214,
+          "theory": 79,
+          "safety_governance_eval": 71,
+          "scientific_modeling_tool": 32,
+          "benchmark_dataset": 50,
+          "infrastructure_systems": 59,
+          "analysis_position": 23,
+          "application_method": 8,
+          "other": 0
+        },
+        "shares": {
+          "core_ml_algorithm": 0.39925373134328357,
+          "theory": 0.14738805970149255,
+          "safety_governance_eval": 0.13246268656716417,
+          "scientific_modeling_tool": 0.05970149253731343,
+          "benchmark_dataset": 0.09328358208955224,
+          "infrastructure_systems": 0.11007462686567164,
+          "analysis_position": 0.04291044776119403,
+          "application_method": 0.014925373134328358,
+          "other": 0.0
+        }
+      }
+    ]
+  },
+  "preferenceEvidence": {
+    "crosstab": {
+      "topDecilePercentile": 90.0,
+      "tiers": {
+        "oral": {
+          "inTopDecile": 40,
+          "total": 159
+        },
+        "spotlight": {
+          "inTopDecile": 63,
+          "total": 377
+        },
+        "poster": {
+          "inTopDecile": 531,
+          "total": 5805
+        }
+      }
+    },
+    "reviewerVsRank": [
+      {
+        "reviewerScore": 3.25,
+        "papers": 70,
+        "meanAiPercentile": 43.6577287066246
+      },
+      {
+        "reviewerScore": 3.3333,
+        "papers": 37,
+        "meanAiPercentile": 40.75454002898798
+      },
+      {
+        "reviewerScore": 3.5,
+        "papers": 307,
+        "meanAiPercentile": 47.23481540089808
+      },
+      {
+        "reviewerScore": 3.6667,
+        "papers": 139,
+        "meanAiPercentile": 45.147856478224355
+      },
+      {
+        "reviewerScore": 3.75,
+        "papers": 793,
+        "meanAiPercentile": 47.08892080149255
+      },
+      {
+        "reviewerScore": 4.0,
+        "papers": 1786,
+        "meanAiPercentile": 47.62498189564118
+      },
+      {
+        "reviewerScore": 4.25,
+        "papers": 1309,
+        "meanAiPercentile": 51.19513535267849
+      },
+      {
+        "reviewerScore": 4.3333,
+        "papers": 304,
+        "meanAiPercentile": 48.16277187448116
+      },
+      {
+        "reviewerScore": 4.5,
+        "papers": 823,
+        "meanAiPercentile": 54.647783940419565
+      },
+      {
+        "reviewerScore": 4.6667,
+        "papers": 153,
+        "meanAiPercentile": 50.85317828498382
+      },
+      {
+        "reviewerScore": 4.75,
+        "papers": 324,
+        "meanAiPercentile": 54.92522490945204
+      },
+      {
+        "reviewerScore": 5.0,
+        "papers": 184,
+        "meanAiPercentile": 60.362347414620764
+      },
+      {
+        "reviewerScore": 5.25,
+        "papers": 25,
+        "meanAiPercentile": 61.427129337539434
+      }
+    ],
+    "divergenceCases": {
+      "corpusSize": 6341,
+      "gems": [
+        {
+          "paperId": "65009",
+          "title": "Spurious Correlation Learning in Preference Optimization: Mechanisms, Consequences, and Mitigation via Tie Training",
+          "tier": "poster",
+          "reviewerScore": 4.75,
+          "corpusRank": 4,
+          "contributionClass": "theory",
+          "statedReason": "Among the batch, it has the clearest combination of general theory, safety relevance, and an immediately implementable training intervention."
+        },
+        {
+          "paperId": "64738",
+          "title": "The Geometry of Sequential Learning: Lie-Bracket Prediction of Transfer Order",
+          "tier": "poster",
+          "reviewerScore": 4.4,
+          "corpusRank": 5,
+          "contributionClass": "theory",
+          "statedReason": "The paper combines a formal commutator derivation, a deployable planner, and unusually broad empirical claims including 85-source scheduling and 56 MMLU subjects."
+        },
+        {
+          "paperId": "66219",
+          "title": "Linear Ensembles Wash Away Watermarks: On the Fragility of Distributional Perturbations in LLMs",
+          "tier": "poster",
+          "reviewerScore": 3.75,
+          "corpusRank": 6,
+          "contributionClass": "safety_governance_eval",
+          "statedReason": "Strong theoretical guarantee plus practical attack that directly challenges a core safety mechanism; clear field-level consequences."
+        }
+      ],
+      "gemPool": 531,
+      "blindSpots": [
+        {
+          "paperId": "60641",
+          "title": "MV-FGAD: Towards Efficient and Effective Federated Graph Anomaly Detection via Multi-view Learning",
+          "tier": "oral",
+          "reviewerScore": 4.75,
+          "corpusRank": 6314,
+          "contributionClass": "application_method",
+          "statedReason": "Incremental combination of existing techniques applied to federated GNN anomaly detection."
+        },
+        {
+          "paperId": "60907",
+          "title": "DroneDINO: Towards Heterogeneous Routed Mixture of Experts for Drone-based Unified Object Detection",
+          "tier": "oral",
+          "reviewerScore": 5.25,
+          "corpusRank": 6294,
+          "contributionClass": "application_method",
+          "statedReason": "Limited transferability beyond aerial multi-modal object detection benchmarks."
+        },
+        {
+          "paperId": "65858",
+          "title": "PhenoBrain: Phenotype-Conditioned Long-Range Communication for Multi-Modal Brain Network Analysis",
+          "tier": "oral",
+          "reviewerScore": 5.0,
+          "corpusRank": 6274,
+          "contributionClass": "scientific_modeling_tool",
+          "statedReason": "Reliance on curated multi-modal datasets and complex routing mechanisms."
+        }
+      ],
+      "blindSpotPool": 35
+    },
+    "stability": {
+      "topK": 50,
+      "overlap": 23,
+      "meanAbsoluteRankShift": 230.096,
+      "addedToShortlist": 119,
+      "judges": {
+        "gemini-3.5-flash-lite": {
+          "earlierSlotWinRate": 0.570995,
+          "slotEffectRange": 0.116982
+        },
+        "nemotron-3-ultra-550b-a55b": {
+          "earlierSlotWinRate": 0.752946,
+          "slotEffectRange": 0.320371
+        },
+        "gpt-5.6-luna": {
+          "earlierSlotWinRate": 0.461347,
+          "slotEffectRange": 0.052722
+        },
+        "grok-4.3": {
+          "earlierSlotWinRate": 0.800781,
+          "slotEffectRange": 0.410098
+        }
+      }
+    }
+  },
+  "judgmentBasis": {
+    "axisWeights": {
+      "finalists": 248,
+      "axes": [
+        {
+          "key": "ml_field_impact",
+          "label": "Predicted ML field impact",
+          "ai": 0.7974104596018988,
+          "aiInterval": [
+            0.7316503280556212,
+            0.8492694642680503
+          ],
+          "human": 0.06100637480061662,
+          "humanInterval": [
+            -0.07212553442563349,
+            0.19014721097610265
+          ]
+        },
+        {
+          "key": "broad_scientific_impact",
+          "label": "Broad scientific impact",
+          "ai": 0.7406878598827343,
+          "aiInterval": [
+            0.672111184020846,
+            0.7964578038705892
+          ],
+          "human": 0.15522266572503746,
+          "humanInterval": [
+            0.029498650828496092,
+            0.27825284948217816
+          ]
+        },
+        {
+          "key": "evidence_confidence",
+          "label": "Evidence confidence",
+          "ai": 0.7290971305043993,
+          "aiInterval": [
+            0.6577461083233428,
+            0.7937762413518948
+          ],
+          "human": 0.1059085298652356,
+          "humanInterval": [
+            -0.02142738874916695,
+            0.2299548065668484
+          ]
+        },
+        {
+          "key": "technical_soundness",
+          "label": "Technical soundness",
+          "ai": 0.6351520049632772,
+          "aiInterval": [
+            0.5391472712377814,
+            0.7168356346997783
+          ],
+          "human": 0.1142336577772139,
+          "humanInterval": [
+            -0.010021301625816806,
+            0.23912049528820414
+          ]
+        },
+        {
+          "key": "novelty",
+          "label": "Novelty",
+          "ai": 0.5858916980571405,
+          "aiInterval": [
+            0.49251448532923325,
+            0.6704450552398149
+          ],
+          "human": 0.2390052154905039,
+          "humanInterval": [
+            0.12915322863443376,
+            0.3510808020586636
+          ]
+        },
+        {
+          "key": "visual_evidence_importance",
+          "label": "Quality of figures and tables",
+          "ai": 0.439385884143374,
+          "aiInterval": [
+            0.326810797126232,
+            0.5424655530332044
+          ],
+          "human": 0.11087512787234743,
+          "humanInterval": [
+            -0.0174804238843806,
+            0.23178832288209347
+          ]
+        }
+      ],
+      "contrast": {
+        "ai": 0.21151876154475835,
+        "aiInterval": [
+          0.11063513790048385,
+          0.3167986673994665
+        ],
+        "human": -0.1779988406898873,
+        "humanInterval": [
+          -0.3153815508456967,
+          -0.03783261043781369
+        ]
+      }
+    },
+    "reasonAxes": {
+      "papers": 6341,
+      "models": 4,
+      "axes": [
+        {
+          "key": "evidence",
+          "kind": "reward",
+          "label": "Its evidence is strong",
+          "coverage": 0.5891815171108657,
+          "ai": 0.3340731790664277,
+          "human": 0.02963791006049313
+        },
+        {
+          "key": "reusable",
+          "kind": "reward",
+          "label": "It gives a mechanism others can reuse",
+          "coverage": 0.9657782684119224,
+          "ai": 0.19682985317050963,
+          "human": 0.02446345722342473
+        },
+        {
+          "key": "theory",
+          "kind": "reward",
+          "label": "It is backed by theory or guarantees",
+          "coverage": 0.9771329443305472,
+          "ai": 0.20093398236577936,
+          "human": 0.05857518902653763
+        },
+        {
+          "key": "complexity",
+          "kind": "concern",
+          "label": "It is complex or hard to adopt",
+          "coverage": 0.6519476423277085,
+          "ai": -0.12832656080256907,
+          "human": -0.015972396044024787
+        },
+        {
+          "key": "incremental",
+          "kind": "concern",
+          "label": "Its gains are small or incremental",
+          "coverage": 0.05188456079482731,
+          "ai": -0.12569850158148135,
+          "human": -0.002465531765641199
+        },
+        {
+          "key": "narrow",
+          "kind": "concern",
+          "label": "It may not generalize beyond its setting",
+          "coverage": 0.7402617883614572,
+          "ai": -0.1153008526664676,
+          "human": -0.04541326110445288
+        }
+      ],
+      "generality": {
+        "majority": 3,
+        "buckets": [
+          {
+            "modelsRaising": 0,
+            "papers": 1647,
+            "meanAiPercentile": 53.372664954347734,
+            "honoredShare": 0.08561020036429873
+          },
+          {
+            "modelsRaising": 1,
+            "papers": 1992,
+            "meanAiPercentile": 52.300392421420696,
+            "honoredShare": 0.08383534136546185
+          },
+          {
+            "modelsRaising": 2,
+            "papers": 1544,
+            "meanAiPercentile": 47.799572171098866,
+            "honoredShare": 0.08808290155440414
+          },
+          {
+            "modelsRaising": 3,
+            "papers": 872,
+            "meanAiPercentile": 44.6059314676005,
+            "honoredShare": 0.08256880733944955
+          },
+          {
+            "modelsRaising": 4,
+            "papers": 286,
+            "meanAiPercentile": 42.88086519159074,
+            "honoredShare": 0.06993006993006994
+          }
+        ],
+        "byTier": {
+          "oral": {
+            "papers": 159,
+            "share": 0.22012578616352202
+          },
+          "spotlight": {
+            "papers": 377,
+            "share": 0.15119363395225463
+          },
+          "poster": {
+            "papers": 5805,
+            "share": 0.18363479758828596
+          }
+        }
+      }
+    },
+    "modelAgreement": {
+      "papers": 6341,
+      "models": [
+        "GPT-5.6 Luna",
+        "Gemini 3.5 Flash Lite",
+        "Grok 4.3",
+        "Nemotron 3 Ultra"
+      ],
+      "pairs": [
+        {
+          "a": "GPT-5.6 Luna",
+          "b": "Gemini 3.5 Flash Lite",
+          "rho": 0.5908134352920322
+        },
+        {
+          "a": "GPT-5.6 Luna",
+          "b": "Grok 4.3",
+          "rho": 0.5694659679642533
+        },
+        {
+          "a": "GPT-5.6 Luna",
+          "b": "Nemotron 3 Ultra",
+          "rho": 0.5974271218949233
+        },
+        {
+          "a": "Gemini 3.5 Flash Lite",
+          "b": "Grok 4.3",
+          "rho": 0.6018305296263783
+        },
+        {
+          "a": "Gemini 3.5 Flash Lite",
+          "b": "Nemotron 3 Ultra",
+          "rho": 0.6407298655254885
+        },
+        {
+          "a": "Grok 4.3",
+          "b": "Nemotron 3 Ultra",
+          "rho": 0.7123073867736237
+        }
+      ],
+      "human": [
+        {
+          "model": "GPT-5.6 Luna",
+          "rho": 0.10141988515780902
+        },
+        {
+          "model": "Gemini 3.5 Flash Lite",
+          "rho": 0.08771368631164095
+        },
+        {
+          "model": "Grok 4.3",
+          "rho": 0.08990098935168819
+        },
+        {
+          "model": "Nemotron 3 Ultra",
+          "rho": 0.06990526278452094
+        }
+      ],
+      "meanModelToModel": 0.6187623845127832,
+      "meanModelToHuman": 0.08723495590141478,
+      "weakestModelPair": 0.5694659679642533,
+      "strongestHumanPair": 0.10141988515780902
+    },
+    "judgeConsistency": {
+      "models": 4,
+      "ranges": [
+        {
+          "key": "corpus",
+          "label": "Every main-track paper",
+          "papers": 6341,
+          "self": {
+            "mean": 0.5058490809056296,
+            "min": 0.37295062722400485,
+            "max": 0.6365335193707026,
+            "pairings": 4
+          },
+          "cross": {
+            "mean": 0.465704354916258,
+            "min": 0.33651766276465467,
+            "max": 0.6718220810853641,
+            "pairings": 24
+          },
+          "human": {
+            "mean": 0.07564768778623546,
+            "min": 0.049023797765935954,
+            "max": 0.09327524671725687,
+            "pairings": 8
+          }
+        },
+        {
+          "key": "finalists",
+          "label": "Only the finalists",
+          "papers": 248,
+          "self": {
+            "mean": -0.00796533700881595,
+            "min": -0.12975477365233068,
+            "max": 0.21726988758627458,
+            "pairings": 4
+          },
+          "cross": {
+            "mean": 0.056013108773390934,
+            "min": -0.2646635777523506,
+            "max": 0.4798604192521322,
+            "pairings": 24
+          },
+          "human": {
+            "mean": 0.009711565521410486,
+            "min": -0.07438782394358724,
+            "max": 0.10078933249209802,
+            "pairings": 8
+          }
+        }
+      ],
+      "frontier": {
+        "papers": 248,
+        "judges": 3,
+        "cross": {
+          "mean": 0.4064712054672582,
+          "min": 0.2863275550924078,
+          "max": 0.6303750986250388,
+          "pairings": 3
+        },
+        "human": {
+          "mean": 0.13660441293959247,
+          "min": 0.11802850933312771,
+          "max": 0.1684784685093473,
+          "pairings": 3
+        }
+      }
+    },
+    "withinBatch": {
+      "batches": 1654,
+      "modelToModel": {
+        "mean": 0.43025752741593126,
+        "comparisons": 9924
+      },
+      "modelToHuman": {
+        "mean": 0.07008210866902898,
+        "comparisons": 6616
+      }
+    }
+  }
 };
