@@ -46,7 +46,11 @@ jobs:
           # Serve the files as-is instead of letting Jekyll rewrite them.
           touch _site/.nojekyll
 
+      # enablement turns Pages on via the API if it has never been enabled, so a
+      # fresh fork does not need anyone to flip the setting by hand first.
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
