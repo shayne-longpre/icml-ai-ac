@@ -143,8 +143,9 @@ python3 -m http.server 8080
 
 Then open `http://localhost:8080/site/`.
 
-The committed `site/data.js` contains the frozen production results. The linked
-methodology and human-comparison documents are included under `docs/`.
+The committed `site/data.js` contains the frozen production results. The page links
+its methodology and human-comparison documents on GitHub; copies are also included
+under `docs/` for offline reading.
 """
     (package / "README.md").write_text(text, encoding="utf-8")
 
